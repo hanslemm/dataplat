@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Areas now mount through a registry (`dataplat/core/registry.py`) — the
+  single seam a future plugin mechanism will extend. Built-in areas declare
+  the same `module:attr` target shape a package entry point would; no
+  user-facing changes.
+
 ## 0.1.0
 
 Initial public release.

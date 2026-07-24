@@ -13,33 +13,11 @@ from dataplat.core.envrc import load_envrc
 load_envrc()
 
 from dataplat.cli._missing import build_missing_deps_app  # noqa: E402
-from dataplat.cli.ci.app import app as ci_app  # noqa: E402
 from dataplat.cli.config import app as config_app  # noqa: E402
 from dataplat.cli.open import app as open_app  # noqa: E402
 from dataplat.cli.status import app as status_app  # noqa: E402
 from dataplat.core.deps import area_ready  # noqa: E402
-
-# Areas with optional dependencies mount for real only when their extra is
-# installed; otherwise a stub group explains and offers to install it.
-if area_ready("db"):
-    from dataplat.cli.db import app as db_app
-else:
-    db_app = build_missing_deps_app("db", "Database query commands")
-
-if area_ready("ingest"):
-    from dataplat.cli.ingest.app import app as ingest_app
-else:
-    ingest_app = build_missing_deps_app("ingest", "Data ingestion tools (Airbyte)")
-
-if area_ready("bi"):
-    from dataplat.cli.bi.app import app as bi_app
-else:
-    bi_app = build_missing_deps_app("bi", "Business-intelligence tools (Superset)")
-
-if area_ready("cloud"):
-    from dataplat.cli.cloud.app import app as cloud_app
-else:
-    cloud_app = build_missing_deps_app("cloud", "Cloud-provider tools (AWS)")
+from dataplat.core.registry import all_areas, load_app  # noqa: E402
 
 app = typer.Typer(
     name="dp",
@@ -74,11 +52,18 @@ def bootstrap(
 
 
 app.add_typer(config_app, name="config")
-app.add_typer(db_app, name="db")
-app.add_typer(ingest_app, name="ingest")
-app.add_typer(bi_app, name="bi")
-app.add_typer(cloud_app, name="cloud")
-app.add_typer(ci_app, name="ci")
+
+# Areas mount through the registry: for real when their dependencies are
+# installed, otherwise as a stub that offers to install the missing extra.
+for _mount in all_areas():
+    if _mount.deps is None or area_ready(_mount.name):
+        app.add_typer(load_app(_mount), name=_mount.name)
+    else:
+        app.add_typer(
+            build_missing_deps_app(_mount.name, _mount.help_text),
+            name=_mount.name,
+        )
+
 app.add_typer(status_app, name="status")
 app.add_typer(open_app, name="open")
 
