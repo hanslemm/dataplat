@@ -241,8 +241,9 @@ uv run mypy dataplat
 
 ## Releasing
 
-Tag `vX.Y.Z` on `main`; GitHub Actions builds and publishes to PyPI via
-Trusted Publishing.
+Tag `X.Y.Z` (bare semver, no `v` prefix) on `main`; GitHub Actions builds
+and publishes to PyPI via Trusted Publishing. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/).
 
 ## License
 
