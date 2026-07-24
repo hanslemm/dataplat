@@ -29,15 +29,16 @@ classifiers = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "croniter>=2.0.0",
-    "httpx>=0.25.0",
-    "plotext>=5.3.2",
-    "psycopg[binary]>=3.2.9",
     "rich>=14.2.0",
-    "textual>=0.64.0",
     "typer>=0.21.1",
-    "boto3>=1.35.0",
 ]
+
+[project.optional-dependencies]
+db = ["psycopg[binary]>=3.2.9"]
+cloud = ["boto3>=1.35.0", "plotext>=5.3.2"]
+ingest = ["httpx>=0.25.0", "textual>=0.64.0", "croniter>=2.0.0"]
+bi = ["httpx>=0.25.0"]
+all = ["dataplat[db,cloud,ingest,bi]"]
 
 [project.scripts]
 dp = "dataplat.main:app"

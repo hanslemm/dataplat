@@ -90,14 +90,33 @@ name = "dataplat"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "rich" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+all = [
     { name = "boto3" },
     { name = "croniter" },
     { name = "httpx" },
     { name = "plotext" },
     { name = "psycopg", extra = ["binary"] },
-    { name = "rich" },
     { name = "textual" },
-    { name = "typer" },
+]
+bi = [
+    { name = "httpx" },
+]
+cloud = [
+    { name = "boto3" },
+    { name = "plotext" },
+]
+db = [
+    { name = "psycopg", extra = ["binary"] },
+]
+ingest = [
+    { name = "croniter" },
+    { name = "httpx" },
+    { name = "textual" },
 ]
 
 [package.dev-dependencies]
@@ -109,15 +128,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", specifier = ">=1.35.0" },
-    { name = "croniter", specifier = ">=2.0.0" },
-    { name = "httpx", specifier = ">=0.25.0" },
-    { name = "plotext", specifier = ">=5.3.2" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2.9" },
+    { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.35.0" },
+    { name = "croniter", marker = "extra == 'ingest'", specifier = ">=2.0.0" },
+    { name = "dataplat", extras = ["db", "cloud", "ingest", "bi"], marker = "extra == 'all'" },
+    { name = "httpx", marker = "extra == 'bi'", specifier = ">=0.25.0" },
+    { name = "httpx", marker = "extra == 'ingest'", specifier = ">=0.25.0" },
+    { name = "plotext", marker = "extra == 'cloud'", specifier = ">=5.3.2" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'db'", specifier = ">=3.2.9" },
     { name = "rich", specifier = ">=14.2.0" },
-    { name = "textual", specifier = ">=0.64.0" },
+    { name = "textual", marker = "extra == 'ingest'", specifier = ">=0.64.0" },
     { name = "typer", specifier = ">=0.21.1" },
 ]
+provides-extras = ["db", "cloud", "ingest", "bi", "all"]
 
 [package.metadata.requires-dev]
 dev = [

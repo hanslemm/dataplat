@@ -26,7 +26,16 @@ _LONG_QUERY_THRESHOLD_S = 60
 
 
 def _db_section() -> dict[str, Any]:
-    import psycopg
+    try:
+        import psycopg
+    except ImportError:
+        return {
+            name: {
+                "reachable": False,
+                "error": "psycopg not installed (run `dp config sync`)",
+            }
+            for name in load_targets()
+        }
 
     from dataplat.cli.db._common import ConnCliParams
     from dataplat.core.errors import DataplatError
@@ -63,8 +72,15 @@ def _db_section() -> dict[str, Any]:
 
 def _airbyte_section() -> dict[str, Any]:
     from dataplat.core.errors import AuthError, ConfigError, ServiceError
-    from dataplat.services.airbyte.client import build_authenticated_client
-    from dataplat.services.airbyte.jobs import list_jobs
+
+    try:
+        from dataplat.services.airbyte.client import build_authenticated_client
+        from dataplat.services.airbyte.jobs import list_jobs
+    except ImportError:
+        return {
+            "available": False,
+            "error": "ingest dependencies not installed (run `dp config sync`)",
+        }
 
     try:
         client, base_url = build_authenticated_client()

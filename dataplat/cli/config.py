@@ -127,6 +127,49 @@ def init(
     console.print(f"Linked: {CONFIG_ENVRC} -> {source}")
 
 
+@app.command("sync")
+def sync(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Install without prompting."),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Report only; exit 1 if an enabled area is missing dependencies.",
+    ),
+) -> None:
+    """Install the dependencies for every area your config enables."""
+    from dataplat.cli._missing import run_install
+    from dataplat.core.deps import AREAS, enabled_areas, missing_modules
+
+    enabled = enabled_areas()
+    table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE)
+    table.add_column("Area", style="bold")
+    table.add_column("Enabled by")
+    table.add_column("Dependencies")
+
+    needed_extras: list[str] = []
+    for name, spec in AREAS.items():
+        missing = missing_modules(name)
+        if name not in enabled:
+            state = "[dim]installed (unused)[/dim]" if not missing else "[dim]—[/dim]"
+            table.add_row(name, "[dim]not enabled[/dim]", state)
+            continue
+        if missing:
+            needed_extras.append(spec.extra)
+            table.add_row(name, enabled[name], f"[red]missing: {', '.join(missing)}[/red]")
+        else:
+            table.add_row(name, enabled[name], "[green]ok[/green]")
+    console.print(table)
+
+    if not needed_extras:
+        console.print("[green]Every enabled area has its dependencies installed.[/green]")
+        return
+    if check:
+        raise typer.Exit(code=1)
+    if not run_install(needed_extras, yes=yes):
+        raise typer.Exit(code=1)
+    console.print("[green]Dependencies installed — the areas above are ready.[/green]")
+
+
 def _mask(value: str | None, secret: bool) -> str:
     if not value:
         return "[dim]unset[/dim]"
@@ -226,6 +269,24 @@ def _offline_checks() -> list[CheckResult]:
             )
         )
 
+    # Optional-dependency status for every enabled area.
+    from dataplat.core.deps import enabled_areas, missing_modules
+
+    for area, var in enabled_areas().items():
+        missing_deps = missing_modules(area)
+        results.append(
+            _check(
+                f"{area} dependencies",
+                not missing_deps,
+                detail=(
+                    f"enabled by {var}"
+                    if not missing_deps
+                    else f"enabled by {var}; missing {', '.join(missing_deps)}"
+                ),
+                hint="Run `dp config sync`." if missing_deps else "",
+            )
+        )
+
     # Optional components: flag missing vars only when partially configured.
     base = bool(os.getenv("AIRBYTE_BASE_URL"))
     cloud = bool(os.getenv("AIRBYTE_CLIENT_ID") and os.getenv("AIRBYTE_CLIENT_SECRET"))
@@ -291,13 +352,26 @@ def _connect_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
 
     # Databases
-    import psycopg
-
-    from dataplat.cli.db._common import ConnCliParams
     from dataplat.core.errors import DataplatError
     from dataplat.services.db.targets import load_targets
 
-    for name in load_targets():
+    db_deps_ready = True
+    try:
+        import psycopg
+
+        from dataplat.cli.db._common import ConnCliParams
+    except ImportError:
+        db_deps_ready = False
+        results.append(
+            _check(
+                "db probes",
+                False,
+                detail="psycopg not installed",
+                hint="Run `dp config sync`.",
+            )
+        )
+
+    for name in load_targets() if db_deps_ready else []:
         try:
             params = ConnCliParams(target=name).resolve()
             kwargs: dict = {**params.as_psycopg_kwargs(), "connect_timeout": 10}
@@ -311,31 +385,51 @@ def _connect_checks() -> list[CheckResult]:
 
     # Airbyte (only when configured)
     from dataplat.core.errors import AuthError, ConfigError
-    from dataplat.services.airbyte.client import build_authenticated_client
 
     if os.getenv("AIRBYTE_BASE_URL"):
         try:
+            from dataplat.services.airbyte.client import build_authenticated_client
+
             client, _ = build_authenticated_client()
             client.close()
             results.append(_check("Airbyte auth", True, detail="token acquired"))
+        except ImportError:
+            results.append(
+                _check(
+                    "Airbyte auth",
+                    False,
+                    detail="ingest dependencies not installed",
+                    hint="Run `dp config sync`.",
+                )
+            )
         except (ConfigError, AuthError) as exc:
             results.append(_check("Airbyte auth", False, detail=str(exc)[:120]))
 
     # Superset (only when configured)
     if os.getenv("SUPERSET_BASE_URL"):
-        import httpx
-
         from dataplat.core.errors import DataplatError
-        from dataplat.services.superset.client import (
-            get_auth_config_from_env,
-            login,
-        )
 
         try:
+            import httpx
+
+            from dataplat.services.superset.client import (
+                get_auth_config_from_env,
+                login,
+            )
+
             cfg = get_auth_config_from_env()
             with httpx.Client() as client:
                 login(client, cfg.base_url, cfg.username, cfg.password)
             results.append(_check("Superset auth", True, detail="login ok"))
+        except ImportError:
+            results.append(
+                _check(
+                    "Superset auth",
+                    False,
+                    detail="bi dependencies not installed",
+                    hint="Run `dp config sync`.",
+                )
+            )
         except DataplatError as exc:
             results.append(_check("Superset auth", False, detail=str(exc)[:120]))
 

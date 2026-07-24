@@ -50,12 +50,44 @@ dp
 ## Installation
 
 ```bash
-uv tool install dataplat     # recommended
+uv tool install "dataplat[all]"     # recommended: everything
 # or
-pipx install dataplat
+pipx install "dataplat[all]"
 # or
-pip install dataplat
+pip install "dataplat[all]"
 ```
+
+Each area's dependencies are an optional extra, so you can also install
+only what your platform uses:
+
+| Extra | Enables | Pulls in |
+| --- | --- | --- |
+| `db` | `dp db` | psycopg |
+| `ingest` | `dp ingest` | httpx, textual, croniter |
+| `bi` | `dp bi` | httpx |
+| `cloud` | `dp cloud` | boto3, plotext |
+| `all` | everything | all of the above |
+
+A bare `pip install dataplat` gives you the core (`status`, `open`,
+`config`) with every other area stubbed. You don't have to plan this in
+advance: `dp` knows which areas your configuration enables and installs
+what's missing on demand — see below.
+
+## Auto-installing dependencies
+
+Two ways, both of which detect whether `dp` runs from a uv tool, pipx, or
+plain-venv install and use the matching installer:
+
+```bash
+dp config sync            # detect enabled areas, install missing deps (confirms)
+dp config sync --check    # report only; exit 1 if something is missing (CI-friendly)
+```
+
+Or just use a command: if your config enables an area whose extra is
+missing, `dp db query ...` shows exactly what it will run, asks, installs,
+and re-runs your original command. Non-interactive sessions never install
+silently — they print the command and exit instead. `dp config doctor`
+also reports per-area dependency status.
 
 ## Quick start
 
@@ -233,7 +265,7 @@ dp ingest airbyte connections set-cursor -c <connection-id> --xmin 0 --yes
 ```bash
 git clone https://github.com/hanslemm/dataplat
 cd dataplat
-uv sync --group dev
+uv sync --group dev --all-extras
 uv run pytest
 uv run ruff check .
 uv run mypy dataplat

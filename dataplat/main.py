@@ -12,14 +12,34 @@ from dataplat.core.envrc import load_envrc
 # regions, DNS) read the environment at import time.
 load_envrc()
 
-from dataplat.cli.bi.app import app as bi_app  # noqa: E402
+from dataplat.cli._missing import build_missing_deps_app  # noqa: E402
 from dataplat.cli.ci.app import app as ci_app  # noqa: E402
-from dataplat.cli.cloud.app import app as cloud_app  # noqa: E402
 from dataplat.cli.config import app as config_app  # noqa: E402
-from dataplat.cli.db import app as db_app  # noqa: E402
-from dataplat.cli.ingest.app import app as ingest_app  # noqa: E402
 from dataplat.cli.open import app as open_app  # noqa: E402
 from dataplat.cli.status import app as status_app  # noqa: E402
+from dataplat.core.deps import area_ready  # noqa: E402
+
+# Areas with optional dependencies mount for real only when their extra is
+# installed; otherwise a stub group explains and offers to install it.
+if area_ready("db"):
+    from dataplat.cli.db import app as db_app
+else:
+    db_app = build_missing_deps_app("db", "Database query commands")
+
+if area_ready("ingest"):
+    from dataplat.cli.ingest.app import app as ingest_app
+else:
+    ingest_app = build_missing_deps_app("ingest", "Data ingestion tools (Airbyte)")
+
+if area_ready("bi"):
+    from dataplat.cli.bi.app import app as bi_app
+else:
+    bi_app = build_missing_deps_app("bi", "Business-intelligence tools (Superset)")
+
+if area_ready("cloud"):
+    from dataplat.cli.cloud.app import app as cloud_app
+else:
+    cloud_app = build_missing_deps_app("cloud", "Cloud-provider tools (AWS)")
 
 app = typer.Typer(
     name="dp",

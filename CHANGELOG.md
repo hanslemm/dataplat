@@ -4,6 +4,11 @@
 
 Initial public release.
 
+- Optional per-area dependency extras (`dataplat[db,ingest,bi,cloud,all]`)
+  with auto-detection: `dp config sync` installs what your enabled areas
+  need, and hitting a stubbed area offers to install its extra and re-run
+  your command.
+
 - `dp` command with areas per component type: `db`, `ingest` (Airbyte),
   `bi` (Superset), `cloud` (AWS), `ci` (GitHub runners), plus `status`,
   `open`, and `config`.

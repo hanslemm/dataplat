@@ -99,3 +99,54 @@ def test_doctor_offline_passes_when_configured(monkeypatch, tmp_path: Path) -> N
 
     assert result.exit_code == 0, result.output
     assert "All checks passed" in result.output
+
+
+def test_sync_reports_ok_when_everything_installed(monkeypatch) -> None:
+    from dataplat.core import deps
+
+    monkeypatch.setattr(deps, "missing_modules", lambda area: [])
+
+    result = runner.invoke(config_cli.app, ["sync"])
+
+    assert result.exit_code == 0, result.output
+    assert "Every enabled area has its dependencies installed." in result.output
+
+
+def test_sync_check_fails_when_enabled_area_missing_deps(monkeypatch) -> None:
+    from dataplat.core import deps
+
+    # db is enabled via DP_TARGETS (conftest); pretend psycopg is absent.
+    monkeypatch.setattr(
+        deps,
+        "missing_modules",
+        lambda area: ["psycopg"] if area == "db" else [],
+    )
+
+    result = runner.invoke(config_cli.app, ["sync", "--check"])
+
+    assert result.exit_code == 1
+    assert "missing: psycopg" in result.output
+
+
+def test_sync_installs_needed_extras(monkeypatch) -> None:
+    from dataplat.cli import _missing
+    from dataplat.core import deps
+
+    monkeypatch.setenv("AIRBYTE_BASE_URL", "https://airbyte.example.com")
+    monkeypatch.setattr(
+        deps,
+        "missing_modules",
+        lambda area: {"db": ["psycopg"], "ingest": ["httpx"]}.get(area, []),
+    )
+    installed: list[tuple[list[str], bool]] = []
+    monkeypatch.setattr(
+        _missing,
+        "run_install",
+        lambda extras, yes: installed.append((extras, yes)) or True,
+    )
+
+    result = runner.invoke(config_cli.app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert installed == [(["db", "ingest"], True)]
+    assert "Dependencies installed" in result.output
