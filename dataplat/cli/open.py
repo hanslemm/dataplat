@@ -9,6 +9,8 @@ from urllib.parse import quote
 import typer
 from rich.console import Console
 
+from dataplat.cli._render import cell
+
 console = Console()
 
 app = typer.Typer(
@@ -16,6 +18,7 @@ app = typer.Typer(
     help="Open a system's web UI in the browser",
     no_args_is_help=True,
 )
+
 
 def _console_region() -> str:
     return (
@@ -43,7 +46,9 @@ def _env_base_url(var: str) -> str:
 
 
 def _launch(url: str, print_only: bool) -> None:
-    console.print(url)
+    # The base URL comes from an env var and the identifiers from argv, so the
+    # URL is external data: print it literally instead of as Rich markup.
+    console.print(cell(url))
     if not print_only:
         webbrowser.open(url)
 

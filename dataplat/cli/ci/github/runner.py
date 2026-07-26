@@ -1,5 +1,7 @@
 """GitHub Actions runner management commands."""
 
+from __future__ import annotations
+
 import os
 import re
 import subprocess
@@ -9,6 +11,8 @@ from urllib.parse import urlparse
 import typer
 from rich.console import Console
 from rich.table import Table
+
+from dataplat.cli._render import cell, esc
 
 app = typer.Typer(
     name="runner",
@@ -50,21 +54,25 @@ def run_command(
         )
         return result
     except FileNotFoundError:
-        console.print(f"[red]Error: {cmd[0]} not found on PATH[/red]")
+        console.print(f"[red]Error: {esc(cmd[0])} not found on PATH[/red]")
         raise typer.Exit(code=1)
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Command failed: {' '.join(cmd)}[/red]")
-        console.print(f"[red]Error: {e.stderr}[/red]")
+        # argv carries runner names, repo URLs and paths, and stderr is docker's
+        # own text: both must be escaped or a stray "[..]" breaks the render.
+        console.print(f"[red]Command failed: {esc(' '.join(cmd))}[/red]")
+        console.print(f"[red]Error: {esc(e.stderr)}[/red]")
         raise typer.Exit(code=1)
 
 
 def ensure_docker_available() -> None:
     """Exit with a clear message when docker is missing or the daemon is down."""
-    result = run_command(["docker", "info", "--format", "{{.ServerVersion}}"], check=False)
+    result = run_command(
+        ["docker", "info", "--format", "{{.ServerVersion}}"], check=False
+    )
     if result.returncode != 0:
         detail = (result.stderr or "").strip().splitlines()
         hint = detail[0] if detail else "daemon not reachable"
-        console.print(f"[red]Error: docker daemon unavailable ({hint})[/red]")
+        console.print(f"[red]Error: docker daemon unavailable ({esc(hint)})[/red]")
         raise typer.Exit(code=1)
 
 
@@ -87,17 +95,30 @@ def ensure_image_present(image: str) -> None:
     inspect = run_command(["docker", "image", "inspect", image], check=False)
     if getattr(inspect, "returncode", 0) == 0:
         return
-    console.print(f"[dim]Image {image} not present locally. Pulling…[/dim]")
+    console.print(f"[dim]Image {esc(image)} not present locally. Pulling…[/dim]")
     try:
         subprocess.run(["docker", "pull", image], check=True)
     except subprocess.CalledProcessError:
-        console.print(f"[red]Failed to pull image: {image}[/red]")
+        console.print(f"[red]Failed to pull image: {esc(image)}[/red]")
         raise typer.Exit(code=1)
 
 
 def get_container_name(runner_name: str) -> str:
     """Generate a Docker-safe container name from the runner name."""
     return f"gha-runner-{_slug(runner_name, fallback='runner')}"
+
+
+def name_filter(container_name: str) -> str:
+    """Build a ``docker ps -f`` value matching exactly one container.
+
+    ``name=`` is an unanchored regex, not an equality test: filtering on
+    ``gha-runner-foo`` also matches ``gha-runner-foobar``, so status would
+    report a sibling runner's row as yours and stop/start would act on the
+    wrong container. Anchor both ends, and escape the one metacharacter
+    :func:`_slug` still lets through (``.``) so it cannot widen the match.
+    """
+    pattern = container_name.replace(".", r"\.")
+    return f"name=^{pattern}$"
 
 
 def get_runner_state_dir() -> Path:
@@ -225,7 +246,7 @@ def start(
     # Check for existing container
     console.print("Checking for existing GitHub Actions runner...")
     result = run_command(
-        ["docker", "ps", "-a", "-q", "-f", f"name={container_name}"], check=False
+        ["docker", "ps", "-a", "-q", "-f", name_filter(container_name)], check=False
     )
 
     if result.stdout.strip():
@@ -285,9 +306,11 @@ def start(
     run_command(docker_cmd, env=docker_env)
     record_repo_mount(repo_url, resolved_local_workdir)
     console.print("[green]✓ GitHub Actions runner started successfully[/green]")
-    console.print(f"[dim]Container name: {container_name}[/dim]")
-    console.print(f"[dim]Local mount: {resolved_local_workdir}[/dim]")
-    console.print(f"[dim]Mount record: {get_repo_mount_record_path(repo_url)}[/dim]")
+    console.print(f"[dim]Container name: {esc(container_name)}[/dim]")
+    console.print(f"[dim]Local mount: {esc(resolved_local_workdir)}[/dim]")
+    console.print(
+        f"[dim]Mount record: {esc(get_repo_mount_record_path(repo_url))}[/dim]"
+    )
 
 
 @app.command()
@@ -304,7 +327,7 @@ def stop(
 
     # Check if container is running
     result = run_command(
-        ["docker", "ps", "-q", "-f", f"name={container_name}"], check=False
+        ["docker", "ps", "-q", "-f", name_filter(container_name)], check=False
     )
 
     if result.stdout.strip():
@@ -329,7 +352,7 @@ def status(
 
     # Check if container is running
     running_result = run_command(
-        ["docker", "ps", "-q", "-f", f"name={container_name}"], check=False
+        ["docker", "ps", "-q", "-f", name_filter(container_name)], check=False
     )
 
     if running_result.stdout.strip():
@@ -341,7 +364,7 @@ def status(
                 "docker",
                 "ps",
                 "-f",
-                f"name={container_name}",
+                name_filter(container_name),
                 "--format",
                 "{{.Names}}\t{{.Status}}\t{{.Ports}}",
             ],
@@ -357,13 +380,14 @@ def status(
 
             for line in lines:
                 parts = line.split("\t")
-                table.add_row(*parts)
+                table.add_row(*(cell(part) for part in parts))
 
             console.print(table)
     else:
         # Check if container exists but is not running
         exists_result = run_command(
-            ["docker", "ps", "-a", "-q", "-f", f"name={container_name}"], check=False
+            ["docker", "ps", "-a", "-q", "-f", name_filter(container_name)],
+            check=False,
         )
 
         if exists_result.stdout.strip():
@@ -377,7 +401,7 @@ def status(
                     "ps",
                     "-a",
                     "-f",
-                    f"name={container_name}",
+                    name_filter(container_name),
                     "--format",
                     "{{.Names}}\t{{.Status}}",
                 ],
@@ -392,7 +416,7 @@ def status(
 
                 for line in lines:
                     parts = line.split("\t")
-                    table.add_row(*parts)
+                    table.add_row(*(cell(part) for part in parts))
 
                 console.print(table)
         else:
