@@ -12,6 +12,9 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from dataplat.cli._options import YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import esc
 from dataplat.core.errors import ConfigError, ServiceError, ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
@@ -68,20 +71,43 @@ TargetOption = typer.Option(
     "-t",
     help="Named DB target from DP_TARGETS, or all.",
 )
-YesOption = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt.")
+
+
+def _tag(label: str) -> str:
+    """The ``[<engine>]`` prefix every progress line carries.
+
+    ``[postgres]`` and ``[redshift]`` are well-formed Rich tags, so unescaped
+    the prefix was parsed as a style name and silently dropped — leaving the
+    reader unable to tell which cluster a rename or drop line belonged to.
+    """
+    return esc(f"[{label}]")
 
 
 def _timestamped_log_path(prefix: str) -> str:
-    """Build a unique-per-run log path like ``<log dir>/<prefix>-<UTC ISO>.log.json``."""
+    """Build a unique-per-run log path: ``<log dir>/<prefix>-<UTC ISO>.log.json``."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return str(LOG_DIR / f"{prefix}-{stamp}.log.json")
 
 
+def _logs_in(directory: Path, prefix: str) -> list[str]:
+    """Timestamped logs for ``prefix`` inside ``directory``.
+
+    ``glob.escape`` the directory but not the pattern: only the ``*`` after the
+    prefix is meant to be a wildcard. Left unescaped, a bracket anywhere in the
+    path — a home directory named ``[work]`` is enough — reads as a character
+    class and quietly matches nothing, so ``revert`` would report no history and
+    ``purge --older-than`` would treat every object as having no recorded
+    rename.
+    """
+    pattern = os.path.join(glob.escape(str(directory)), f"{prefix}-*.log.json")
+    return glob.glob(pattern)
+
+
 def _matching_logs(prefix: str) -> list[str]:
     """All timestamped logs for ``prefix``, oldest first (by timestamped name)."""
-    matches = glob.glob(str(LOG_DIR / f"{prefix}-*.log.json"))
-    matches += glob.glob(str(LEGACY_LOG_DIR / f"{prefix}-*.log.json"))
+    matches = _logs_in(LOG_DIR, prefix)
+    matches += _logs_in(LEGACY_LOG_DIR, prefix)
     return sorted(matches, key=os.path.basename)
 
 
@@ -96,17 +122,9 @@ def _engines_for_target(name: str) -> list[tuple[str, SqlEngine, str]]:
     try:
         targets = resolve_targets(name)
     except ValidationError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     return [(_ENGINE_LABELS[t.engine], t.engine, t.env_prefix) for t in targets]
-
-
-def _confirm_or_abort(prompt: str, yes: bool) -> None:
-    if yes:
-        return
-    if not typer.confirm(prompt, default=False):
-        console.print("[yellow]Aborted.[/yellow]")
-        raise typer.Exit(code=1)
 
 
 def _parse_exclusions(
@@ -139,9 +157,7 @@ def _parse_exclusions(
         for piece in raw.split(","):
             token = piece.strip()
             if not token:
-                raise ValidationError(
-                    f"Empty exclusion token in {raw!r}"
-                )
+                raise ValidationError(f"Empty exclusion token in {raw!r}")
             parts = token.split(".")
             if len(parts) == 1:
                 schemas.add(parts[0])
@@ -149,8 +165,7 @@ def _parse_exclusions(
                 relations.add((parts[0], parts[1]))
             else:
                 raise ValidationError(
-                    f"Invalid exclusion {token!r}: expected 'schema' or "
-                    f"'schema.name'"
+                    f"Invalid exclusion {token!r}: expected 'schema' or 'schema.name'"
                 )
     return frozenset(schemas), frozenset(relations)
 
@@ -210,13 +225,16 @@ def main(
             exclude, exclude_file
         )
     except ValidationError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        # The message quotes the offending --exclude token back at the user.
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     engines = _engines_for_target(target)
     if not dry_run:
-        _confirm_or_abort(
-            "Rename every orphaned dbt object with a _deprecated suffix?", yes
+        confirm_or_exit(
+            yes=yes,
+            prompt="Rename every orphaned dbt object with a _deprecated suffix?",
+            console=console,
         )
 
     since = datetime.now(UTC) - timedelta(days=window_days)
@@ -238,9 +256,9 @@ def main(
             )
     except ServiceError as exc:
         _write_audit_log(log, all_entries, dry_run=dry_run)
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         console.print(
-            f"[yellow]Partial audit log written to {log} "
+            f"[yellow]Partial audit log written to {esc(log)} "
             f"({len(all_entries)} entries).[/yellow]"
         )
         raise typer.Exit(code=1)
@@ -250,12 +268,10 @@ def main(
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(
         f"[green]{prefix}Processed {len(all_entries)} object(s). "
-        f"Log written to {log}.[/green]"
+        f"Log written to {esc(log)}.[/green]"
     )
     if dry_run and all_entries:
-        console.print(
-            "[dim]Re-run with --no-dry-run to apply these renames.[/dim]"
-        )
+        console.print("[dim]Re-run with --no-dry-run to apply these renames.[/dim]")
 
 
 def _write_audit_log(
@@ -289,7 +305,7 @@ def _run_for_engine(
         raise ServiceError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
-            f"[yellow][{label}] Missing connection parameters, skipping.[/yellow]"
+            f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"
         )
         return []
 
@@ -300,48 +316,48 @@ def _run_for_engine(
         open_transactional_connection(params, dry_run=dry_run) as conn,
         conn.cursor() as cur,
     ):
-            live = fetch_live_model_relations(
-                cur,
-                invocation_command=invocation_command(),
-                node_prefix=dbt_node_prefix,
-                statuses=LIVE_STATUSES,
-                since=since,
+        live = fetch_live_model_relations(
+            cur,
+            invocation_command=invocation_command(),
+            node_prefix=dbt_node_prefix,
+            statuses=LIVE_STATUSES,
+            since=since,
+        )
+        if not live:
+            console.print(
+                f"[yellow]{_tag(label)} No matching dbt builds in the last "
+                f"{window_days} day(s); skipping to avoid diffing "
+                f"against empty set.[/yellow]"
             )
-            if not live:
-                console.print(
-                    f"[yellow][{label}] No matching dbt builds in the last "
-                    f"{window_days} day(s); skipping to avoid diffing "
-                    f"against empty set.[/yellow]"
+            return []
+
+        excluded = excluded_schemas()
+        schemas_to_scan = sorted(s for s in live if s not in excluded)
+        existing = fetch_existing_relations(
+            cur, schemas_to_scan, is_redshift=is_redshift
+        )
+        orphans = diff_orphans(
+            live=live,
+            existing=existing,
+            excluded_schemas=excluded,
+            excluded_user_schemas=excluded_user_schemas,
+            excluded_user_relations=excluded_user_relations,
+        )
+
+        _print_summary(label, live, existing, orphans)
+
+        for schema, names in orphans.items():
+            for name in names:
+                entry = _rename_orphan(
+                    cur,
+                    label,
+                    schema,
+                    name,
+                    is_redshift=is_redshift,
+                    dry_run=dry_run,
                 )
-                return []
-
-            excluded = excluded_schemas()
-            schemas_to_scan = sorted(s for s in live if s not in excluded)
-            existing = fetch_existing_relations(
-                cur, schemas_to_scan, is_redshift=is_redshift
-            )
-            orphans = diff_orphans(
-                live=live,
-                existing=existing,
-                excluded_schemas=excluded,
-                excluded_user_schemas=excluded_user_schemas,
-                excluded_user_relations=excluded_user_relations,
-            )
-
-            _print_summary(label, live, existing, orphans)
-
-            for schema, names in orphans.items():
-                for name in names:
-                    entry = _rename_orphan(
-                        cur,
-                        label,
-                        schema,
-                        name,
-                        is_redshift=is_redshift,
-                        dry_run=dry_run,
-                    )
-                    if entry is not None:
-                        entries.append(entry)
+                if entry is not None:
+                    entries.append(entry)
 
     return entries
 
@@ -355,12 +371,10 @@ def _print_summary(
     live_count = sum(len(v) for v in live.values())
     existing_count = sum(len(v) for v in existing.values())
     orphan_count = sum(len(v) for v in orphans.values())
-    per_schema = ", ".join(
-        f"{len(v)} in {s}" for s, v in sorted(orphans.items())
-    )
+    per_schema = ", ".join(f"{len(v)} in {esc(s)}" for s, v in sorted(orphans.items()))
     suffix = f" ({per_schema})" if per_schema else ""
     console.print(
-        f"[cyan][{label}] {live_count} live dbt models; {existing_count} "
+        f"[cyan]{_tag(label)} {live_count} live dbt models; {existing_count} "
         f"existing in live schemas; {orphan_count} orphans after "
         f"exclusions{suffix}[/cyan]"
     )
@@ -376,24 +390,27 @@ def _rename_orphan(
     dry_run: bool,
 ) -> RenameEntry | None:
     kind = classify_object(cur, schema, name, is_redshift=is_redshift)
+    # Schema and relation names come from the warehouse catalog, so every
+    # interpolation below has to be escaped before Rich parses the markup.
     if kind is None:
         console.print(
-            f"[yellow][{label}] {schema}.{name} no longer present, skipping.[/yellow]"
+            f"[yellow]{_tag(label)} {esc(schema)}.{esc(name)} no longer present, "
+            f"skipping.[/yellow]"
         )
         return None
 
     new_name = f"{name}{DEPRECATED_SUFFIX}"
     if classify_object(cur, schema, new_name, is_redshift=is_redshift) is not None:
         console.print(
-            f"[yellow][{label}] {schema}.{new_name} already exists, "
-            f"skipping rename of {schema}.{name}.[/yellow]"
+            f"[yellow]{_tag(label)} {esc(schema)}.{esc(new_name)} already exists, "
+            f"skipping rename of {esc(schema)}.{esc(name)}.[/yellow]"
         )
         return None
 
     action = "[DRY-RUN] Would rename" if dry_run else "Renaming"
     console.print(
-        f"[blue][{label}] {action} {kind} "
-        f"{schema}.{name} -> {schema}.{new_name}[/blue]"
+        f"[blue]{_tag(label)} {action} {kind} "
+        f"{esc(schema)}.{esc(name)} -> {esc(schema)}.{esc(new_name)}[/blue]"
     )
 
     if not dry_run:
@@ -430,29 +447,26 @@ def revert_cmd(
         log = _find_latest_log(APPLY_LOG_PREFIX)
         if log is None:
             console.print(
-                f"[red]Error: no {APPLY_LOG_PREFIX} log found in "
-                f"{LOG_DIR}/[/red]"
+                f"[red]Error: no {APPLY_LOG_PREFIX} log found in {esc(LOG_DIR)}/[/red]"
             )
             console.print(
                 "[dim]Run `dp db dbt-orphans` first or pass --log explicitly.[/dim]"
             )
             raise typer.Exit(code=1)
-        console.print(f"[dim]Using latest log: {log}[/dim]")
+        console.print(f"[dim]Using latest log: {esc(log)}[/dim]")
     if not os.path.exists(log):
-        console.print(f"[red]Error: log file not found: {log}[/red]")
-        console.print(
-            "[dim]Run `dp db dbt-orphans` first to generate it.[/dim]"
-        )
+        console.print(f"[red]Error: log file not found: {esc(log)}[/red]")
+        console.print("[dim]Run `dp db dbt-orphans` first to generate it.[/dim]")
         raise typer.Exit(code=1)
 
     try:
         with open(log) as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        console.print(f"[red]Error: could not read log {log}: {exc}[/red]")
+        console.print(f"[red]Error: could not read log {esc(log)}: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     if not isinstance(payload, dict):
-        console.print(f"[red]Error: malformed log {log}: expected an object[/red]")
+        console.print(f"[red]Error: malformed log {esc(log)}: expected an object[/red]")
         raise typer.Exit(code=1)
 
     if payload.get("dry_run"):
@@ -463,26 +477,23 @@ def revert_cmd(
 
     renames = payload.get("renames") or []
     if not renames:
-        console.print(
-            "[dim]No renames recorded in the log; nothing to revert.[/dim]"
-        )
+        console.print("[dim]No renames recorded in the log; nothing to revert.[/dim]")
         return
 
     total = 0
     try:
         for label, engine, env_prefix in _engines_for_target(target):
             entries = [
-                r for r in renames
-                if isinstance(r, dict) and r.get("database") == label
+                r for r in renames if isinstance(r, dict) and r.get("database") == label
             ]
             if not entries:
-                console.print(f"[dim][{label}] No entries in log.[/dim]")
+                console.print(f"[dim]{_tag(label)} No entries in log.[/dim]")
                 continue
             total += _revert_for_engine(
                 label, engine, entries, env_prefix=env_prefix, dry_run=dry_run
             )
     except ServiceError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         console.print(
             f"[yellow]Reverted {total} object(s) before the failure.[/yellow]"
         )
@@ -491,9 +502,7 @@ def revert_cmd(
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(f"[green]{prefix}Reverted {total} object(s).[/green]")
     if dry_run and total:
-        console.print(
-            "[dim]Re-run with --no-dry-run to revert these renames.[/dim]"
-        )
+        console.print("[dim]Re-run with --no-dry-run to revert these renames.[/dim]")
 
 
 def _revert_for_engine(
@@ -510,7 +519,7 @@ def _revert_for_engine(
         raise ServiceError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
-            f"[yellow][{label}] Missing connection parameters, skipping.[/yellow]"
+            f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"
         )
         return 0
 
@@ -521,11 +530,9 @@ def _revert_for_engine(
         open_transactional_connection(params, dry_run=dry_run) as conn,
         conn.cursor() as cur,
     ):
-            for entry in entries:
-                if _revert_one(
-                    cur, label, entry, is_redshift=is_redshift, dry_run=dry_run
-                ):
-                    reverted += 1
+        for entry in entries:
+            if _revert_one(cur, label, entry, is_redshift=is_redshift, dry_run=dry_run):
+                reverted += 1
 
     return reverted
 
@@ -543,29 +550,31 @@ def _revert_one(
     original_name = entry.get("old_name")
     if not (schema and current_name and original_name):
         console.print(
-            f"[yellow][{label}] Skipping malformed log entry: {entry!r}[/yellow]"
+            f"[yellow]{_tag(label)} Skipping malformed log entry: "
+            f"{esc(repr(entry))}[/yellow]"
         )
         return False
     kind: ObjectKind = entry.get("kind", "table")
 
     if classify_object(cur, schema, current_name, is_redshift=is_redshift) is None:
         console.print(
-            f"[dim][{label}] {schema}.{current_name} not found, "
+            f"[dim]{_tag(label)} {esc(schema)}.{esc(current_name)} not found, "
             f"skipping revert.[/dim]"
         )
         return False
 
     if classify_object(cur, schema, original_name, is_redshift=is_redshift) is not None:
         console.print(
-            f"[yellow][{label}] {schema}.{original_name} already exists, "
-            f"cannot revert {schema}.{current_name}.[/yellow]"
+            f"[yellow]{_tag(label)} {esc(schema)}.{esc(original_name)} already "
+            f"exists, cannot revert {esc(schema)}.{esc(current_name)}.[/yellow]"
         )
         return False
 
     action = "[DRY-RUN] Would revert" if dry_run else "Reverting"
     console.print(
-        f"[blue][{label}] {action} {kind} "
-        f"{schema}.{current_name} -> {schema}.{original_name}[/blue]"
+        f"[blue]{_tag(label)} {action} {kind} "
+        f"{esc(schema)}.{esc(current_name)} -> "
+        f"{esc(schema)}.{esc(original_name)}[/blue]"
     )
 
     if not dry_run:
@@ -661,14 +670,17 @@ def purge_cmd(
             exclude, exclude_file
         )
     except ValidationError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     engines = _engines_for_target(target)
     if not dry_run:
-        _confirm_or_abort(
-            "Permanently DROP every *_deprecated object? This cannot be undone.",
-            yes,
+        confirm_or_exit(
+            yes=yes,
+            prompt=(
+                "Permanently DROP every *_deprecated object? This cannot be undone."
+            ),
+            console=console,
         )
 
     renamed_at = _renamed_at_index() if older_than is not None else None
@@ -696,9 +708,9 @@ def purge_cmd(
             )
     except ServiceError as exc:
         _write_purge_log(log, all_drops, dry_run=dry_run)
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         console.print(
-            f"[yellow]Partial purge log written to {log} "
+            f"[yellow]Partial purge log written to {esc(log)} "
             f"({len(all_drops)} entries).[/yellow]"
         )
         raise typer.Exit(code=1)
@@ -708,12 +720,11 @@ def purge_cmd(
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(
         f"[green]{prefix}Dropped {len(all_drops)} object(s). "
-        f"Log written to {log}.[/green]"
+        f"Log written to {esc(log)}.[/green]"
     )
     if dry_run and all_drops:
         console.print(
-            "[dim]Re-run with --no-dry-run to apply these drops "
-            "(irreversible).[/dim]"
+            "[dim]Re-run with --no-dry-run to apply these drops (irreversible).[/dim]"
         )
 
 
@@ -735,7 +746,7 @@ def _purge_for_engine(
         raise ServiceError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
-            f"[yellow][{label}] Missing connection parameters, skipping.[/yellow]"
+            f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"
         )
         return []
 
@@ -747,37 +758,33 @@ def _purge_for_engine(
         open_transactional_connection(params, dry_run=dry_run) as conn,
         conn.cursor() as cur,
     ):
-            deprecated = fetch_deprecated_objects(
-                cur,
-                is_redshift=is_redshift,
-                excluded_schemas=effective_excluded_schemas,
-            )
-            deprecated = [
-                (s, n, k)
-                for s, n, k in deprecated
-                if (s, n) not in excluded_user_relations
-            ]
+        deprecated = fetch_deprecated_objects(
+            cur,
+            is_redshift=is_redshift,
+            excluded_schemas=effective_excluded_schemas,
+        )
+        deprecated = [
+            (s, n, k) for s, n, k in deprecated if (s, n) not in excluded_user_relations
+        ]
 
-            if renamed_at is not None and cutoff is not None:
-                deprecated = _apply_age_filter(
-                    deprecated,
-                    label=label,
-                    renamed_at=renamed_at,
-                    cutoff=cutoff,
-                    include_unknown=include_unknown,
-                )
-
-            console.print(
-                f"[cyan][{label}] {len(deprecated)} deprecated "
-                f"object(s) after exclusions.[/cyan]"
+        if renamed_at is not None and cutoff is not None:
+            deprecated = _apply_age_filter(
+                deprecated,
+                label=label,
+                renamed_at=renamed_at,
+                cutoff=cutoff,
+                include_unknown=include_unknown,
             )
 
-            for schema, name, kind in deprecated:
-                entry = _drop_one(
-                    cur, label, schema, name, kind, dry_run=dry_run
-                )
-                if entry is not None:
-                    drops.append(entry)
+        console.print(
+            f"[cyan]{_tag(label)} {len(deprecated)} deprecated "
+            f"object(s) after exclusions.[/cyan]"
+        )
+
+        for schema, name, kind in deprecated:
+            entry = _drop_one(cur, label, schema, name, kind, dry_run=dry_run)
+            if entry is not None:
+                drops.append(entry)
 
     return drops
 
@@ -799,15 +806,16 @@ def _apply_age_filter(
                 kept.append((schema, name, kind))
             else:
                 console.print(
-                    f"[yellow][{label}] {schema}.{name}: no recorded rename; "
-                    f"skipping (pass --include-unknown to drop anyway).[/yellow]"
+                    f"[yellow]{_tag(label)} {esc(schema)}.{esc(name)}: no recorded "
+                    f"rename; skipping (pass --include-unknown to drop "
+                    f"anyway).[/yellow]"
                 )
             continue
         if when <= cutoff:
             kept.append((schema, name, kind))
         else:
             console.print(
-                f"[dim][{label}] {schema}.{name}: renamed "
+                f"[dim]{_tag(label)} {esc(schema)}.{esc(name)}: renamed "
                 f"{when.date()}, inside the grace period; skipping.[/dim]"
             )
     return kept
@@ -823,15 +831,15 @@ def _drop_one(
     dry_run: bool,
 ) -> DropEntry | None:
     action = "[DRY-RUN] Would drop" if dry_run else "Dropping"
-    console.print(f"[blue][{label}] {action} {kind} {schema}.{name}[/blue]")
+    console.print(
+        f"[blue]{_tag(label)} {action} {kind} {esc(schema)}.{esc(name)}[/blue]"
+    )
     if not dry_run:
         drop_object(cur, schema, name, kind)
     return DropEntry(database=label, schema=schema, name=name, kind=kind)
 
 
-def _write_purge_log(
-    log_path: str, entries: list[DropEntry], *, dry_run: bool
-) -> None:
+def _write_purge_log(log_path: str, entries: list[DropEntry], *, dry_run: bool) -> None:
     payload = {
         "generated_at": datetime.now(UTC).isoformat(),
         "dry_run": dry_run,

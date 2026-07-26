@@ -3,6 +3,16 @@
 Used by ``describe``, ``role``, and ``top-tables`` so all printed reports
 share one visual language: numbered sections with captions, a rounded title
 card, HORIZONTALS tables, and consistent size/row formatting.
+
+Markup rule for this module, no exceptions: **every ``str`` that crosses into
+these helpers is already-composed Rich markup, and the caller escapes the
+external parts of it** with :func:`dataplat.cli._render.esc`. That includes
+``title_card``'s ``title`` (a ``schema.table`` or role name), the section
+titles and captions, and every ``metadata`` value.
+
+Escaping inside the helpers is not an option: what callers hand over is built
+*from* the markup helpers here — ``dim``, ``green``, ``fmt_size``, ``DASH`` —
+so escaping it a second time would print the tags instead of applying them.
 """
 
 from __future__ import annotations
@@ -137,7 +147,11 @@ def title_card(
     subtitle: str,
     metadata: list[tuple[str, str]],
 ) -> Align | Panel:
-    """Build the cover card renderable."""
+    """Build the cover card renderable.
+
+    ``title``, ``subtitle``, and the ``metadata`` values are markup the caller
+    has already made safe (see the module docstring).
+    """
     width = console.size.width or 80
     two_column = width >= 100
 

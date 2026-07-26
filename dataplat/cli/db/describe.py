@@ -6,6 +6,12 @@ them with Rich. No SQL or connection handling in this module.
 Design goal: a printed-report feel — typography-first, generous whitespace,
 numbered sections with captions, a title card on top. Inspired by a
 well-typeset corporate data-dictionary PDF.
+
+Everything rendered here — identifiers, comments, constraint bodies, view SQL —
+comes from the warehouse, so it is either a :func:`cell` (table cells, whole
+values) or passed through :func:`esc` before it is interpolated into one of our
+markup strings. See :mod:`dataplat.cli.db._report` for the rule that applies to
+the shared report helpers.
 """
 
 from __future__ import annotations
@@ -18,7 +24,9 @@ import typer
 from rich.columns import Columns
 from rich.console import Console
 from rich.syntax import Syntax
+from rich.text import Text
 
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -132,30 +140,20 @@ def _strip_partition_bounds(bounds: str | None) -> str:
         return b
     prefix = "FOR VALUES IN ("
     if b.startswith(prefix) and b.endswith(")"):
-        return b[len(prefix):-1].strip()
+        return b[len(prefix) : -1].strip()
     return b
 
 
-def _summarize_partition_key(
-    key: str | None, strategy: str | None
-) -> tuple[str, str]:
+def _summarize_partition_key(key: str | None, strategy: str | None) -> tuple[str, str]:
     """Return ``(strategy_label, columns_label)`` for the summary line."""
     if not key:
         return (strategy or "", "")
     for prefix in ("LIST", "RANGE", "HASH"):
         lower_prefix = f"{prefix} ("
         if key.upper().startswith(lower_prefix):
-            inner = key[len(lower_prefix):].rstrip(")").strip()
+            inner = key[len(lower_prefix) :].rstrip(")").strip()
             return (prefix, inner)
     return (strategy or "", key)
-
-
-def _truncate(text: str, width: int) -> str:
-    if len(text) <= width:
-        return text
-    if width <= 1:
-        return "…"
-    return text[: width - 1] + "…"
 
 
 def _kind_label(kind: ObjectKind, *, partitioned: bool = False) -> str:
@@ -184,9 +182,9 @@ def _table_title_metadata(desc: TableDescription) -> list[tuple[str, str]]:
     hdr = desc.header
     pairs: list[tuple[str, str]] = []
     if hdr.owner:
-        pairs.append(("Owner", hdr.owner))
+        pairs.append(("Owner", esc(hdr.owner)))
     if hdr.tablespace:
-        pairs.append(("Tablespace", hdr.tablespace))
+        pairs.append(("Tablespace", esc(hdr.tablespace)))
     if hdr.total_size is not None:
         parts: list[str] = []
         if hdr.table_size is not None:
@@ -204,7 +202,7 @@ def _table_title_metadata(desc: TableDescription) -> list[tuple[str, str]]:
     if desc.partitioning.children:
         pairs.append(("Partitions", str(len(desc.partitioning.children))))
     if hdr.comment:
-        pairs.append(("Comment", hdr.comment))
+        pairs.append(("Comment", esc(hdr.comment)))
     return pairs
 
 
@@ -212,12 +210,12 @@ def _view_title_metadata(desc: ViewDescription) -> list[tuple[str, str]]:
     hdr = desc.header
     pairs: list[tuple[str, str]] = []
     if hdr.owner:
-        pairs.append(("Owner", hdr.owner))
+        pairs.append(("Owner", esc(hdr.owner)))
     pairs.append(("Updatable", "yes" if desc.definition.is_updatable else "no"))
     if desc.definition.check_option:
-        pairs.append(("Check option", desc.definition.check_option))
+        pairs.append(("Check option", esc(desc.definition.check_option)))
     if hdr.comment:
-        pairs.append(("Comment", hdr.comment))
+        pairs.append(("Comment", esc(hdr.comment)))
     return pairs
 
 
@@ -229,13 +227,13 @@ def _schema_title_metadata(desc: SchemaDescription) -> list[tuple[str, str]]:
 
     pairs: list[tuple[str, str]] = []
     if hdr.owner:
-        pairs.append(("Owner", hdr.owner))
+        pairs.append(("Owner", esc(hdr.owner)))
     if counts:
         parts = []
         for kind in sorted(counts):
             n = counts[kind]
             label = kind if n == 1 else f"{kind}s"
-            parts.append(f"{n} {label}")
+            parts.append(f"{n} {esc(label)}")
         pairs.append(("Contents", " · ".join(parts)))
     total_size = sum(item.size_bytes or 0 for item in desc.contents)
     if total_size > 0:
@@ -248,7 +246,7 @@ def _schema_title_metadata(desc: SchemaDescription) -> list[tuple[str, str]]:
     if total_rows > 0:
         pairs.append(("Rows (est)", _fmt_rows(total_rows)))
     if hdr.comment:
-        pairs.append(("Comment", hdr.comment))
+        pairs.append(("Comment", esc(hdr.comment)))
     return pairs
 
 
@@ -309,28 +307,26 @@ def _render_columns(
         table.add_column("Encoding")
 
     for c in desc.columns:
-        row: list[str] = [
+        row: list[str | Text] = [
             str(c.ordinal),
-            c.name,
-            c.data_type,
+            cell(c.name),
+            cell(c.data_type),
             _dim("not null") if not c.nullable else "",
         ]
         if is_table:
             if has_default:
-                row.append(_shorten_identity(c.default) or "")
+                row.append(cell(_shorten_identity(c.default) or ""))
             row.append("[cyan]●[/cyan]" if c.is_primary_key else "")
             if has_fk:
                 if c.fk_target_table:
-                    row.append(
-                        f"{_dim('→')} "
-                        f"{_dim(f'{c.fk_target_table}({c.fk_target_column})')}"
-                    )
+                    fk = esc(f"{c.fk_target_table}({c.fk_target_column})")
+                    row.append(f"{_dim('→')} {_dim(fk)}")
                 else:
                     row.append("")
         if has_comment:
-            row.append(_truncate(c.comment or "", comment_width))
+            row.append(cell(c.comment or "", max_length=comment_width))
         if has_encoding:
-            row.append(c.encoding or "")
+            row.append(cell(c.encoding or ""))
         table.add_row(*row)
 
     console.print(_indent(table))
@@ -340,7 +336,7 @@ def _render_columns(
         caption_bits: list[str] = []
         if pk is not None:
             caption_bits.append(
-                f"Primary key: {pk.name} ({', '.join(pk.columns)})"
+                f"Primary key: {esc(pk.name)} ({esc(', '.join(pk.columns))})"
             )
         caption_bits.append(f"{len(desc.columns)} columns")
         if desc.header.row_estimate is not None and desc.header.row_estimate >= 0:
@@ -383,15 +379,15 @@ def _render_indexes(
             kind = "[bold]UNIQUE[/bold]"
         else:
             kind = _dim("INDEX")
-        row = [
-            idx.name,
+        row: list[str | Text] = [
+            cell(idx.name),
             kind,
-            ", ".join(idx.columns),
-            idx.method,
+            cell(", ".join(idx.columns)),
+            cell(idx.method),
             _fmt_size(idx.size_bytes),
         ]
         if has_predicate:
-            row.append(idx.predicate or "")
+            row.append(cell(idx.predicate or ""))
         table.add_row(*row)
     console.print(_indent(table))
 
@@ -420,23 +416,23 @@ def _render_constraints(
     table.add_column("Details", overflow="fold")
 
     for fk in cons.foreign_keys:
-        cols = ", ".join(fk.columns)
-        ref = f"{fk.referenced_table}({', '.join(fk.referenced_columns)})"
+        cols = esc(", ".join(fk.columns))
+        ref = esc(f"{fk.referenced_table}({', '.join(fk.referenced_columns)})")
         body = f"{cols} {_dim('→')} {ref}"
         extras: list[str] = []
         if fk.on_delete and fk.on_delete != "NO ACTION":
-            extras.append(f"ON DELETE {fk.on_delete}")
+            extras.append(f"ON DELETE {esc(fk.on_delete)}")
         if fk.on_update and fk.on_update != "NO ACTION":
-            extras.append(f"ON UPDATE {fk.on_update}")
+            extras.append(f"ON UPDATE {esc(fk.on_update)}")
         if fk.deferrable:
             extras.append("DEFERRABLE")
         if extras:
             body = f"{body}  {_dim(' '.join(extras))}"
-        table.add_row("FOREIGN KEY", fk.name, body)
+        table.add_row("FOREIGN KEY", cell(fk.name), body)
     for u in cons.unique_constraints:
-        table.add_row("UNIQUE", u.name, u.definition)
+        table.add_row("UNIQUE", cell(u.name), cell(u.definition))
     for ck in cons.check_constraints:
-        table.add_row("CHECK", ck.name, ck.definition)
+        table.add_row("CHECK", cell(ck.name), cell(ck.definition))
 
     console.print(_indent(table))
 
@@ -453,14 +449,16 @@ def _render_partitioning(
         _print_section_heading(
             console, counter, "Partitioning", _CAPTION_PARTITIONING_CHILD
         )
-        console.print(f"  Partition of [cyan]{info.parent}[/cyan]")
+        console.print(f"  Partition of [cyan]{esc(info.parent)}[/cyan]")
         return
     if not info.children and not info.partition_key:
         return
-    _print_section_heading(
-        console, counter, "Partitioning", _CAPTION_PARTITIONING_ROOT
+    _print_section_heading(console, counter, "Partitioning", _CAPTION_PARTITIONING_ROOT)
+    raw_strategy, raw_columns = _summarize_partition_key(
+        info.partition_key, info.strategy
     )
-    strategy, columns = _summarize_partition_key(info.partition_key, info.strategy)
+    # Both halves are catalog text (the key can name arbitrary columns).
+    strategy, columns = esc(raw_strategy), esc(raw_columns)
     n = len(info.children)
     summary_bits: list[str] = []
     if strategy or columns:
@@ -481,7 +479,7 @@ def _render_partitioning(
         table.add_column("Name")
         table.add_column("Bounds", overflow="fold")
         for child, bounds in info.children:
-            table.add_row(child, _strip_partition_bounds(bounds))
+            table.add_row(cell(child), cell(_strip_partition_bounds(bounds)))
         console.print(_indent(table))
 
 
@@ -503,7 +501,7 @@ def _render_privileges(
     table.add_column("Grantor", style="dim")
     for g in filtered:
         priv = g.privilege + (" *" if g.with_grant_option else "")
-        table.add_row(g.grantee, priv, g.grantor or "")
+        table.add_row(cell(g.grantee), cell(priv), cell(g.grantor or ""))
     console.print(_indent(table))
 
 
@@ -525,7 +523,7 @@ def _render_triggers(
     for col in ("Name", "Timing", "Events", "Definition"):
         table.add_column(col, overflow="fold")
     for t in desc.triggers:
-        table.add_row(t.name, t.timing, t.events, t.function)
+        table.add_row(cell(t.name), cell(t.timing), cell(t.events), cell(t.function))
     console.print(_indent(table))
 
 
@@ -534,15 +532,11 @@ def _render_rls(
 ) -> None:
     if not (desc.policies_enabled or desc.policies):
         return
-    _print_section_heading(
-        console, counter, "Row-level security", _CAPTION_RLS
-    )
+    _print_section_heading(console, counter, "Row-level security", _CAPTION_RLS)
     if desc.policies_enabled and not desc.policies:
         console.print(_indent(_dim("RLS enabled, no policies.")))
         return
-    console.print(
-        f"  Enabled: {'yes' if desc.policies_enabled else 'no'}"
-    )
+    console.print(f"  Enabled: {'yes' if desc.policies_enabled else 'no'}")
     if desc.policies:
         console.print()
         table = _report_table(zebra=len(desc.policies) > 5)
@@ -550,11 +544,11 @@ def _render_rls(
             table.add_column(col, overflow="fold")
         for p in desc.policies:
             table.add_row(
-                p.name,
-                p.command,
-                ", ".join(p.roles),
-                p.using or "",
-                p.with_check or "",
+                cell(p.name),
+                cell(p.command),
+                cell(", ".join(p.roles)),
+                cell(p.using or ""),
+                cell(p.with_check or ""),
             )
         console.print(_indent(table))
 
@@ -569,9 +563,7 @@ def _render_view_dependencies(
 ) -> None:
     if not desc.upstream and not desc.downstream:
         return
-    _print_section_heading(
-        console, counter, "Dependencies", _CAPTION_DEPENDENCIES
-    )
+    _print_section_heading(console, counter, "Dependencies", _CAPTION_DEPENDENCIES)
 
     def _block(title: str, edges: list[Any]) -> str:
         lines = [f"[dim italic]{title}[/dim italic]"]
@@ -580,7 +572,8 @@ def _render_view_dependencies(
         else:
             for e in edges:
                 lines.append(
-                    f"  [dim]•[/dim] {e.qualified_name} {_dim('(' + e.kind + ')')}"
+                    f"  [dim]•[/dim] {esc(e.qualified_name)} "
+                    f"{_dim('(' + esc(e.kind) + ')')}"
                 )
         return "\n".join(lines)
 
@@ -616,17 +609,15 @@ def _render_redshift_extras(
             console, counter, "Distribution & sort", _CAPTION_DISTRIBUTION
         )
         parts = [
-            f"{_dim('Diststyle')} {rd.diststyle}",
-            f"{_dim('Distkey')} {rd.distkey or '—'}",
-            f"{_dim('Sortkey style')} {rd.sortkey_style or '—'}",
-            f"{_dim('Sortkeys')} {', '.join(rd.sortkeys) or '—'}",
+            f"{_dim('Diststyle')} {esc(rd.diststyle)}",
+            f"{_dim('Distkey')} {esc(rd.distkey) or '—'}",
+            f"{_dim('Sortkey style')} {esc(rd.sortkey_style) or '—'}",
+            f"{_dim('Sortkeys')} {esc(', '.join(rd.sortkeys)) or '—'}",
         ]
         console.print(f"  {'  ·  '.join(parts)}")
     if desc.redshift_stats:
         rs = desc.redshift_stats
-        _print_section_heading(
-            console, counter, "Table stats", _CAPTION_TABLE_STATS
-        )
+        _print_section_heading(console, counter, "Table stats", _CAPTION_TABLE_STATS)
         parts = [
             f"{_dim('Skew rows')} {rs.skew_rows}",
             f"{_dim('Unsorted')} {rs.unsorted_pct}%",
@@ -659,7 +650,7 @@ def _render_table_description(
 ) -> None:
     partitioned = bool(desc.partitioning.children)
     kind = _kind_label(desc.ref.kind, partitioned=partitioned)
-    qualified = f"{desc.header.schema}.{desc.header.name}"
+    qualified = esc(f"{desc.header.schema}.{desc.header.name}")
     _print_title_card_and_gap(
         console,
         title=qualified,
@@ -694,7 +685,7 @@ def _render_table_description(
 def _render_view_description(
     console: Console, desc: ViewDescription, engine: SqlEngine
 ) -> None:
-    qualified = f"{desc.header.schema}.{desc.header.name}"
+    qualified = esc(f"{desc.header.schema}.{desc.header.name}")
     kind = "Materialized View" if desc.ref.kind == ObjectKind.matview else "View"
     _print_title_card_and_gap(
         console,
@@ -730,16 +721,14 @@ def _render_schema_privileges(
     filtered = _filtered_grants(grants)
     if not filtered:
         return
-    _print_section_heading(
-        console, counter, "Privileges", _CAPTION_SCHEMA_PRIVILEGES
-    )
+    _print_section_heading(console, counter, "Privileges", _CAPTION_SCHEMA_PRIVILEGES)
     table = _report_table(zebra=len(filtered) > 5)
     table.add_column("Grantee")
     table.add_column("Privilege")
     table.add_column("Grantor", style="dim")
     for g in filtered:
         priv = g.privilege + (" *" if g.with_grant_option else "")
-        table.add_row(g.grantee, priv, g.grantor or "")
+        table.add_row(cell(g.grantee), cell(priv), cell(g.grantor or ""))
     console.print(_indent(table))
 
 
@@ -762,7 +751,9 @@ def _render_schema_default_privileges(
         privs = ", ".join(g.privileges)
         if g.with_grant_option:
             privs = f"{privs} *"
-        table.add_row(g.grantee, g.object_type, privs, g.grantor or "")
+        table.add_row(
+            cell(g.grantee), cell(g.object_type), cell(privs), cell(g.grantor or "")
+        )
     console.print(_indent(table))
 
 
@@ -778,12 +769,8 @@ def _render_schema_highlights(
     ]
     if not candidates:
         return
-    top = sorted(
-        candidates, key=lambda it: it.size_bytes or 0, reverse=True
-    )[:5]
-    _print_section_heading(
-        console, counter, "Highlights", _CAPTION_SCHEMA_HIGHLIGHTS
-    )
+    top = sorted(candidates, key=lambda it: it.size_bytes or 0, reverse=True)[:5]
+    _print_section_heading(console, counter, "Highlights", _CAPTION_SCHEMA_HIGHLIGHTS)
     table = _report_table(zebra=False)
     table.add_column("#", justify="right", style="dim", width=3)
     table.add_column("Name")
@@ -793,8 +780,8 @@ def _render_schema_highlights(
     for i, item in enumerate(top, start=1):
         table.add_row(
             str(i),
-            item.name,
-            item.kind,
+            cell(item.name),
+            cell(item.kind),
             _fmt_rows(item.row_estimate),
             _fmt_size(item.size_bytes),
         )
@@ -807,7 +794,7 @@ def _render_schema_description(
     del _engine  # unused; present for dispatcher interface symmetry
     _print_title_card_and_gap(
         console,
-        title=desc.header.name,
+        title=esc(desc.header.name),
         subtitle="Schema",
         metadata=_schema_title_metadata(desc),
     )
@@ -817,9 +804,7 @@ def _render_schema_description(
     _render_schema_default_privileges(console, counter, desc.default_privileges)
     _render_schema_highlights(console, counter, desc)
     if desc.contents:
-        _print_section_heading(
-            console, counter, "Contents", _CAPTION_SCHEMA_CONTENTS
-        )
+        _print_section_heading(console, counter, "Contents", _CAPTION_SCHEMA_CONTENTS)
         table = _report_table(zebra=len(desc.contents) > 5)
         table.add_column("Name")
         table.add_column("Kind", style="dim")
@@ -828,9 +813,9 @@ def _render_schema_description(
         table.add_column("Size", justify="right")
         for item in desc.contents:
             table.add_row(
-                item.name,
-                item.kind,
-                item.owner,
+                cell(item.name),
+                cell(item.kind),
+                cell(item.owner),
                 _fmt_rows(item.row_estimate),
                 _fmt_size(item.size_bytes),
             )
@@ -887,7 +872,9 @@ def describe(
     console = Console()
     targets = _split_targets(target)
     if not targets:
-        console.print('[red]Error: target must be "<schema>" or "<schema>.<object>"[/red]')
+        console.print(
+            '[red]Error: target must be "<schema>" or "<schema>.<object>"[/red]'
+        )
         raise typer.Exit(code=1)
 
     conn_params = resolve_params_or_exit(
@@ -913,7 +900,7 @@ def describe(
             try:
                 ref = resolve_target(cursor, resolved_engine, single)
             except (ValueError, TargetNotFoundError) as exc:
-                console.print(f"[red]Error ({single}): {exc}[/red]")
+                console.print(f"[red]Error ({esc(single)}): {esc(exc)}[/red]")
                 failures += 1
                 continue
             if ref.kind == ObjectKind.schema:
@@ -923,9 +910,7 @@ def describe(
             else:
                 desc = describe_table(cursor, ref, resolved_engine)
             if as_json:
-                json_payload.append(
-                    {"target": single, **dataclasses.asdict(desc)}
-                )
+                json_payload.append({"target": single, **dataclasses.asdict(desc)})
             else:
                 if rendered > 0:
                     console.print()

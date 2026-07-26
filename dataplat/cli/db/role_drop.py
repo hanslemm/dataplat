@@ -22,6 +22,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -77,17 +80,15 @@ def _resolve_databases(
     return [fallback_db]
 
 
-def _render_plan(
-    console: Console, plans: list[DropPlan], conn_ctx: Any
-) -> None:
+def _render_plan(console: Console, plans: list[DropPlan], conn_ctx: Any) -> None:
     for plan in plans:
-        console.print(f"\n[bold cyan]Role:[/bold cyan] {plan.role}")
+        console.print(f"\n[bold cyan]Role:[/bold cyan] {esc(plan.role)}")
         if plan.pre_cluster_ops:
             console.print("  [dim]Pre-cluster (membership setup):[/dim]")
             for op in plan.pre_cluster_ops:
                 _print_op(console, op, conn_ctx, indent=4)
         for db, ops in plan.per_database_ops.items():
-            console.print(f"  [dim]Database:[/dim] {db}")
+            console.print(f"  [dim]Database:[/dim] {esc(db)}")
             for op in ops:
                 _print_op(console, op, conn_ctx, indent=4)
         console.print("  [dim]Cluster:[/dim]")
@@ -97,8 +98,10 @@ def _render_plan(
 
 def _print_op(console: Console, op: SqlOp, conn_ctx: Any, *, indent: int) -> None:
     pad = " " * indent
+    # This preview is the last thing a user reads before an irreversible DROP,
+    # so the SQL must survive Rich verbatim — brackets and all.
     rendered = op.statement.as_string(conn_ctx)
-    console.print(f"{pad}{rendered};")
+    console.print(f"{pad}{esc(rendered)};")
 
 
 def _execute_plan(
@@ -114,7 +117,7 @@ def _execute_plan(
                 for op in plan.pre_cluster_ops:
                     cursor.execute(op.statement)
             conn.commit()
-        console.print(f"  [green]✓[/green] {plan.role} — membership granted")
+        console.print(f"  [green]✓[/green] {esc(plan.role)} — membership granted")
 
     for db, ops in plan.per_database_ops.items():
         if not ops:
@@ -125,52 +128,53 @@ def _execute_plan(
                 for op in ops:
                     cursor.execute(op.statement)
             conn.commit()
-        console.print(f"  [green]✓[/green] {plan.role} — {db}")
+        console.print(f"  [green]✓[/green] {esc(plan.role)} — {esc(db)}")
 
     with psycopg.connect(**conn_params_kwargs) as conn:
         with conn.cursor() as cursor:
             for op in plan.cluster_ops:
                 cursor.execute(op.statement)
         conn.commit()
-    console.print(f"  [green]✓[/green] {plan.role} — DROP ROLE")
+    console.print(f"  [green]✓[/green] {esc(plan.role)} — DROP ROLE")
 
 
 def drop_command(
-    names: list[str] = typer.Argument(
-        ..., help="One or more role names to drop."
-    ),
+    names: list[str] = typer.Argument(..., help="One or more role names to drop."),
     reassign_to: str | None = typer.Option(
-        None, "--reassign-to",
+        None,
+        "--reassign-to",
         help="Role to receive ownership transfer in every database. "
-             "Defaults vary per DB; pass to override.",
+        "Defaults vary per DB; pass to override.",
     ),
     no_reassign: bool = typer.Option(
-        False, "--no-reassign",
+        False,
+        "--no-reassign",
         help="Skip REASSIGN OWNED. DROP OWNED alone will revoke privileges "
-             "but error if the role still owns objects.",
+        "but error if the role still owns objects.",
     ),
     no_grant_membership: bool = typer.Option(
-        False, "--no-grant-membership",
+        False,
+        "--no-grant-membership",
         help="Skip the automatic GRANT <role> TO <connection-user> that lets "
-             "non-superusers run REASSIGN/DROP OWNED. Use when running as "
-             "superuser or already a member.",
+        "non-superusers run REASSIGN/DROP OWNED. Use when running as "
+        "superuser or already a member.",
     ),
     databases_flag: list[str] | None = typer.Option(
-        None, "--databases",
+        None,
+        "--databases",
         help="Comma-separated databases to clean up. Repeatable.",
     ),
     all_databases: bool = typer.Option(
-        False, "--all-databases",
+        False,
+        "--all-databases",
         help="Iterate every non-template database on the cluster.",
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run",
+        False,
+        "--dry-run",
         help="Print the SQL plan and exit without connecting.",
     ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y",
-        help="Skip the confirmation prompt.",
-    ),
+    yes: bool = YesOption,
     target: str | None = TargetOption,
     engine: SqlEngine | None = EngineOption,
     user: str | None = UserOption,
@@ -186,8 +190,14 @@ def drop_command(
 
     conn_params = resolve_params_or_exit(
         ConnCliParams(
-            target=target, engine=engine, user=user, password=password,
-            database=database, host=host, port=port, sslmode=sslmode,
+            target=target,
+            engine=engine,
+            user=user,
+            password=password,
+            database=database,
+            host=host,
+            port=port,
+            sslmode=sslmode,
             env_prefix=env_prefix,
         )
     )
@@ -216,16 +226,15 @@ def drop_command(
                             owned_by[n] = dialect.enumerate_owned(cursor, n)
                             groups_by[n] = dialect.groups_of(cursor, n)
                     except ValueError as exc:
-                        console.print(f"[red]Error: {exc}[/red]")
+                        console.print(f"[red]Error: {esc(exc)}[/red]")
                         raise typer.Exit(code=1)
             if missing:
                 console.print(
-                    f"[red]Error: role(s) not found: {', '.join(missing)}[/red]"
+                    "[red]Error: role(s) not found: "
+                    f"{', '.join(esc(m) for m in missing)}[/red]"
                 )
                 raise typer.Exit(code=1)
-            grant_membership_to = (
-                None if no_grant_membership else conn_params.user
-            )
+            grant_membership_to = None if no_grant_membership else conn_params.user
             effective_reassign_to = reassign_to
             if reassign_to is None and not no_reassign:
                 # The reassign owner is a property of the target, not the
@@ -238,53 +247,60 @@ def drop_command(
             try:
                 plans = [
                     build_drop_plan(
-                        n, target_dbs, dialect,
-                        reassign_to=effective_reassign_to, no_reassign=no_reassign,
+                        n,
+                        target_dbs,
+                        dialect,
+                        reassign_to=effective_reassign_to,
+                        no_reassign=no_reassign,
                         grant_membership_to=grant_membership_to,
-                        owned=owned_by.get(n), groups=groups_by.get(n),
+                        owned=owned_by.get(n),
+                        groups=groups_by.get(n),
                     )
                     for n in names
                 ]
             except (ValueError, MissingReassignOwnerError) as exc:
-                console.print(f"[red]Error: {exc}[/red]")
+                console.print(f"[red]Error: {esc(exc)}[/red]")
                 raise typer.Exit(code=1)
             console.print(
                 f"[bold red]Plan:[/bold red] DROP {len(plans)} role(s) "
                 f"across {len(target_dbs)} database(s) "
-                f"({', '.join(target_dbs)})"
+                f"({', '.join(esc(d) for d in target_dbs)})"
             )
             for w in warnings:
+                # Warnings are our own fixed strings — nothing to escape.
                 console.print(f"[yellow]Warning: {w}[/yellow]")
             _render_plan(console, plans, conn)
     except psycopg.Error as exc:
-        console.print(f"[red]Database error: {exc}[/red]")
+        console.print(f"[red]Database error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if dry_run:
         console.print("\n[yellow]Dry-run; no SQL executed.[/yellow]")
         return
 
-    if not yes:
-        confirmed = typer.confirm(
-            "\n[!] This is destructive. Proceed?", default=False,
-        )
-        if not confirmed:
-            console.print("[yellow]Aborted.[/yellow]")
-            raise typer.Exit(code=1)
+    # Wording (and the leading newline that detaches the question from the
+    # plan above it) is unchanged from the hand-rolled gate this replaced.
+    confirm_or_exit(
+        yes=yes,
+        prompt="\n[!] This is destructive. Proceed?",
+        console=console,
+    )
 
     console.print()
     for plan in plans:
         try:
             _execute_plan(
-                plan=plan, conn_params_kwargs=conn_kwargs, console=console,
+                plan=plan,
+                conn_params_kwargs=conn_kwargs,
+                console=console,
             )
         except psycopg.Error as exc:
-            console.print(f"[red]✗ {plan.role}: {exc}[/red]")
+            console.print(f"[red]✗ {esc(plan.role)}: {esc(exc)}[/red]")
             raise typer.Exit(code=1)
 
     table = Table(title="Dropped", show_header=True, header_style="bold")
     table.add_column("Role")
     table.add_column("Databases")
     for plan in plans:
-        table.add_row(plan.role, ", ".join(plan.per_database_ops.keys()))
+        table.add_row(cell(plan.role), cell(", ".join(plan.per_database_ops.keys())))
     console.print(table)

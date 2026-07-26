@@ -28,8 +28,16 @@ from dataplat.services.db.describe import (
 def _blank_table_description() -> TableDescription:
     ref = TargetRef(ObjectKind.table, "public", "users", 42)
     header = RelationHeader(
-        "public", "users", "dbadmin", "pg_default", "App users",
-        100, 1024, 512, 256, 256,
+        "public",
+        "users",
+        "dbadmin",
+        "pg_default",
+        "App users",
+        100,
+        1024,
+        512,
+        256,
+        256,
     )
     return TableDescription(
         ref=ref,
@@ -48,6 +56,224 @@ def _blank_table_description() -> TableDescription:
     )
 
 
+def _markup_table_description() -> TableDescription:
+    """A table whose every text field carries Rich markup."""
+    from dataplat.services.db.describe import (
+        ConstraintInfo,
+        ForeignKeyInfo,
+        IndexInfo,
+        PolicyInfo,
+        PrimaryKeyInfo,
+        TriggerInfo,
+    )
+
+    ref = TargetRef(ObjectKind.table, "dev_[/x]", "fact[bold]", 42)
+    header = RelationHeader(
+        "dev_[/x]",
+        "fact[bold]",
+        "owner[/x]",
+        "ts[bold]",
+        "comment with [/issue] and [bold]",
+        100,
+        1024,
+        512,
+        256,
+        256,
+    )
+    return TableDescription(
+        ref=ref,
+        header=header,
+        columns=[
+            ColumnInfo(
+                1,
+                "id[/x]",
+                "bigint[bold]",
+                False,
+                "nextval('s[/x]')",
+                True,
+                "public.orgs[/x]",
+                "id[bold]",
+                "col comment [/issue]",
+                "lzo[/x]",
+            ),
+        ],
+        constraints=ConstraintBundle(
+            PrimaryKeyInfo("pk[/x]", ["id[bold]"]),
+            [
+                ForeignKeyInfo(
+                    "fk[/x]",
+                    ["id[bold]"],
+                    "public.orgs[/x]",
+                    ["id"],
+                    "CASCADE[/x]",
+                    "CASCADE[bold]",
+                    True,
+                )
+            ],
+            [ConstraintInfo("uq[/x]", "UNIQUE (id[bold])")],
+            [ConstraintInfo("ck[/x]", "CHECK (id > 0) [bold]")],
+        ),
+        indexes=[
+            IndexInfo(
+                "idx[/x]",
+                ["id[bold]"],
+                True,
+                False,
+                "btree[/x]",
+                1024,
+                "id > 0 [bold]",
+            )
+        ],
+        privileges=[PrivilegeGrant("analyst[/x]", "SELECT[bold]", True, "dba[/x]")],
+        triggers=[TriggerInfo("trg[/x]", "BEFORE[bold]", "INSERT[/x]", "fn[bold]()")],
+        policies=[PolicyInfo("pol[/x]", "ALL[bold]", ["r[/x]"], "true [/issue]", None)],
+        policies_enabled=True,
+        partitioning=PartitioningInfo(
+            None, "LIST", "LIST (src[/x])", [("p_[bold]", "FOR VALUES IN ('[/x]')")]
+        ),
+        redshift_distribution=None,
+        redshift_stats=None,
+        definition=None,
+    )
+
+
+class TestDescribeMarkupSafety:
+    """Regression: catalog text is data, never Rich markup."""
+
+    def _render(self, desc, engine: SqlEngine = SqlEngine.postgresql) -> str:
+        console = Console(record=True, width=200)
+        render_description(console, desc, engine)
+        return console.export_text()
+
+    def test_table_report_renders_every_field_literally(self) -> None:
+        # Any of these used to raise MarkupError mid-render (closing tags) or
+        # be silently swallowed (real style names).
+        out = self._render(_markup_table_description())
+        for expected in (
+            "dev_[/x].fact[bold]",  # title card
+            "owner[/x]",  # header metadata
+            "comment with [/issue]",  # header comment
+            "id[/x]",  # column name
+            "bigint[bold]",  # column type
+            "col comment [/issue]",  # column comment
+            "public.orgs[/x](id[bold])",  # FK reference
+            "pk[/x]",  # columns caption
+            "idx[/x]",  # index name
+            "id > 0 [bold]",  # index predicate
+            "uq[/x]",  # unique constraint
+            "CHECK (id > 0) [bold]",  # check constraint body
+            "LIST on src[/x]",  # partition key summary
+            "p_[bold]",  # partition child
+            "'[/x]'",  # partition bounds
+            "analyst[/x]",  # privilege grantee
+            "trg[/x]",  # trigger name
+            "pol[/x]",  # policy name
+            "true [/issue]",  # policy USING clause
+        ):
+            assert expected in out, expected
+
+    def test_view_dependencies_and_definition(self) -> None:
+        from dataplat.services.db.describe import DependencyEdge
+
+        desc = ViewDescription(
+            ref=TargetRef(ObjectKind.view, "public", "v[/x]", 7),
+            header=RelationHeader(
+                "public",
+                "v[/x]",
+                "dba[bold]",
+                None,
+                "note [/issue]",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            columns=[
+                ColumnInfo(1, "c[/x]", "int", True, None, False, None, None, None)
+            ],
+            definition=ViewDefinition(
+                sql="SELECT 'closes [/issue] 42' AS x",
+                is_updatable=False,
+                check_option="CASCADED[bold]",
+            ),
+            upstream=[DependencyEdge("public.t[/x]", "table[bold]")],
+            downstream=[DependencyEdge("public.d[bold]", "view[/x]")],
+            privileges=[],
+            triggers=[],
+        )
+        out = self._render(desc)
+        for expected in (
+            "public.v[/x]",
+            "note [/issue]",
+            "CASCADED[bold]",
+            "public.t[/x]",
+            "table[bold]",
+            "public.d[bold]",
+        ):
+            assert expected in out, expected
+
+    def test_schema_report_renders_names_literally(self) -> None:
+        from dataplat.services.db.describe import DefaultPrivilegeGrant
+
+        desc = SchemaDescription(
+            header=SchemaHeader("dev_[/x]", "dba[bold]", "note [/issue]"),
+            privileges=[PrivilegeGrant("analyst[/x]", "USAGE[bold]", False, "dba")],
+            contents=[SchemaContentItem("t[/x]", "table[bold]", "dba[/x]", 100, 1024)],
+            default_privileges=[
+                DefaultPrivilegeGrant(
+                    "app[/x]", "TABLE[bold]", ["SELECT[/x]"], False, "dba[bold]"
+                )
+            ],
+        )
+        out = self._render(desc)
+        for expected in (
+            "dev_[/x]",
+            "dba[bold]",
+            "note [/issue]",
+            "analyst[/x]",
+            "t[/x]",
+            "table[bold]",
+            "app[/x]",
+            "SELECT[/x]",
+        ):
+            assert expected in out, expected
+
+    def test_redshift_extras_render_keys_literally(self) -> None:
+        from dataclasses import replace
+
+        from dataplat.services.db.describe import (
+            RedshiftDistribution,
+            RedshiftTableStats,
+        )
+
+        desc = replace(
+            _blank_table_description(),
+            redshift_distribution=RedshiftDistribution(
+                "KEY[/x]", "dk[bold]", "COMPOUND[/x]", ["sk[bold]"]
+            ),
+            redshift_stats=RedshiftTableStats(1.0, 2.0, False),
+        )
+        out = self._render(desc, SqlEngine.redshift)
+        for expected in ("KEY[/x]", "dk[bold]", "COMPOUND[/x]", "sk[bold]"):
+            assert expected in out, expected
+
+
+def test_describe_unknown_target_error_escapes_name(monkeypatch) -> None:
+    """The failing target name is echoed back; it may contain markup."""
+    monkeypatch.setenv("DEMO_PG_HOST", "localhost")
+    monkeypatch.setenv("DEMO_PG_USER", "dbadmin")
+    monkeypatch.setenv("DEMO_PG_PASSWORD", "x")
+    monkeypatch.setenv("DEMO_PG_DATABASE", "analytics")
+
+    connect = _make_mock_connect([])  # fetchone() -> None: schema not found
+    with patch("dataplat.cli.db._common.psycopg.connect", connect):
+        result = CliRunner().invoke(db_app, ["describe", "no[/x]pe"])
+
+    assert result.exit_code == 1
+    assert "no[/x]pe" in result.output
+
+
 def test_render_table_does_not_crash() -> None:
     console = Console(record=True, width=120)
     render_description(console, _blank_table_description(), SqlEngine.postgresql)
@@ -62,7 +288,7 @@ def test_render_table_omits_owner_from_privileges() -> None:
     from rich.console import Console
 
     console = Console(record=True, width=120)
-    # _blank_table_description() has privileges=[PrivilegeGrant("dbadmin", "OWNER", ...)]
+    # _blank_table_description()'s only grant is PrivilegeGrant("dbadmin", "OWNER").
     render_description(console, _blank_table_description(), SqlEngine.postgresql)
     out = console.export_text()
     # Header shows owner
@@ -165,8 +391,15 @@ def test_render_identity_column_label() -> None:
         desc,
         columns=[
             ColumnInfo(
-                1, "id", "bigint", False, "GENERATED BY DEFAULT AS IDENTITY",
-                True, None, None, None,
+                1,
+                "id",
+                "bigint",
+                False,
+                "GENERATED BY DEFAULT AS IDENTITY",
+                True,
+                None,
+                None,
+                None,
             ),
         ],
     )
@@ -180,8 +413,16 @@ def test_render_identity_column_label() -> None:
 def test_render_view_does_not_crash() -> None:
     ref = TargetRef(ObjectKind.view, "public", "user_view", 7)
     header = RelationHeader(
-        "public", "user_view", "dbadmin", None, None,
-        None, None, None, None, None,
+        "public",
+        "user_view",
+        "dbadmin",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     desc = ViewDescription(
         ref=ref,
@@ -284,8 +525,16 @@ def test_render_view_definition_is_last() -> None:
     """View output places the Definition section after Privileges/Dependencies."""
     ref = TargetRef(ObjectKind.view, "public", "user_view", 7)
     header = RelationHeader(
-        "public", "user_view", "dbadmin", None, None,
-        None, None, None, None, None,
+        "public",
+        "user_view",
+        "dbadmin",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     desc = ViewDescription(
         ref=ref,
@@ -361,6 +610,7 @@ def test_render_schema_title_card_shows_totals() -> None:
         SchemaDescription,
         SchemaHeader,
     )
+
     desc = SchemaDescription(
         header=SchemaHeader("public", "dbadmin", None),
         privileges=[],
@@ -373,7 +623,7 @@ def test_render_schema_title_card_shows_totals() -> None:
     render_description(console, desc, SqlEngine.postgresql)
     out = console.export_text()
     assert "3.0 KiB" in out  # 1024 + 2048
-    assert "300" in out       # 100 + 200 rows
+    assert "300" in out  # 100 + 200 rows
 
 
 def test_render_schema_privileges_section_present_when_grants_exist() -> None:
@@ -382,6 +632,7 @@ def test_render_schema_privileges_section_present_when_grants_exist() -> None:
         SchemaDescription,
         SchemaHeader,
     )
+
     desc = SchemaDescription(
         header=SchemaHeader("public", "dbadmin", None),
         privileges=[
@@ -403,6 +654,7 @@ def test_render_schema_highlights_top_largest() -> None:
         SchemaDescription,
         SchemaHeader,
     )
+
     # 7 items, different sizes — only top 5 should appear under Highlights
     sizes = [10, 20, 30, 40, 50, 60, 70]
     contents = [
@@ -452,7 +704,11 @@ def test_render_schema_default_privileges_section() -> None:
         contents=[],
         default_privileges=[
             DefaultPrivilegeGrant(
-                "app", "TABLE", ["SELECT", "INSERT", "UPDATE", "DELETE"], False, "dbadmin"
+                "app",
+                "TABLE",
+                ["SELECT", "INSERT", "UPDATE", "DELETE"],
+                False,
+                "dbadmin",
             ),
             DefaultPrivilegeGrant("analyst", "TABLE", ["SELECT"], True, "dbadmin"),
         ],
@@ -490,17 +746,17 @@ def test_describe_comma_separated_targets(monkeypatch) -> None:
 
     fetch_results = [
         # describe "public"
-        (1,),                                       # resolve_target schema row
-        ("public", "dbadmin", None),                # schema header
-        [],                                         # schema privileges
-        [],                                         # schema default privileges
-        [],                                         # schema contents
+        (1,),  # resolve_target schema row
+        ("public", "dbadmin", None),  # schema header
+        [],  # schema privileges
+        [],  # schema default privileges
+        [],  # schema contents
         # describe "raw"
-        (2,),                                       # resolve_target schema row
-        ("raw", "dbadmin", None),                   # schema header
-        [],                                         # schema privileges
-        [],                                         # schema default privileges
-        [],                                         # schema contents
+        (2,),  # resolve_target schema row
+        ("raw", "dbadmin", None),  # schema header
+        [],  # schema privileges
+        [],  # schema default privileges
+        [],  # schema contents
     ]
     connect = _make_mock_connect(fetch_results)
     with patch("dataplat.cli.db._common.psycopg.connect", connect):

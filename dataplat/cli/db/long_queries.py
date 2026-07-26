@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import sys
 from datetime import UTC, datetime, timedelta
 
 import typer
@@ -17,6 +16,8 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     JsonOption,
@@ -70,9 +71,7 @@ def _fetch_for_target(
                 cutoff=cutoff,
                 running_only=running_only,
             )
-        return fetch_long_queries_postgres(
-            cursor, min_seconds=min_seconds, limit=limit
-        )
+        return fetch_long_queries_postgres(cursor, min_seconds=min_seconds, limit=limit)
 
 
 def _render_rows(target: DbTarget, rows: list[LongQueryRow]) -> None:
@@ -97,18 +96,18 @@ def _render_rows(target: DbTarget, rows: list[LongQueryRow]) -> None:
             else "dim"
         )
         table.add_row(
-            row.session_id or "—",
-            row.query_id,
-            row.user_name,
-            row.db_name,
-            f"[{status_style}]{row.status}[/{status_style}]",
+            cell(row.session_id or "—"),
+            cell(row.query_id),
+            cell(row.user_name),
+            cell(row.db_name),
+            cell(row.status, style=status_style),
             f"{row.elapsed_s}s",
-            row.query_text,
+            cell(row.query_text),
         )
     console.print(table)
     console.print(
         f"[dim]  {len(rows)} row(s). "
-        f"Kill with: dp db kill <PID> -t {target.name}[/dim]"
+        f"Kill with: dp db kill <PID> -t {esc(target.name)}[/dim]"
     )
 
 
@@ -140,7 +139,7 @@ def _render_history(target: DbTarget, rows: list[QueryHistoryRow]) -> None:
             f"{row.total_s:.2f}",
             f"{row.mean_s:.2f}",
             f"{row.max_s:.2f}",
-            row.query_text or "—",
+            cell(row.query_text or "—"),
         )
     console.print(table)
 
@@ -179,7 +178,7 @@ def long_queries_command(
     try:
         targets = resolve_targets(target)
     except ValidationError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if history:
@@ -207,7 +206,10 @@ def long_queries_command(
                 )
             )
         except ValidationError as exc:
-            console.print(f"[red][{tgt.name}] {exc}[/red]")
+            # The literal brackets around the target name have to be escaped
+            # too, or Rich reads `[demo_pg]` as a style tag.
+            detail = esc(f"[{tgt.name}] {exc}")
+            console.print(f"[red]{detail}[/red]")
             failures += 1
             continue
         except typer.Exit:
@@ -252,30 +254,20 @@ def kill_command(
         name = target or default_target_name()
         if not name:
             raise ValidationError(
-                "No target given and none configured. Pass --target or set "
-                "DP_TARGETS."
+                "No target given and none configured. Pass --target or set DP_TARGETS."
             )
         tgt = resolve_target(name)
     except DataplatError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     action = "Cancel" if cancel or tgt.engine == SqlEngine.redshift else "Terminate"
-    if not yes:
-        summary = (
-            f"{action} {len(pids)} session(s) on "
-            f"[cyan]{tgt.name}[/cyan]: {', '.join(str(p) for p in pids)}"
-        )
-        console.print(summary)
-        if not sys.stdin.isatty():
-            console.print(
-                "[red]Error: confirmation required. Pass --yes/-y in "
-                "non-interactive contexts.[/red]"
-            )
-            raise typer.Exit(code=1)
-        if not typer.confirm("Proceed?", default=False):
-            console.print("[yellow]Aborted.[/yellow]")
-            raise typer.Exit(code=1)
+    confirm_or_exit(
+        f"{action} {len(pids)} session(s) on "
+        f"[cyan]{esc(tgt.name)}[/cyan]: {', '.join(str(p) for p in pids)}",
+        yes=yes,
+        console=console,
+    )
 
     params = resolve_params_or_exit(ConnCliParams(target=tgt.name))
     failed = 0
