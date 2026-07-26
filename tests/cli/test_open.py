@@ -24,6 +24,21 @@ def test_open_airbyte_strips_api_suffix(monkeypatch) -> None:
     assert opened == ["https://airbyte.example.com"]
 
 
+def test_open_prints_markup_like_url_literally(monkeypatch) -> None:
+    """The URL comes from an env var: ``[/x]`` used to crash the render."""
+    _disable_envrc(monkeypatch)
+    monkeypatch.setenv("AIRBYTE_BASE_URL", "https://ab.test/[bold]/[/issue]/api")
+    opened: list[str] = []
+    monkeypatch.setattr(open_cli.webbrowser, "open", lambda url: opened.append(url))
+
+    result = runner.invoke(main_module.app, ["open", "airbyte"])
+
+    assert result.exit_code == 0, result.output
+    assert "https://ab.test/[bold]/[/issue]" in result.output
+    # Printing it safely must not change the URL the browser is handed.
+    assert opened == ["https://ab.test/[bold]/[/issue]"]
+
+
 def test_open_superset_missing_env(monkeypatch) -> None:
     _disable_envrc(monkeypatch)
     monkeypatch.delenv("SUPERSET_BASE_URL", raising=False)

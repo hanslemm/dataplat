@@ -11,6 +11,9 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import JsonOption, YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.superset.client import (
     create_user as _create_user,
@@ -106,7 +109,7 @@ def _load_auth_context() -> tuple[str, str, str]:
     try:
         cfg = get_auth_config_from_env()
     except ConfigError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     return cfg.base_url, cfg.username, cfg.password
 
@@ -123,7 +126,7 @@ def list_roles(
         "--order-dir",
         help="Sort direction (asc or desc)",
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit JSON instead of a table"),
+    as_json: bool = JsonOption,
 ):
     """List available Superset roles."""
     base_url, admin_username, admin_password = _load_auth_context()
@@ -133,7 +136,7 @@ def list_roles(
             access_token = _login(client, base_url, admin_username, admin_password)
             roles = list(_iter_roles(client, base_url, access_token))
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if as_json:
@@ -166,7 +169,7 @@ def list_roles(
     for role in sorted(roles, key=sort_key, reverse=reverse):
         role_id = role.get("id")
         name = role.get("name", "")
-        table.add_row(str(role_id) if role_id is not None else "", str(name))
+        table.add_row(cell(role_id), cell(name))
 
     console.print(table)
 
@@ -182,9 +185,7 @@ def create_user(
         hide_input=True,
         confirmation_prompt=True,
     ),
-    email: str = typer.Option(
-        ..., "--email", "-e", help="Email for the new user"
-    ),
+    email: str = typer.Option(..., "--email", "-e", help="Email for the new user"),
     first_name: str | None = typer.Option(
         None, "--first-name", help="First name for the new user"
     ),
@@ -235,13 +236,13 @@ def create_user(
 
             response = _create_user(client, base_url, access_token, payload)
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     user_id = response.get("id") or response.get("result", {}).get("id")
     console.print(
         "[green]✓ Superset user created[/green] "
-        f"[dim](username={username}, id={user_id})[/dim]"
+        f"[dim](username={esc(username)}, id={esc(user_id)})[/dim]"
     )
 
 
@@ -297,7 +298,8 @@ def update_users(
 
     if set_group and (add_group or remove_group):
         console.print(
-            "[red]Error: --set-group cannot be combined with --add-group or --remove-group[/red]"
+            "[red]Error: --set-group cannot be combined with "
+            "--add-group or --remove-group[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -389,7 +391,7 @@ def update_users(
                 _update_user(client, base_url, access_token, user_id, payload)
                 updated += 1
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if matched == 0:
@@ -412,7 +414,7 @@ def list_users(
         "--filter-role",
         help="Only show users holding this role (repeatable).",
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit JSON instead of a table"),
+    as_json: bool = JsonOption,
 ):
     """List Superset users."""
     base_url, admin_username, admin_password = _load_auth_context()
@@ -427,13 +429,11 @@ def list_users(
                     _resolve_role_ids(client, base_url, access_token, filter_role)
                 )
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if role_filter_ids:
-        users = [
-            u for u in users if role_filter_ids & set(_user_role_ids(u))
-        ]
+        users = [u for u in users if role_filter_ids & set(_user_role_ids(u))]
 
     if as_json:
         typer.echo(json.dumps(users, indent=2, ensure_ascii=False))
@@ -462,17 +462,15 @@ def list_users(
             str(r.get("name", r)) if isinstance(r, dict) else str(r) for r in roles
         )
         full_name = " ".join(
-            part
-            for part in (user.get("first_name"), user.get("last_name"))
-            if part
+            part for part in (user.get("first_name"), user.get("last_name")) if part
         )
         table.add_row(
-            str(user.get("id", "")),
-            str(user.get("username", "")),
-            full_name,
-            str(user.get("email", "")),
+            cell(user.get("id", "")),
+            cell(user.get("username", "")),
+            cell(full_name),
+            cell(user.get("email", "")),
             "yes" if user.get("active") else "no",
-            role_names,
+            cell(role_names),
         )
 
     console.print(table)
@@ -482,14 +480,14 @@ def list_users(
 @users_app.command("delete")
 def delete_users(
     user_ids: list[int] = typer.Argument(..., help="Superset user ID(s) to delete"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    yes: bool = YesOption,
 ):
     """Delete Superset user(s) by ID."""
-    if not yes:
-        typer.confirm(
-            f"Delete Superset user(s) {', '.join(str(u) for u in user_ids)}?",
-            abort=True,
-        )
+    # Typer parsed the ids as ints, so the prompt needs no markup escaping.
+    confirm_or_exit(
+        yes=yes,
+        prompt=f"Delete Superset user(s) {', '.join(str(u) for u in user_ids)}?",
+    )
 
     base_url, admin_username, admin_password = _load_auth_context()
 
@@ -502,10 +500,10 @@ def delete_users(
                     _delete_user(client, base_url, access_token, user_id)
                     console.print(f"[green]✓ Deleted user {user_id}[/green]")
                 except ServiceError as exc:
-                    console.print(f"[red]✗ user {user_id}: {exc}[/red]")
+                    console.print(f"[red]✗ user {user_id}: {esc(exc)}[/red]")
                     failures += 1
     except (AuthError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if failures:
@@ -514,7 +512,7 @@ def delete_users(
 
 @groups_app.command("list")
 def list_groups(
-    as_json: bool = typer.Option(False, "--json", help="Emit JSON instead of a table"),
+    as_json: bool = JsonOption,
 ):
     """List Superset groups."""
     base_url, admin_username, admin_password = _load_auth_context()
@@ -524,7 +522,7 @@ def list_groups(
             access_token = _login(client, base_url, admin_username, admin_password)
             groups = list(_iter_groups(client, base_url, access_token))
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if as_json:
@@ -548,10 +546,10 @@ def list_groups(
 
     for group in sorted(groups, key=lambda g: str(g.get("name", ""))):
         table.add_row(
-            str(group.get("id", "")),
-            str(group.get("name", "")),
-            str(group.get("label", "") or ""),
-            str(group.get("description", "") or ""),
+            cell(group.get("id", "")),
+            cell(group.get("name", "")),
+            cell(group.get("label", "") or ""),
+            cell(group.get("description", "") or ""),
         )
 
     console.print(table)
