@@ -118,7 +118,8 @@ def get_access_token(
         return token
     except httpx.HTTPStatusError as exc:
         raise AuthError(
-            f"Failed to get access token: {exc.response.status_code} {exc.response.reason_phrase}"
+            f"Failed to get access token: {exc.response.status_code} "
+            f"{exc.response.reason_phrase}"
         ) from exc
     except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
         raise AuthError(f"Failed to connect to Airbyte token endpoint: {exc}") from exc
@@ -147,10 +148,13 @@ def login_airbyte_oss(
         return token
     except httpx.HTTPStatusError as exc:
         raise AuthError(
-            f"Failed to login to Airbyte OSS: {exc.response.status_code} {exc.response.reason_phrase}"
+            f"Failed to login to Airbyte OSS: {exc.response.status_code} "
+            f"{exc.response.reason_phrase}"
         ) from exc
     except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-        raise AuthError(f"Failed to connect to Airbyte OSS login endpoint: {exc}") from exc
+        raise AuthError(
+            f"Failed to connect to Airbyte OSS login endpoint: {exc}"
+        ) from exc
     except ValueError as exc:
         raise AuthError("Failed to parse Airbyte OSS login response") from exc
 
@@ -276,5 +280,3 @@ def split_cron_timezone(cron_expr: str) -> tuple[str, str | None]:
             except Exception:
                 pass
     return cron_expr, None
-
-

@@ -96,9 +96,7 @@ def build_long_queries_query(
         )
 
     query_id_col = _pick(column_names, "query_id", "queryid", "query")
-    user_col = _pick(
-        column_names, "user_name", "username", "user", "user_id", "userid"
-    )
+    user_col = _pick(column_names, "user_name", "username", "user", "user_id", "userid")
     db_col = _pick(column_names, "database_name", "database", "dbname")
     status_col = _pick(column_names, "status", "state")
     end_col = _pick(column_names, "end_time", "endtime")
@@ -113,30 +111,21 @@ def build_long_queries_query(
     )
 
     query_id_expr = (
-        f"CAST({_quote(query_id_col)} AS VARCHAR)"
-        if query_id_col
-        else "''::VARCHAR"
+        f"CAST({_quote(query_id_col)} AS VARCHAR)" if query_id_col else "''::VARCHAR"
     )
-    user_expr = (
-        f"CAST({_quote(user_col)} AS VARCHAR)" if user_col else "''::VARCHAR"
-    )
+    user_expr = f"CAST({_quote(user_col)} AS VARCHAR)" if user_col else "''::VARCHAR"
     db_expr = f"CAST({_quote(db_col)} AS VARCHAR)" if db_col else "''::VARCHAR"
 
-    status_raw = (
-        f"CAST({_quote(status_col)} AS VARCHAR)" if status_col else None
-    )
+    status_raw = f"CAST({_quote(status_col)} AS VARCHAR)" if status_col else None
     if status_raw is not None:
         status_expr = status_raw
     elif end_ref:
-        status_expr = (
-            f"CASE WHEN {end_ref} IS NULL THEN 'running' ELSE 'completed' END"
-        )
+        status_expr = f"CASE WHEN {end_ref} IS NULL THEN 'running' ELSE 'completed' END"
     else:
         status_expr = "'unknown'"
 
     text_expr = (
-        "LEFT(REGEXP_REPLACE(CAST("
-        f"{_quote(text_col)} AS VARCHAR), '\\\\s+', ' '), 180)"
+        f"LEFT(REGEXP_REPLACE(CAST({_quote(text_col)} AS VARCHAR), '\\\\s+', ' '), 180)"
         if text_col
         else "''::VARCHAR"
     )
@@ -170,16 +159,13 @@ def build_long_queries_query(
         params.extend([min_seconds, cutoff])
         if status_raw is not None:
             branches.append(
-                f"({start_ref} >= %s "
-                f"AND {_status_in(status_raw, FAILURE_STATUSES)})"
+                f"({start_ref} >= %s AND {_status_in(status_raw, FAILURE_STATUSES)})"
             )
             params.append(cutoff)
         where = " OR ".join(branches)
 
     order_rank = (
-        f"CASE WHEN {is_running} THEN 0 ELSE 1 END"
-        if is_running is not None
-        else "1"
+        f"CASE WHEN {is_running} THEN 0 ELSE 1 END" if is_running is not None else "1"
     )
 
     sql = f"""
@@ -215,9 +201,7 @@ def fetch_long_queries(
     when ``running_only`` is set.
     """
     cursor.execute("SELECT * FROM sys_query_history LIMIT 0")
-    column_names = {
-        desc.name.lower() for desc in (cursor.description or [])
-    }
+    column_names = {desc.name.lower() for desc in (cursor.description or [])}
     sql, params = build_long_queries_query(
         column_names,
         min_seconds=min_seconds,
@@ -325,9 +309,7 @@ def fetch_query_history_postgres(
     calls_col = _pick(column_names, "calls")
 
     if not all([total_col, mean_col, max_col, query_col, calls_col]):
-        raise ValidationError(
-            "pg_stat_statements columns are missing or incompatible."
-        )
+        raise ValidationError("pg_stat_statements columns are missing or incompatible.")
     assert total_col and mean_col and max_col and query_col and calls_col
 
     sql = f"""

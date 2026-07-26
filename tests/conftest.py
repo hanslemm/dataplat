@@ -32,11 +32,26 @@ os.environ.pop("DP_ENVRC_PATH", None)
 
 # Isolate the suite from connection/config env in the developer's shell.
 for _var in (
-    "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE",
-    "PGCLIENTENCODING", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD",
-    "DB_NAME", "DB_SSLMODE", "DP_AWS_PROFILE", "DP_AWS_PROFILE_ALIASES",
-    "DP_AWS_REGION", "DP_RDS_INSTANCE", "DP_DBT_PROJECT",
-    "DP_DBT_INVOCATION_COMMAND", "DP_DBT_ORPHANS_EXCLUDE_SCHEMAS",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "PGSSLMODE",
+    "PGCLIENTENCODING",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_NAME",
+    "DB_SSLMODE",
+    "DP_AWS_PROFILE",
+    "DP_AWS_PROFILE_ALIASES",
+    "DP_AWS_REGION",
+    "DP_RDS_INSTANCE",
+    "DP_DBT_PROJECT",
+    "DP_DBT_INVOCATION_COMMAND",
+    "DP_DBT_ORPHANS_EXCLUDE_SCHEMAS",
     "DP_CI_RUNNER_DNS",
 ):
     os.environ.pop(_var, None)

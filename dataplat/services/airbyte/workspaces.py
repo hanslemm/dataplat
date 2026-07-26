@@ -1,4 +1,5 @@
 """Airbyte workspace API helpers."""
+
 from __future__ import annotations
 
 import httpx
@@ -23,7 +24,8 @@ def list_workspaces(
         except httpx.HTTPStatusError as exc:
             snippet = (response.text or "").strip()[:500]
             raise ServiceError(
-                f"Failed to list workspaces (status={response.status_code}, body={snippet})"
+                "Failed to list workspaces "
+                f"(status={response.status_code}, body={snippet})"
             ) from exc
 
         payload = response.json() or {}

@@ -121,10 +121,16 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
         if row is None:
             # Group — no login, no attributes table.
             return RoleAttributes(
-                can_login=False, superuser=False, create_db=False,
-                create_role=False, inherit=True, replication=False,
-                bypass_rls=False, connection_limit=-1,
-                password_set=False, valid_until=None,
+                can_login=False,
+                superuser=False,
+                create_db=False,
+                create_role=False,
+                inherit=True,
+                replication=False,
+                bypass_rls=False,
+                connection_limit=-1,
+                password_set=False,
+                valid_until=None,
             )
         can_login, superuser, create_db, valid_until = row
         return RoleAttributes(
@@ -144,8 +150,16 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
     if row is None:
         raise RoleNotFoundError(f'role "{name}" not found')
     (
-        can_login, superuser, create_db, create_role, inherit,
-        replication, bypass_rls, conn_limit, password_set, valid_until,
+        can_login,
+        superuser,
+        create_db,
+        create_role,
+        inherit,
+        replication,
+        bypass_rls,
+        conn_limit,
+        password_set,
+        valid_until,
     ) = row
     return RoleAttributes(
         can_login=bool(can_login),
@@ -163,10 +177,10 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
 
 @dataclass(frozen=True)
 class MembershipEdge:
-    role: str       # other end of the edge (ancestor or descendant)
-    inherit: bool   # INHERIT flag on the edge closest to the target
-    depth: int      # distance from target; 1 = direct
-    via: str        # for ancestor walks: parent that granted this row
+    role: str  # other end of the edge (ancestor or descendant)
+    inherit: bool  # INHERIT flag on the edge closest to the target
+    depth: int  # distance from target; 1 = direct
+    via: str  # for ancestor walks: parent that granted this row
 
 
 # The recursive walks carry a `path` array of oids already visited so the
@@ -241,7 +255,8 @@ def fetch_memberships_out(
     cursor: Any, oid: int, engine: SqlEngine
 ) -> list[MembershipEdge]:
     sql = (
-        _MEMBERSHIPS_OUT_REDSHIFT if engine == SqlEngine.redshift
+        _MEMBERSHIPS_OUT_REDSHIFT
+        if engine == SqlEngine.redshift
         else _MEMBERSHIPS_OUT_POSTGRES
     )
     cursor.execute(sql, (oid,))
@@ -255,7 +270,8 @@ def fetch_memberships_in(
     cursor: Any, oid: int, engine: SqlEngine
 ) -> list[MembershipEdge]:
     sql = (
-        _MEMBERSHIPS_IN_REDSHIFT if engine == SqlEngine.redshift
+        _MEMBERSHIPS_IN_REDSHIFT
+        if engine == SqlEngine.redshift
         else _MEMBERSHIPS_IN_POSTGRES
     )
     cursor.execute(sql, (oid,))
@@ -266,14 +282,16 @@ def fetch_memberships_in(
 
 
 _KIND_LABEL = {
-    "r": "table", "p": "table", "v": "view", "m": "matview",
-    "f": "foreign table", "S": "sequence",
+    "r": "table",
+    "p": "table",
+    "v": "view",
+    "m": "matview",
+    "f": "foreign table",
+    "S": "sequence",
 }
 
 
-def build_closure(
-    *, self_name: str, ancestors: list[MembershipEdge]
-) -> set[str]:
+def build_closure(*, self_name: str, ancestors: list[MembershipEdge]) -> set[str]:
     """Roles whose direct grants apply to this role's permissions.
 
     Includes the role itself, transitively inherited ancestors, and PUBLIC.
@@ -333,7 +351,7 @@ def fetch_owned_objects(
 
 @dataclass(frozen=True)
 class EffectivePrivilege:
-    scope: str          # "schema" | "relation" | "sequence" | "function"
+    scope: str  # "schema" | "relation" | "sequence" | "function"
     qualified_name: str
     kind: str
     privilege: str
@@ -423,41 +441,59 @@ def fetch_effective_privileges(
 
     cursor.execute(_EFFECTIVE_SCHEMAS_SQL, (closure_list,))
     for name, priv, grantor, via, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="schema", qualified_name=name, kind="schema",
-            privilege=priv, grantor=grantor or "",
-            via=via or "public", grantable=bool(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="schema",
+                qualified_name=name,
+                kind="schema",
+                privilege=priv,
+                grantor=grantor or "",
+                via=via or "public",
+                grantable=bool(grantable),
+            )
+        )
 
     cursor.execute(_EFFECTIVE_RELATIONS_SQL, (closure_list,))
     for nspname, relname, kind, priv, grantor, via, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="relation",
-            qualified_name=f"{nspname}.{relname}",
-            kind=kind, privilege=priv,
-            grantor=grantor or "", via=via or "public",
-            grantable=bool(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="relation",
+                qualified_name=f"{nspname}.{relname}",
+                kind=kind,
+                privilege=priv,
+                grantor=grantor or "",
+                via=via or "public",
+                grantable=bool(grantable),
+            )
+        )
 
     cursor.execute(_EFFECTIVE_SEQUENCES_SQL, (closure_list,))
     for nspname, relname, priv, grantor, via, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="sequence",
-            qualified_name=f"{nspname}.{relname}",
-            kind="sequence", privilege=priv,
-            grantor=grantor or "", via=via or "public",
-            grantable=bool(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="sequence",
+                qualified_name=f"{nspname}.{relname}",
+                kind="sequence",
+                privilege=priv,
+                grantor=grantor or "",
+                via=via or "public",
+                grantable=bool(grantable),
+            )
+        )
 
     cursor.execute(_EFFECTIVE_FUNCTIONS_SQL, (closure_list,))
     for nspname, identity, priv, grantor, via, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="function",
-            qualified_name=f"{nspname}.{identity}",
-            kind="function", privilege=priv,
-            grantor=grantor or "", via=via or "public",
-            grantable=bool(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="function",
+                qualified_name=f"{nspname}.{identity}",
+                kind="function",
+                privilege=priv,
+                grantor=grantor or "",
+                via=via or "public",
+                grantable=bool(grantable),
+            )
+        )
     return rows
 
 
@@ -482,7 +518,11 @@ ORDER BY n.nspname, c.relname
 
 _REDSHIFT_SCHEMA_PRIV_PROBES = ("USAGE", "CREATE")
 _REDSHIFT_RELATION_PRIV_PROBES = (
-    "SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "REFERENCES",
 )
 
 # Hard cap on the number of ``has_*_privilege`` probes packed into a single
@@ -575,31 +615,45 @@ def _fetch_effective_redshift_rbac(
 
     cursor.execute(_REDSHIFT_SVV_SCHEMAS_SQL, (closure_list,))
     for schema, priv, identity, admin in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="schema", qualified_name=schema, kind="schema",
-            privilege=priv, grantor="", via=identity or "public",
-            grantable=bool(admin),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="schema",
+                qualified_name=schema,
+                kind="schema",
+                privilege=priv,
+                grantor="",
+                via=identity or "public",
+                grantable=bool(admin),
+            )
+        )
 
     cursor.execute(_REDSHIFT_SVV_RELATIONS_SQL, (closure_list,))
     for schema, rel, kind, priv, identity, admin in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="relation",
-            qualified_name=f"{schema}.{rel}",
-            kind=kind or "table", privilege=priv,
-            grantor="", via=identity or "public",
-            grantable=bool(admin),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="relation",
+                qualified_name=f"{schema}.{rel}",
+                kind=kind or "table",
+                privilege=priv,
+                grantor="",
+                via=identity or "public",
+                grantable=bool(admin),
+            )
+        )
 
     cursor.execute(_REDSHIFT_SVV_FUNCTIONS_SQL, (closure_list,))
     for schema, fname, priv, identity, admin in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="function",
-            qualified_name=f"{schema}.{fname}",
-            kind="function", privilege=priv,
-            grantor="", via=identity or "public",
-            grantable=bool(admin),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="function",
+                qualified_name=f"{schema}.{fname}",
+                kind="function",
+                privilege=priv,
+                grantor="",
+                via=identity or "public",
+                grantable=bool(admin),
+            )
+        )
     return rows
 
 
@@ -650,27 +704,31 @@ def _fetch_effective_redshift(
 
     cursor.execute(_REDSHIFT_INFO_SCHEMA_RELATIONS_SQL, (closure_lower,))
     for schema, rel, priv, grantee, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="relation",
-            qualified_name=f"{schema}.{rel}",
-            kind="table",  # info_schema doesn't distinguish table/view/matview
-            privilege=priv,
-            grantor="",
-            via=(grantee or "public").lower(),
-            grantable=_is_grantable(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="relation",
+                qualified_name=f"{schema}.{rel}",
+                kind="table",  # info_schema doesn't distinguish table/view/matview
+                privilege=priv,
+                grantor="",
+                via=(grantee or "public").lower(),
+                grantable=_is_grantable(grantable),
+            )
+        )
 
     cursor.execute(_REDSHIFT_INFO_SCHEMA_FUNCTIONS_SQL, (closure_lower,))
     for schema, fname, priv, grantee, grantable in cursor.fetchall():
-        rows.append(EffectivePrivilege(
-            scope="function",
-            qualified_name=f"{schema}.{fname}",
-            kind="function",
-            privilege=priv,
-            grantor="",
-            via=(grantee or "public").lower(),
-            grantable=_is_grantable(grantable),
-        ))
+        rows.append(
+            EffectivePrivilege(
+                scope="function",
+                qualified_name=f"{schema}.{fname}",
+                kind="function",
+                privilege=priv,
+                grantor="",
+                via=(grantee or "public").lower(),
+                grantable=_is_grantable(grantable),
+            )
+        )
 
     # Schemas still probe — small blast radius, and no portable alternative.
     cursor.execute(_REDSHIFT_CANDIDATE_SCHEMAS_SQL)
@@ -704,10 +762,17 @@ def _fetch_effective_redshift(
         cursor.execute(schema_union, tuple(schema_params))
         for _role, schema, priv, has in cursor.fetchall():
             if has:
-                rows.append(EffectivePrivilege(
-                    scope="schema", qualified_name=schema, kind="schema",
-                    privilege=priv, grantor="", via="self", grantable=False,
-                ))
+                rows.append(
+                    EffectivePrivilege(
+                        scope="schema",
+                        qualified_name=schema,
+                        kind="schema",
+                        privilege=priv,
+                        grantor="",
+                        via="self",
+                        grantable=False,
+                    )
+                )
     return rows
 
 
@@ -722,7 +787,10 @@ class DefaultPrivilege:
 
 
 _DEFAULT_ACL_OBJTYPE = {
-    "r": "table", "S": "sequence", "f": "function", "T": "type",
+    "r": "table",
+    "S": "sequence",
+    "f": "function",
+    "T": "type",
 }
 
 
@@ -749,14 +817,16 @@ def fetch_default_privileges(
     cursor.execute(_DEFAULT_ACL_SQL, (sorted(closure),))
     out: list[DefaultPrivilege] = []
     for owner, schema, objtype, priv, via, grantable in cursor.fetchall():
-        out.append(DefaultPrivilege(
-            owner=owner,
-            schema=schema or "",
-            object_type=_DEFAULT_ACL_OBJTYPE.get(objtype, objtype),
-            privilege=priv,
-            via=via or "public",
-            grantable=bool(grantable),
-        ))
+        out.append(
+            DefaultPrivilege(
+                owner=owner,
+                schema=schema or "",
+                object_type=_DEFAULT_ACL_OBJTYPE.get(objtype, objtype),
+                privilege=priv,
+                via=via or "public",
+                grantable=bool(grantable),
+            )
+        )
     return out
 
 
@@ -791,7 +861,9 @@ def describe_role(
     if engine == SqlEngine.redshift:
         rbac_flag = _redshift_rbac_available(cursor)
     effective = fetch_effective_privileges(
-        cursor, closure=closure, engine=engine,
+        cursor,
+        closure=closure,
+        engine=engine,
     )
     defaults = (
         []

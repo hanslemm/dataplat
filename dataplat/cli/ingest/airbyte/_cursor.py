@@ -13,6 +13,7 @@ connector-defined JSON. Two kinds of cursor are rewritten:
 Everything else — numeric/epoch cursors, LSN/CDC objects, non-ISO strings — is an
 "opaque" cursor and is left alone.
 """
+
 from __future__ import annotations
 
 import copy
@@ -136,10 +137,15 @@ def _plan_xmin_stream(
         action = "skip:xmin"
     else:
         try:
-            if only_rewind and old_xid is not None and (
-                rewrite_xmin(
-                    old_xid, xmin_value=xmin_value, xmin_factor=xmin_factor
-                ) > int(old_xid)
+            if (
+                only_rewind
+                and old_xid is not None
+                and (
+                    rewrite_xmin(
+                        old_xid, xmin_value=xmin_value, xmin_factor=xmin_factor
+                    )
+                    > int(old_xid)
+                )
             ):
                 action = "skip:advance"
             else:
@@ -152,7 +158,9 @@ def _plan_xmin_stream(
         except (TypeError, ValueError):
             action = "skip:xmin"
     return {
-        "stream": name, "namespace": namespace, "key": "xmin",
+        "stream": name,
+        "namespace": namespace,
+        "key": "xmin",
         "old": old_xid,
         "new": inner.get("xmin_xid_value") if action == "rewrite:xmin" else old_xid,
         "action": action,
@@ -210,8 +218,11 @@ def plan_cursor_rewrites(
         if inner.get("state_type") == "xmin":
             actions.append(
                 _plan_xmin_stream(
-                    inner, name, namespace,
-                    xmin_value=xmin_value, xmin_factor=xmin_factor,
+                    inner,
+                    name,
+                    namespace,
+                    xmin_value=xmin_value,
+                    xmin_factor=xmin_factor,
                     only_rewind=only_rewind,
                 )
             )
@@ -223,29 +234,53 @@ def plan_cursor_rewrites(
                 continue  # decided after the loop, based on whether the cursor moved
             if classify_cursor_value(value) == "date":
                 if target is None:
-                    actions.append({
-                        "stream": name, "namespace": namespace, "key": key,
-                        "old": value, "new": value, "action": "skip:date",
-                    })
+                    actions.append(
+                        {
+                            "stream": name,
+                            "namespace": namespace,
+                            "key": key,
+                            "old": value,
+                            "new": value,
+                            "action": "skip:date",
+                        }
+                    )
                     continue
                 if only_rewind and _cursor_date(value) < target:
-                    actions.append({
-                        "stream": name, "namespace": namespace, "key": key,
-                        "old": value, "new": value, "action": "skip:advance",
-                    })
+                    actions.append(
+                        {
+                            "stream": name,
+                            "namespace": namespace,
+                            "key": key,
+                            "old": value,
+                            "new": value,
+                            "action": "skip:advance",
+                        }
+                    )
                     continue
                 new_value = rewrite_date(value, target)
                 inner[key] = new_value
                 rewrote_date = True
-                actions.append({
-                    "stream": name, "namespace": namespace, "key": key,
-                    "old": value, "new": new_value, "action": "rewrite",
-                })
+                actions.append(
+                    {
+                        "stream": name,
+                        "namespace": namespace,
+                        "key": key,
+                        "old": value,
+                        "new": new_value,
+                        "action": "rewrite",
+                    }
+                )
             else:
-                actions.append({
-                    "stream": name, "namespace": namespace, "key": key,
-                    "old": value, "new": value, "action": "skip:opaque",
-                })
+                actions.append(
+                    {
+                        "stream": name,
+                        "namespace": namespace,
+                        "key": key,
+                        "old": value,
+                        "new": value,
+                        "action": "skip:opaque",
+                    }
+                )
 
         # A rewound cursor has emitted no rows at the new boundary, so the
         # boundary-dedup counter must reset to 0 — otherwise the next sync would
@@ -254,15 +289,25 @@ def plan_cursor_rewrites(
             old_count = inner["cursor_record_count"]
             if rewrote_date and old_count != 0:
                 inner["cursor_record_count"] = 0
-                actions.append({
-                    "stream": name, "namespace": namespace,
-                    "key": "cursor_record_count",
-                    "old": old_count, "new": 0, "action": "reset:count",
-                })
+                actions.append(
+                    {
+                        "stream": name,
+                        "namespace": namespace,
+                        "key": "cursor_record_count",
+                        "old": old_count,
+                        "new": 0,
+                        "action": "reset:count",
+                    }
+                )
             else:
-                actions.append({
-                    "stream": name, "namespace": namespace,
-                    "key": "cursor_record_count",
-                    "old": old_count, "new": old_count, "action": "skip:opaque",
-                })
+                actions.append(
+                    {
+                        "stream": name,
+                        "namespace": namespace,
+                        "key": "cursor_record_count",
+                        "old": old_count,
+                        "new": old_count,
+                        "action": "skip:opaque",
+                    }
+                )
     return new_state, actions

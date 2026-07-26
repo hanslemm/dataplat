@@ -31,9 +31,7 @@ def list_destinations(
     )
 
 
-def get_destination(
-    client: httpx.Client, base_url: str, destination_id: str
-) -> dict:
+def get_destination(client: httpx.Client, base_url: str, destination_id: str) -> dict:
     return get_resource(client, base_url, "destinations", destination_id)
 
 

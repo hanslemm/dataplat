@@ -29,13 +29,18 @@ def test_postgres_create_login_is_create_role_login() -> None:
 def test_postgres_membership_ignores_kind() -> None:
     d = PostgresDialect()
     for kind in (ParentKind.role, ParentKind.group):
-        assert _r(d.grant_membership("alice", "analyst", kind)) == 'GRANT "analyst" TO "alice"'
+        assert (
+            _r(d.grant_membership("alice", "analyst", kind))
+            == 'GRANT "analyst" TO "alice"'
+        )
 
 
 def test_postgres_shared_grants() -> None:
     d = PostgresDialect()
     assert _r(d.grant_schema_usage("a", "raw")) == 'GRANT USAGE ON SCHEMA "raw" TO "a"'
-    assert _r(d.grant_schema_create("a", "raw")) == 'GRANT CREATE ON SCHEMA "raw" TO "a"'
+    assert (
+        _r(d.grant_schema_create("a", "raw")) == 'GRANT CREATE ON SCHEMA "raw" TO "a"'
+    )
     assert _r(d.grant_table_select("a", "raw")) == (
         'GRANT SELECT ON ALL TABLES IN SCHEMA "raw" TO "a"'
     )
@@ -110,14 +115,12 @@ def test_postgres_grant_role_to_ignores_kind_and_role_flag() -> None:
 
 def test_redshift_grant_role_to_user_and_role() -> None:
     d = RedshiftDialect()
-    assert _r(d.grant_role_to("readers", "alice", ParentKind.user,
-                              name_is_role=True)) == (
-        'GRANT ROLE "readers" TO "alice"'
-    )
-    assert _r(d.grant_role_to("readers", "rbac", ParentKind.role,
-                              name_is_role=True)) == (
-        'GRANT ROLE "readers" TO ROLE "rbac"'
-    )
+    assert _r(
+        d.grant_role_to("readers", "alice", ParentKind.user, name_is_role=True)
+    ) == ('GRANT ROLE "readers" TO "alice"')
+    assert _r(
+        d.grant_role_to("readers", "rbac", ParentKind.role, name_is_role=True)
+    ) == ('GRANT ROLE "readers" TO ROLE "rbac"')
 
 
 def test_postgres_grants_ignore_as_role() -> None:
@@ -149,10 +152,9 @@ def test_redshift_default_privileges_skip_for_roles() -> None:
 
 def test_redshift_membership_role_member_uses_to_role() -> None:
     d = RedshiftDialect()
-    assert _r(d.grant_membership("readers", "rbac", ParentKind.role,
-                                 member_is_role=True)) == (
-        'GRANT ROLE "rbac" TO ROLE "readers"'
-    )
+    assert _r(
+        d.grant_membership("readers", "rbac", ParentKind.role, member_is_role=True)
+    ) == ('GRANT ROLE "rbac" TO ROLE "readers"')
 
 
 class _ScriptedCursor:
@@ -191,14 +193,16 @@ def test_redshift_role_exists_checks_user_then_group() -> None:
 
 def test_redshift_resolve_parent_kind_group() -> None:
     kind = RedshiftDialect().resolve_parent_kind(
-        _ScriptedCursor({"pg_group": (1,)}), "reporting",
+        _ScriptedCursor({"pg_group": (1,)}),
+        "reporting",
     )
     assert kind is ParentKind.group
 
 
 def test_redshift_resolve_parent_kind_rbac_role() -> None:
     kind = RedshiftDialect().resolve_parent_kind(
-        _ScriptedCursor({"svv_roles": (1,)}), "rbac_reader",
+        _ScriptedCursor({"svv_roles": (1,)}),
+        "rbac_reader",
     )
     assert kind is ParentKind.role
 
@@ -215,14 +219,19 @@ def test_redshift_role_exists_checks_rbac_roles() -> None:
 
 def test_redshift_resolve_grantee_kind() -> None:
     d = RedshiftDialect()
-    assert d.resolve_grantee_kind(
-        _ScriptedCursor({"pg_user": (1,)}), "alice") is ParentKind.user
-    assert d.resolve_grantee_kind(
-        _ScriptedCursor({"pg_group": (1,)}), "grp") is ParentKind.group
-    assert d.resolve_grantee_kind(
-        _ScriptedCursor({"svv_roles": (1,)}), "rbac") is ParentKind.role
-    assert d.resolve_grantee_kind(
-        _ScriptedCursor({}), "ghost") is ParentKind.absent
+    assert (
+        d.resolve_grantee_kind(_ScriptedCursor({"pg_user": (1,)}), "alice")
+        is ParentKind.user
+    )
+    assert (
+        d.resolve_grantee_kind(_ScriptedCursor({"pg_group": (1,)}), "grp")
+        is ParentKind.group
+    )
+    assert (
+        d.resolve_grantee_kind(_ScriptedCursor({"svv_roles": (1,)}), "rbac")
+        is ParentKind.role
+    )
+    assert d.resolve_grantee_kind(_ScriptedCursor({}), "ghost") is ParentKind.absent
 
 
 def test_postgres_resolve_grantee_kind_is_role_without_io() -> None:
@@ -294,10 +303,12 @@ class _RowsCursor:
 
 def test_redshift_list_roles_unions_users_and_groups() -> None:
     # First execute -> users, second -> groups.
-    cursor = _RowsCursor([
-        [("svc", True, False)],                 # usename, usesuper, usecreatedb
-        [("reporting", 3)],                     # groname, member count
-    ])
+    cursor = _RowsCursor(
+        [
+            [("svc", True, False)],  # usename, usesuper, usecreatedb
+            [("reporting", 3)],  # groname, member count
+        ]
+    )
     rows = RedshiftDialect().list_roles(cursor)
     by_name = {r.name: r for r in rows}
     assert by_name["svc"].can_login is True

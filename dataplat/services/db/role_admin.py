@@ -186,9 +186,7 @@ def build_create_plan(
                 f'cannot grant role "{name}" to legacy group "{target}" on '
                 f"Redshift (groups hold only login users)"
             )
-        cluster.append(
-            dialect.grant_role_to(name, target, kind, name_is_role=is_role)
-        )
+        cluster.append(dialect.grant_role_to(name, target, kind, name_is_role=is_role))
 
     per_db: dict[str, list[SqlOp]] = {}
     usage_schemas = _schema_usage_set(spec)
@@ -302,13 +300,22 @@ def build_drop_plan(
     if isinstance(dialect, RedshiftDialect):
         # Redshift: single connected database; no REASSIGN/DROP OWNED.
         db = databases[0]
-        default_owner = resolve_reassign_owner(
-            db, explicit=reassign_to, defaults=defaults,
-        ) if not no_reassign else (reassign_to or "")
+        default_owner = (
+            resolve_reassign_owner(
+                db,
+                explicit=reassign_to,
+                defaults=defaults,
+            )
+            if not no_reassign
+            else (reassign_to or "")
+        )
         drop_ops = dialect.build_drop_ops(
-            cleaned, db,
-            reassign_to=reassign_to, no_reassign=no_reassign,
-            owned=owned or OwnedForDrop(), groups=groups or [],
+            cleaned,
+            db,
+            reassign_to=reassign_to,
+            no_reassign=no_reassign,
+            owned=owned or OwnedForDrop(),
+            groups=groups or [],
             default_owner=default_owner,
         )
         return DropPlan(
@@ -323,39 +330,51 @@ def build_drop_plan(
 
     pre_cluster: list[SqlOp] = []
     if grant_membership_to:
-        pre_cluster.append(SqlOp(
-            description=(
-                f"GRANT {cleaned} TO {grant_membership_to} "
-                f"(needed for REASSIGN/DROP OWNED)"
-            ),
-            statement=sql.SQL("GRANT {role} TO {grantee}").format(
-                role=role_id, grantee=sql.Identifier(grant_membership_to),
-            ),
-        ))
+        pre_cluster.append(
+            SqlOp(
+                description=(
+                    f"GRANT {cleaned} TO {grant_membership_to} "
+                    f"(needed for REASSIGN/DROP OWNED)"
+                ),
+                statement=sql.SQL("GRANT {role} TO {grantee}").format(
+                    role=role_id,
+                    grantee=sql.Identifier(grant_membership_to),
+                ),
+            )
+        )
 
     per_db: dict[str, list[SqlOp]] = {}
     for db in databases:
         ops: list[SqlOp] = []
         if not no_reassign:
             owner = resolve_reassign_owner(
-                db, explicit=reassign_to, defaults=defaults,
+                db,
+                explicit=reassign_to,
+                defaults=defaults,
             )
-            ops.append(SqlOp(
-                description=f"REASSIGN OWNED BY {cleaned} TO {owner}",
-                statement=sql.SQL("REASSIGN OWNED BY {role} TO {owner}").format(
-                    role=role_id, owner=sql.Identifier(owner),
-                ),
-            ))
-        ops.append(SqlOp(
-            description=f"DROP OWNED BY {cleaned}",
-            statement=sql.SQL("DROP OWNED BY {role}").format(role=role_id),
-        ))
+            ops.append(
+                SqlOp(
+                    description=f"REASSIGN OWNED BY {cleaned} TO {owner}",
+                    statement=sql.SQL("REASSIGN OWNED BY {role} TO {owner}").format(
+                        role=role_id,
+                        owner=sql.Identifier(owner),
+                    ),
+                )
+            )
+        ops.append(
+            SqlOp(
+                description=f"DROP OWNED BY {cleaned}",
+                statement=sql.SQL("DROP OWNED BY {role}").format(role=role_id),
+            )
+        )
         per_db[db] = ops
 
-    cluster = [SqlOp(
-        description=f"DROP ROLE {cleaned}",
-        statement=sql.SQL("DROP ROLE {role}").format(role=role_id),
-    )]
+    cluster = [
+        SqlOp(
+            description=f"DROP ROLE {cleaned}",
+            statement=sql.SQL("DROP ROLE {role}").format(role=role_id),
+        )
+    ]
     return DropPlan(
         role=cleaned,
         pre_cluster_ops=pre_cluster,
@@ -392,8 +411,8 @@ class RoleSummary:
     superuser: bool
     create_db: bool
     create_role: bool
-    member_of_count: int     # parents (roles this role is a member of)
-    members_count: int       # children (roles that are members of this role)
+    member_of_count: int  # parents (roles this role is a member of)
+    members_count: int  # children (roles that are members of this role)
 
 
 # pg_roles is shared across the cluster, so the result is identical from any
@@ -432,8 +451,15 @@ def list_roles(cursor: Any) -> list[RoleSummary]:
             member_of_count=int(member_of_count),
             members_count=int(members_count),
         )
-        for name, can_login, superuser, create_db, create_role,
-        member_of_count, members_count in cursor.fetchall()
+        for (
+            name,
+            can_login,
+            superuser,
+            create_db,
+            create_role,
+            member_of_count,
+            members_count,
+        ) in cursor.fetchall()
     ]
 
 

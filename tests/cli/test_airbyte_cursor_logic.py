@@ -1,4 +1,5 @@
 """Unit tests for pure Airbyte cursor classification/rewrite logic."""
+
 from __future__ import annotations
 
 from datetime import date
@@ -45,15 +46,15 @@ def test_classify_date_values(value: str) -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        1711753326,            # epoch int -> opaque (conservative)
+        1711753326,  # epoch int -> opaque (conservative)
         123,
         12.5,
-        "12345",               # numeric string, not ISO
+        "12345",  # numeric string, not ISO
         "not-a-date",
-        "2024",                # year only, not a full date
+        "2024",  # year only, not a full date
         "",
         None,
-        {"lsn": 123456},       # CDC/global object
+        {"lsn": 123456},  # CDC/global object
         ["2024-06-01"],
         True,
     ],
@@ -104,21 +105,38 @@ def test_plan_rewrites_only_date_cursors() -> None:
     new_state, actions = plan_cursor_rewrites(state, date(2024, 1, 1))
 
     # original object untouched (deep copy)
-    assert state["streamState"][0]["streamState"]["updated_at"] == "2024-06-01T00:00:00Z"
+    assert (
+        state["streamState"][0]["streamState"]["updated_at"] == "2024-06-01T00:00:00Z"
+    )
     # date cursor rewritten in the new state
-    assert new_state["streamState"][0]["streamState"]["updated_at"] == "2024-01-01T00:00:00Z"
+    assert (
+        new_state["streamState"][0]["streamState"]["updated_at"]
+        == "2024-01-01T00:00:00Z"
+    )
     # opaque cursor untouched in the new state
     assert new_state["streamState"][1]["streamState"]["id"] == 987654
 
     rewrite = [a for a in actions if a["action"] == "rewrite"]
     skipped = [a for a in actions if a["action"] == "skip:opaque"]
     assert rewrite == [
-        {"stream": "orders", "namespace": "public", "key": "updated_at",
-         "old": "2024-06-01T00:00:00Z", "new": "2024-01-01T00:00:00Z", "action": "rewrite"}
+        {
+            "stream": "orders",
+            "namespace": "public",
+            "key": "updated_at",
+            "old": "2024-06-01T00:00:00Z",
+            "new": "2024-01-01T00:00:00Z",
+            "action": "rewrite",
+        }
     ]
     assert skipped == [
-        {"stream": "events", "namespace": "public", "key": "id",
-         "old": 987654, "new": 987654, "action": "skip:opaque"}
+        {
+            "stream": "events",
+            "namespace": "public",
+            "key": "id",
+            "old": 987654,
+            "new": 987654,
+            "action": "skip:opaque",
+        }
     ]
 
 
@@ -141,10 +159,10 @@ def test_rewrite_xmin_absolute_ignores_old() -> None:
     ("old", "factor", "expected"),
     [
         (1000, 0.1, 100),
-        (12345, 0.1, 1234),   # round(1234.5) -> 1234 (banker's)
+        (12345, 0.1, 1234),  # round(1234.5) -> 1234 (banker's)
         (1000, 0.0, 0),
         (1000, 2.0, 2000),
-        ("500", 0.5, 250),    # numeric string coerces
+        ("500", 0.5, 250),  # numeric string coerces
     ],
 )
 def test_rewrite_xmin_factor(old: object, factor: float, expected: int) -> None:
@@ -157,11 +175,17 @@ def test_plan_xmin_factor_scales_both_fields() -> None:
     inner = new_state["streamState"][0]["streamState"]
     assert inner["xmin_xid_value"] == 100
     assert inner["xmin_raw_value"] == 100
-    assert inner["version"] == 2            # untouched
-    assert inner["num_wraparound"] == 0     # untouched
+    assert inner["version"] == 2  # untouched
+    assert inner["num_wraparound"] == 0  # untouched
     assert actions == [
-        {"stream": "orders", "namespace": "public", "key": "xmin",
-         "old": 1000, "new": 100, "action": "rewrite:xmin"}
+        {
+            "stream": "orders",
+            "namespace": "public",
+            "key": "xmin",
+            "old": 1000,
+            "new": 100,
+            "action": "rewrite:xmin",
+        }
     ]
 
 
@@ -180,8 +204,14 @@ def test_plan_xmin_skipped_when_no_xmin_op() -> None:
     # only --to was given: the xmin stream is left alone
     assert new_state["streamState"][0]["streamState"]["xmin_xid_value"] == 555
     assert actions == [
-        {"stream": "orders", "namespace": "public", "key": "xmin",
-         "old": 555, "new": 555, "action": "skip:xmin"}
+        {
+            "stream": "orders",
+            "namespace": "public",
+            "key": "xmin",
+            "old": 555,
+            "new": 555,
+            "action": "skip:xmin",
+        }
     ]
 
 
@@ -189,13 +219,18 @@ def test_plan_date_skipped_when_no_target() -> None:
     state = {
         "stateType": "stream",
         "streamState": [
-            {"streamDescriptor": {"name": "orders", "namespace": "public"},
-             "streamState": {"updated_at": "2024-06-01T00:00:00Z"}},
+            {
+                "streamDescriptor": {"name": "orders", "namespace": "public"},
+                "streamState": {"updated_at": "2024-06-01T00:00:00Z"},
+            },
         ],
     }
     new_state, actions = plan_cursor_rewrites(state, xmin_value=0)
     # only an xmin op was given: date cursor untouched, reported as skip:date
-    assert new_state["streamState"][0]["streamState"]["updated_at"] == "2024-06-01T00:00:00Z"
+    assert (
+        new_state["streamState"][0]["streamState"]["updated_at"]
+        == "2024-06-01T00:00:00Z"
+    )
     assert actions[0]["action"] == "skip:date"
 
 
@@ -203,14 +238,14 @@ def test_plan_combined_date_and_xmin_in_one_pass() -> None:
     state = {
         "stateType": "stream",
         "streamState": [
-            {"streamDescriptor": {"name": "orders", "namespace": "public"},
-             "streamState": {"updated_at": "2024-06-01T00:00:00Z"}},
+            {
+                "streamDescriptor": {"name": "orders", "namespace": "public"},
+                "streamState": {"updated_at": "2024-06-01T00:00:00Z"},
+            },
             _xmin_stream(1000),
         ],
     }
-    new_state, actions = plan_cursor_rewrites(
-        state, date(2024, 1, 1), xmin_factor=0.1
-    )
+    new_state, actions = plan_cursor_rewrites(state, date(2024, 1, 1), xmin_factor=0.1)
     streams = new_state["streamState"]
     assert streams[0]["streamState"]["updated_at"] == "2024-01-01T00:00:00Z"
     assert streams[1]["streamState"]["xmin_xid_value"] == 100
@@ -222,9 +257,13 @@ def _cursor_based_stream(cursor: str, *, count: int = 1) -> dict:
     return {
         "streamDescriptor": {"name": "orders", "namespace": "public"},
         "streamState": {
-            "cursor": cursor, "version": 2, "state_type": "cursor_based",
-            "stream_name": "orders", "cursor_field": ["updated_at"],
-            "stream_namespace": "public", "cursor_record_count": count,
+            "cursor": cursor,
+            "version": 2,
+            "state_type": "cursor_based",
+            "stream_name": "orders",
+            "cursor_field": ["updated_at"],
+            "stream_namespace": "public",
+            "cursor_record_count": count,
         },
     }
 
@@ -279,7 +318,9 @@ def test_plan_xmin_non_numeric_payload_is_skipped() -> None:
     stream["streamState"]["xmin_raw_value"] = "not-a-number"
     state = {"stateType": "stream", "streamState": [stream]}
     new_state, actions = plan_cursor_rewrites(state, xmin_factor=0.1)
-    assert new_state["streamState"][0]["streamState"]["xmin_xid_value"] == "not-a-number"
+    assert (
+        new_state["streamState"][0]["streamState"]["xmin_xid_value"] == "not-a-number"
+    )
     assert actions[0]["action"] == "skip:xmin"
 
 
@@ -297,13 +338,11 @@ def test_only_rewind_skips_date_cursor_behind_target() -> None:
     state = {
         "stateType": "stream",
         "streamState": [
-            _date_stream("ahead", "2024-06-01T00:00:00Z"),   # after target: rewind
+            _date_stream("ahead", "2024-06-01T00:00:00Z"),  # after target: rewind
             _date_stream("behind", "2023-01-01T00:00:00Z"),  # before target: skip
         ],
     }
-    new_state, actions = plan_cursor_rewrites(
-        state, date(2024, 1, 1), only_rewind=True
-    )
+    new_state, actions = plan_cursor_rewrites(state, date(2024, 1, 1), only_rewind=True)
     assert new_state["streamState"][0]["streamState"]["updated_at"] == (
         "2024-01-01T00:00:00Z"
     )
@@ -314,16 +353,21 @@ def test_only_rewind_skips_date_cursor_behind_target() -> None:
     by_stream = {a["stream"]: a for a in actions}
     assert by_stream["ahead"]["action"] == "rewrite"
     assert by_stream["behind"] == {
-        "stream": "behind", "namespace": "public", "key": "updated_at",
-        "old": "2023-01-01T00:00:00Z", "new": "2023-01-01T00:00:00Z",
+        "stream": "behind",
+        "namespace": "public",
+        "key": "updated_at",
+        "old": "2023-01-01T00:00:00Z",
+        "new": "2023-01-01T00:00:00Z",
         "action": "skip:advance",
     }
 
 
 def test_only_rewind_same_day_still_rewrites() -> None:
     # equal calendar date is not an advance; the (no-op) rewrite is kept
-    state = {"stateType": "stream",
-             "streamState": [_date_stream("orders", "2024-01-01T12:00:00Z")]}
+    state = {
+        "stateType": "stream",
+        "streamState": [_date_stream("orders", "2024-01-01T12:00:00Z")],
+    }
     _, actions = plan_cursor_rewrites(state, date(2024, 1, 1), only_rewind=True)
     assert actions[0]["action"] == "rewrite"
     assert actions[0]["new"] == "2024-01-01T12:00:00Z"
@@ -331,8 +375,10 @@ def test_only_rewind_same_day_still_rewrites() -> None:
 
 def test_without_only_rewind_forward_move_still_happens() -> None:
     # regression guard: default behavior is unchanged
-    state = {"stateType": "stream",
-             "streamState": [_date_stream("behind", "2023-01-01T00:00:00Z")]}
+    state = {
+        "stateType": "stream",
+        "streamState": [_date_stream("behind", "2023-01-01T00:00:00Z")],
+    }
     new_state, actions = plan_cursor_rewrites(state, date(2024, 1, 1))
     assert actions[0]["action"] == "rewrite"
     assert new_state["streamState"][0]["streamState"]["updated_at"] == (
@@ -341,27 +387,32 @@ def test_without_only_rewind_forward_move_still_happens() -> None:
 
 
 def test_only_rewind_skip_leaves_cursor_record_count_alone() -> None:
-    state = {"stateType": "stream",
-             "streamState": [_date_stream(
-                 "behind", "2023-01-01T00:00:00Z", cursor_record_count=7)]}
-    new_state, actions = plan_cursor_rewrites(
-        state, date(2024, 1, 1), only_rewind=True
-    )
+    state = {
+        "stateType": "stream",
+        "streamState": [
+            _date_stream("behind", "2023-01-01T00:00:00Z", cursor_record_count=7)
+        ],
+    }
+    new_state, actions = plan_cursor_rewrites(state, date(2024, 1, 1), only_rewind=True)
     assert new_state["streamState"][0]["streamState"]["cursor_record_count"] == 7
     assert not any(a["action"] == "reset:count" for a in actions)
 
 
 def test_only_rewind_skips_xmin_increase_absolute() -> None:
     state = {"stateType": "stream", "streamState": [_xmin_stream(100)]}
-    new_state, actions = plan_cursor_rewrites(
-        state, xmin_value=500, only_rewind=True
-    )
+    new_state, actions = plan_cursor_rewrites(state, xmin_value=500, only_rewind=True)
     inner = new_state["streamState"][0]["streamState"]
     assert inner["xmin_xid_value"] == 100
     assert inner["xmin_raw_value"] == 100
     assert actions == [
-        {"stream": "orders", "namespace": "public", "key": "xmin",
-         "old": 100, "new": 100, "action": "skip:advance"}
+        {
+            "stream": "orders",
+            "namespace": "public",
+            "key": "xmin",
+            "old": 100,
+            "new": 100,
+            "action": "skip:advance",
+        }
     ]
 
 
@@ -373,9 +424,7 @@ def test_only_rewind_skips_xmin_increase_factor() -> None:
 
 def test_only_rewind_allows_xmin_decrease() -> None:
     state = {"stateType": "stream", "streamState": [_xmin_stream(1000)]}
-    new_state, actions = plan_cursor_rewrites(
-        state, xmin_factor=0.1, only_rewind=True
-    )
+    new_state, actions = plan_cursor_rewrites(state, xmin_factor=0.1, only_rewind=True)
     assert new_state["streamState"][0]["streamState"]["xmin_xid_value"] == 100
     assert actions[0]["action"] == "rewrite:xmin"
 

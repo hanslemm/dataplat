@@ -80,7 +80,7 @@ def test_triage_keeps_live_queries_outside_the_window() -> None:
     sql, _ = build_long_queries_query(
         _COLUMNS, min_seconds=60, limit=20, cutoff=_CUTOFF, running_only=False
     )
-    assert 'IN (\'running\', \'queued\') OR "start_time" >=' in sql
+    assert "IN ('running', 'queued') OR \"start_time\" >=" in sql
 
 
 def test_triage_orders_running_queries_first() -> None:

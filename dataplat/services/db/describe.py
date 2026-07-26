@@ -93,9 +93,7 @@ def resolve_target(cursor: Any, engine: SqlEngine, target: str) -> TargetRef:
         "m": ObjectKind.matview,
     }
     if relkind not in kind_map:
-        raise TargetNotFoundError(
-            f'"{schema}.{obj}" has unsupported kind {relkind!r}'
-        )
+        raise TargetNotFoundError(f'"{schema}.{obj}" has unsupported kind {relkind!r}')
     return TargetRef(kind=kind_map[relkind], schema=schema, name=obj, oid=oid)
 
 
@@ -183,7 +181,9 @@ ORDER BY a.attnum
 
 def fetch_columns(cursor: Any, oid: int, engine: SqlEngine) -> list[ColumnInfo]:
     """Return ordinal-ordered columns for the given relation oid."""
-    sql = _COLUMNS_SQL_REDSHIFT if engine == SqlEngine.redshift else _COLUMNS_SQL_POSTGRES
+    sql = (
+        _COLUMNS_SQL_REDSHIFT if engine == SqlEngine.redshift else _COLUMNS_SQL_POSTGRES
+    )
     cursor.execute(sql, (oid,))
     return [ColumnInfo(*row) for row in cursor.fetchall()]
 
@@ -304,7 +304,9 @@ ORDER BY ic.relname
 
 def fetch_indexes(cursor: Any, oid: int, engine: SqlEngine) -> list[IndexInfo]:
     """Return indexes for the given relation oid."""
-    sql = _INDEXES_SQL_REDSHIFT if engine == SqlEngine.redshift else _INDEXES_SQL_POSTGRES
+    sql = (
+        _INDEXES_SQL_REDSHIFT if engine == SqlEngine.redshift else _INDEXES_SQL_POSTGRES
+    )
     cursor.execute(sql, (oid,))
     return [IndexInfo(*row) for row in cursor.fetchall()]
 
@@ -379,7 +381,11 @@ WHERE c.oid = %s
 
 
 def fetch_relation_header(cursor: Any, oid: int, engine: SqlEngine) -> RelationHeader:
-    sql = _RELATION_HEADER_SQL_REDSHIFT if engine == SqlEngine.redshift else _RELATION_HEADER_SQL_POSTGRES
+    sql = (
+        _RELATION_HEADER_SQL_REDSHIFT
+        if engine == SqlEngine.redshift
+        else _RELATION_HEADER_SQL_POSTGRES
+    )
     cursor.execute(sql, (oid,))
     row = cursor.fetchone()
     if row is None:
@@ -402,7 +408,9 @@ ORDER BY grantee, privilege
 """
 
 
-def fetch_relation_privileges(cursor: Any, schema: str, name: str) -> list[PrivilegeGrant]:
+def fetch_relation_privileges(
+    cursor: Any, schema: str, name: str
+) -> list[PrivilegeGrant]:
     cursor.execute(_PRIVILEGES_SQL, (schema, name, schema, name))
     return [PrivilegeGrant(*row) for row in cursor.fetchall()]
 
@@ -410,15 +418,15 @@ def fetch_relation_privileges(cursor: Any, schema: str, name: str) -> list[Privi
 @dataclass(frozen=True)
 class TriggerInfo:
     name: str
-    timing: str         # BEFORE / AFTER / INSTEAD OF
-    events: str         # e.g. "INSERT OR UPDATE"
+    timing: str  # BEFORE / AFTER / INSTEAD OF
+    events: str  # e.g. "INSERT OR UPDATE"
     function: str
 
 
 @dataclass(frozen=True)
 class PolicyInfo:
     name: str
-    command: str        # ALL, SELECT, INSERT, UPDATE, DELETE
+    command: str  # ALL, SELECT, INSERT, UPDATE, DELETE
     roles: list[str]
     using: str | None
     with_check: str | None
@@ -500,7 +508,11 @@ WHERE inh.inhrelid = %s
 
 
 _PARTITION_ROOT_STRATEGY_SQL = """
-SELECT CASE partstrat WHEN 'r' THEN 'RANGE' WHEN 'l' THEN 'LIST' WHEN 'h' THEN 'HASH' END
+SELECT CASE partstrat
+    WHEN 'r' THEN 'RANGE'
+    WHEN 'l' THEN 'LIST'
+    WHEN 'h' THEN 'HASH'
+END
 FROM pg_partitioned_table
 WHERE partrelid = %s
 """
@@ -517,11 +529,11 @@ ORDER BY cc.relname
 """
 
 
-def fetch_partitioning(
-    cursor: Any, oid: int, engine: SqlEngine
-) -> PartitioningInfo:
+def fetch_partitioning(cursor: Any, oid: int, engine: SqlEngine) -> PartitioningInfo:
     if engine == SqlEngine.redshift:
-        return PartitioningInfo(parent=None, strategy=None, partition_key=None, children=[])
+        return PartitioningInfo(
+            parent=None, strategy=None, partition_key=None, children=[]
+        )
     cursor.execute(_PARTITION_CHILD_PARENT_SQL, (oid,))
     parent_row = cursor.fetchone()
     parent = parent_row[0] if parent_row else None
@@ -608,9 +620,7 @@ _KIND_LABEL = {
 }
 
 
-def fetch_view_definition(
-    cursor: Any, oid: int, engine: SqlEngine
-) -> ViewDefinition:
+def fetch_view_definition(cursor: Any, oid: int, engine: SqlEngine) -> ViewDefinition:
     """Return the SQL definition + updatability info for a view/matview."""
     if engine == SqlEngine.redshift:
         cursor.execute(_VIEW_DEFINITION_SQL_REDSHIFT, (oid,))
@@ -647,7 +657,9 @@ def fetch_dependencies(
     elif direction == "downstream":
         sql = _DEPS_DOWNSTREAM_SQL
     else:
-        raise ValueError(f"direction must be 'upstream' or 'downstream', got {direction!r}")
+        raise ValueError(
+            f"direction must be 'upstream' or 'downstream', got {direction!r}"
+        )
     cursor.execute(sql, (oid, oid))
     return [
         DependencyEdge(qualified_name=name, kind=_KIND_LABEL.get(kind, kind))
@@ -789,7 +801,8 @@ def fetch_schema_privileges(cursor: Any, schema: str) -> list[PrivilegeGrant]:
 class DefaultPrivilegeGrant:
     """A row from ``pg_default_acl`` — privileges that future objects inherit.
 
-    Set via ``ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT ... ON TABLES TO <role>``.
+    Set via
+    ``ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT ... ON TABLES TO <role>``.
     """
 
     grantee: str
@@ -818,7 +831,13 @@ def fetch_schema_default_privileges(
             with_grant_option=bool(with_grant_option),
             grantor=grantor or "",
         )
-        for grantee, object_type, privileges, with_grant_option, grantor in cursor.fetchall()
+        for (
+            grantee,
+            object_type,
+            privileges,
+            with_grant_option,
+            grantor,
+        ) in cursor.fetchall()
     ]
 
 
@@ -941,7 +960,9 @@ def describe_table(cursor: Any, ref: TargetRef, engine: SqlEngine) -> TableDescr
     redshift_distribution: RedshiftDistribution | None = None
     redshift_stats: RedshiftTableStats | None = None
     if engine == SqlEngine.redshift:
-        redshift_distribution = fetch_redshift_distribution(cursor, ref.schema, ref.name)
+        redshift_distribution = fetch_redshift_distribution(
+            cursor, ref.schema, ref.name
+        )
         redshift_stats = fetch_redshift_table_stats(cursor, ref.schema, ref.name)
 
     definition: str | None = None
@@ -972,7 +993,9 @@ def describe_view(cursor: Any, ref: TargetRef, engine: SqlEngine) -> ViewDescrip
     columns = fetch_columns(cursor, ref.oid, engine)
     definition = fetch_view_definition(cursor, ref.oid, engine)
     upstream = fetch_dependencies(cursor, ref.oid, direction="upstream", engine=engine)
-    downstream = fetch_dependencies(cursor, ref.oid, direction="downstream", engine=engine)
+    downstream = fetch_dependencies(
+        cursor, ref.oid, direction="downstream", engine=engine
+    )
     privileges = fetch_relation_privileges(cursor, ref.schema, ref.name)
     triggers = fetch_triggers(cursor, ref.oid, engine)
     return ViewDescription(
@@ -987,7 +1010,9 @@ def describe_view(cursor: Any, ref: TargetRef, engine: SqlEngine) -> ViewDescrip
     )
 
 
-def describe_schema(cursor: Any, ref: TargetRef, engine: SqlEngine) -> SchemaDescription:
+def describe_schema(
+    cursor: Any, ref: TargetRef, engine: SqlEngine
+) -> SchemaDescription:
     """Compose a full schema description by invoking each fetcher."""
     header = fetch_schema_header(cursor, ref.schema)
     privileges = fetch_schema_privileges(cursor, ref.schema)
@@ -1004,15 +1029,27 @@ def describe_schema(cursor: Any, ref: TargetRef, engine: SqlEngine) -> SchemaDes
 def fetch_constraints(cursor: Any, oid: int, engine: SqlEngine) -> ConstraintBundle:
     if engine == SqlEngine.redshift:
         return ConstraintBundle(
-            primary_key=None, foreign_keys=[],
-            unique_constraints=[], check_constraints=[],
+            primary_key=None,
+            foreign_keys=[],
+            unique_constraints=[],
+            check_constraints=[],
         )
     cursor.execute(_CONSTRAINTS_SQL, (oid,))
     pk: PrimaryKeyInfo | None = None
     fks: list[ForeignKeyInfo] = []
     uniques: list[ConstraintInfo] = []
     checks: list[ConstraintInfo] = []
-    for name, kind, defn, local_cols, ref_table, ref_cols, del_t, upd_t, deferrable in cursor.fetchall():
+    for (
+        name,
+        kind,
+        defn,
+        local_cols,
+        ref_table,
+        ref_cols,
+        del_t,
+        upd_t,
+        deferrable,
+    ) in cursor.fetchall():
         if kind == "p":
             pk = PrimaryKeyInfo(name=name, columns=list(local_cols))
         elif kind == "f":

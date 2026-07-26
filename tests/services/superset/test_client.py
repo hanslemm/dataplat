@@ -30,17 +30,25 @@ def test_iter_security_items_paginates() -> None:
         if page == 0:
             return httpx.Response(
                 200,
-                json={"result": [{"id": 1}], "pagination": {"page": 0, "page_size": 1, "total_pages": 2}},
+                json={
+                    "result": [{"id": 1}],
+                    "pagination": {"page": 0, "page_size": 1, "total_pages": 2},
+                },
                 request=request,
             )
         return httpx.Response(
             200,
-            json={"result": [{"id": 2}], "pagination": {"page": 1, "page_size": 1, "total_pages": 2}},
+            json={
+                "result": [{"id": 2}],
+                "pagination": {"page": 1, "page_size": 1, "total_pages": 2},
+            },
             request=request,
         )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as c:
-        rows = list(client.iter_security_items(c, "https://superset.test", "tok", "roles"))
+        rows = list(
+            client.iter_security_items(c, "https://superset.test", "tok", "roles")
+        )
 
     assert [row["id"] for row in rows] == [1, 2]
     assert calls["count"] == 2

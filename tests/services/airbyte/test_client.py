@@ -22,7 +22,11 @@ def test_build_authenticated_client_cloud_fallbacks_to_oss(monkeypatch) -> None:
     monkeypatch.setenv("AIRBYTE_EMAIL", "mail@example.com")
     monkeypatch.setenv("AIRBYTE_PASSWORD", "pw")
 
-    monkeypatch.setattr(client, "get_access_token", lambda *a, **k: (_ for _ in ()).throw(AuthError("x")))
+    monkeypatch.setattr(
+        client,
+        "get_access_token",
+        lambda *a, **k: (_ for _ in ()).throw(AuthError("x")),
+    )
     monkeypatch.setattr(client, "login_airbyte_oss", lambda *a, **k: "fallback-token")
 
     c, base_url = client.build_authenticated_client()

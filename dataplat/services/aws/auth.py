@@ -15,7 +15,9 @@ def _import_boto() -> tuple[Any, Any]:
     try:
         import boto3
         import botocore.exceptions
-    except Exception as exc:  # pragma: no cover - import failure is environment-specific
+    except (
+        Exception
+    ) as exc:  # pragma: no cover - import failure is environment-specific
         raise ServiceError("boto3 and botocore are required for AWS commands") from exc
     return boto3, botocore.exceptions
 

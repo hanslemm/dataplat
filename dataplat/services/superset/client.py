@@ -201,7 +201,9 @@ def iter_security_items(
         page += 1
 
 
-def iter_roles(client: httpx.Client, base_url: str, access_token: str) -> Iterable[dict]:
+def iter_roles(
+    client: httpx.Client, base_url: str, access_token: str
+) -> Iterable[dict]:
     """Iterate Superset roles."""
     return iter_security_items(client, base_url, access_token, "roles")
 
@@ -215,7 +217,9 @@ def iter_groups(
     return iter_security_items(client, base_url, access_token, "groups")
 
 
-def iter_users(client: httpx.Client, base_url: str, access_token: str) -> Iterable[dict]:
+def iter_users(
+    client: httpx.Client, base_url: str, access_token: str
+) -> Iterable[dict]:
     """Iterate Superset users."""
     return iter_security_items(client, base_url, access_token, "users")
 
@@ -270,7 +274,9 @@ def create_user(
 ) -> dict:
     """Create a Superset user."""
     url = f"{base_url}/api/v1/security/users/"
-    response = client.post(url, json=payload, headers=auth_headers(access_token), timeout=60)
+    response = client.post(
+        url, json=payload, headers=auth_headers(access_token), timeout=60
+    )
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -290,7 +296,9 @@ def update_user(
 ) -> dict:
     """Update a Superset user."""
     url = f"{base_url}/api/v1/security/users/{user_id}"
-    response = client.put(url, json=payload, headers=auth_headers(access_token), timeout=60)
+    response = client.put(
+        url, json=payload, headers=auth_headers(access_token), timeout=60
+    )
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
