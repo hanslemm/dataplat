@@ -3,11 +3,25 @@ name: CI
 on:
   push:
     branches: ["**"]
+    # A tag push matches no branch, so without this a release tag would run no
+    # checks at all before release.yml publishes it.
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
   pull_request:
 
 jobs:
   checks:
     runs-on: ubuntu-latest
+    strategy:
+      # The floor and the ceiling break for different reasons; report both
+      # rather than hiding one behind the other.
+      fail-fast: false
+      matrix:
+        # Lowest version requires-python allows, plus the dev pin.
+        python-version: ["3.12", "3.13"]
+    env:
+      # Overrides .python-version (3.13). Without it every uv command in the
+      # 3.12 leg would still pick the pin and we would test 3.13 twice.
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,13 +30,16 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Setup Python
-        run: uv python install 3.13
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --group dev --all-extras
 
       - name: Ruff
         run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
 
       - name: MyPy
         run: uv run mypy dataplat

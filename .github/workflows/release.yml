@@ -5,7 +5,68 @@ on:
     tags: ["[0-9]*.[0-9]*.[0-9]*"]
 
 jobs:
+  # Nothing downstream re-checks the tree, so this job is the only thing
+  # standing between an untested commit and PyPI. Publishing is irreversible:
+  # a version can be yanked but never replaced.
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must mirror ci.yml: the wheel advertises >=3.12, so the floor has to
+        # pass before we publish, not just the dev pin.
+        python-version: ["3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Setup Python
+        run: uv python install ${{ matrix.python-version }}
+
+      # Before the expensive sync: a mismatch means the tag would either
+      # publish the wrong version number or die at upload against an already
+      # occupied filename.
+      - name: Assert tag matches project version
+        run: |
+          uv run --no-project python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          with open("pyproject.toml", "rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          if tag != version:
+              sys.exit(
+                  f"Tag '{tag}' does not match [project].version '{version}' in "
+                  "pyproject.toml. Bump the version, commit, and re-tag; "
+                  "refusing to publish a mismatched artifact."
+              )
+          print(f"Tag '{tag}' matches [project].version.")
+          PY
+
+      - name: Install dependencies
+        run: uv sync --group dev --all-extras
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: MyPy
+        run: uv run mypy dataplat
+
+      - name: Pytest
+        run: uv run pytest
+
   build:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
