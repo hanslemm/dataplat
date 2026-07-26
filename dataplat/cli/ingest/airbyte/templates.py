@@ -7,6 +7,7 @@ import json
 import typer
 from rich.console import Console
 
+from dataplat.cli._render import esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.definitions import (
@@ -14,7 +15,11 @@ from dataplat.services.airbyte.definitions import (
     list_source_definitions,
 )
 
-app = typer.Typer(name="templates", help="Generate Airbyte configuration skeletons", no_args_is_help=True)
+app = typer.Typer(
+    name="templates",
+    help="Generate Airbyte configuration skeletons",
+    no_args_is_help=True,
+)
 console = Console()
 
 
@@ -28,7 +33,9 @@ def _find_definition(definitions: list, definition_id: str, id_key: str) -> dict
 
 def _spec_to_skeleton(spec: dict) -> dict:
     """Convert a JSON schema spec to a skeleton dict with placeholder values."""
-    properties = spec.get("properties") or spec.get("connectionSpecification", {}).get("properties", {})
+    properties = spec.get("properties") or spec.get("connectionSpecification", {}).get(
+        "properties", {}
+    )
     if not properties:
         return {}
 
@@ -56,40 +63,51 @@ def _spec_to_skeleton(spec: dict) -> dict:
 
 
 def _write_output(data: dict, output: str | None) -> None:
-    """Print JSON to stdout or write to a file."""
+    """Print JSON to stdout or write to a file.
+
+    The skeleton itself goes out through the builtin ``print``: it is the
+    machine-readable payload, so it must never pass through Rich.
+    """
     text = json.dumps(data, indent=2, ensure_ascii=False)
     if output:
         with open(output, "w", encoding="utf-8") as f:
             f.write(text + "\n")
-        console.print(f"[green]Template written to {output}[/green]")
+        console.print(f"[green]Template written to {esc(output)}[/green]")
     else:
         print(text)
 
 
 @app.command("source")
 def source_template(
-    definition_id: str = typer.Option(..., "--definition-id", "-d", help="Source definition ID"),
+    definition_id: str = typer.Option(
+        ..., "--definition-id", "-d", help="Source definition ID"
+    ),
     workspace_id: str = typer.Option(..., "--workspace-id", "-w", help="Workspace ID"),
-    output: str | None = typer.Option(None, "--output", "-o", help="Write template to this file path"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Write template to this file path"
+    ),
 ):
     """Generate a JSON config skeleton for a source connector."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
         definitions = list(list_source_definitions(client, base_url, workspace_id))
     except ServiceError as exc:
-        console.print(f"[red]Error fetching source definitions: {exc}[/red]")
+        console.print(f"[red]Error fetching source definitions: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
 
     definition = _find_definition(definitions, definition_id, "sourceDefinitionId")
     if not definition:
-        console.print(f"[red]Error: source definition {definition_id!r} not found in workspace {workspace_id}[/red]")
+        console.print(
+            f"[red]Error: source definition {esc(repr(definition_id))} not found "
+            f"in workspace {esc(workspace_id)}[/red]"
+        )
         raise typer.Exit(code=1)
 
     spec = definition.get("spec") or definition.get("connectionSpecification") or {}
@@ -99,28 +117,35 @@ def source_template(
 
 @app.command("destination")
 def destination_template(
-    definition_id: str = typer.Option(..., "--definition-id", "-d", help="Destination definition ID"),
+    definition_id: str = typer.Option(
+        ..., "--definition-id", "-d", help="Destination definition ID"
+    ),
     workspace_id: str = typer.Option(..., "--workspace-id", "-w", help="Workspace ID"),
-    output: str | None = typer.Option(None, "--output", "-o", help="Write template to this file path"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Write template to this file path"
+    ),
 ):
     """Generate a JSON config skeleton for a destination connector."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
         definitions = list(list_destination_definitions(client, base_url, workspace_id))
     except ServiceError as exc:
-        console.print(f"[red]Error fetching destination definitions: {exc}[/red]")
+        console.print(f"[red]Error fetching destination definitions: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
 
     definition = _find_definition(definitions, definition_id, "destinationDefinitionId")
     if not definition:
-        console.print(f"[red]Error: destination definition {definition_id!r} not found in workspace {workspace_id}[/red]")
+        console.print(
+            f"[red]Error: destination definition {esc(repr(definition_id))} not "
+            f"found in workspace {esc(workspace_id)}[/red]"
+        )
         raise typer.Exit(code=1)
 
     spec = definition.get("spec") or definition.get("connectionSpecification") or {}
@@ -130,7 +155,9 @@ def destination_template(
 
 @app.command("connection")
 def connection_template(
-    output: str | None = typer.Option(None, "--output", "-o", help="Write template to this file path"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Write template to this file path"
+    ),
 ):
     """Generate a JSON skeleton for creating a connection."""
     skeleton = {

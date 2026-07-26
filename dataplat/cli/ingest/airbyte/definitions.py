@@ -9,6 +9,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._render import cell, esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.definitions import (
@@ -16,20 +17,24 @@ from dataplat.services.airbyte.definitions import (
     list_source_definitions,
 )
 
-app = typer.Typer(name="definitions", help="List Airbyte connector definitions", no_args_is_help=True)
+app = typer.Typer(
+    name="definitions", help="List Airbyte connector definitions", no_args_is_help=True
+)
 console = Console()
 
 
 @app.command("list-sources")
 def list_source_definitions_cmd(
     workspace_id: str = typer.Option(..., "--workspace-id", "-w", help="Workspace ID"),
-    format: str = typer.Option("table", "--format", "-f", help="Output format: table or json"),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format: table or json"
+    ),
 ):
     """List available source connector definitions for a workspace."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
@@ -40,10 +45,15 @@ def list_source_definitions_cmd(
             return
 
         if format == "json":
-            console.print(json.dumps(definitions, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(definitions, indent=2, ensure_ascii=False)))
             return
 
-        table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE_HEAVY, expand=True)
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+        )
         table.add_column("Name", style="cyan")
         table.add_column("Definition ID", style="dim")
         table.add_column("Docker Image")
@@ -55,17 +65,17 @@ def list_source_definitions_cmd(
             docker_image = f"{docker}:{tag}" if tag else docker
             def_id = d.get("sourceDefinitionId", d.get("definitionId", "N/A"))
             table.add_row(
-                d.get("name", "N/A"),
-                def_id,
-                docker_image,
-                d.get("documentationUrl", "N/A"),
+                cell(d.get("name", "N/A")),
+                cell(def_id),
+                cell(docker_image),
+                cell(d.get("documentationUrl", "N/A")),
             )
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(definitions)} definition(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing source definitions: {exc}[/red]")
+        console.print(f"[red]Error listing source definitions: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -74,13 +84,15 @@ def list_source_definitions_cmd(
 @app.command("list-destinations")
 def list_destination_definitions_cmd(
     workspace_id: str = typer.Option(..., "--workspace-id", "-w", help="Workspace ID"),
-    format: str = typer.Option("table", "--format", "-f", help="Output format: table or json"),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format: table or json"
+    ),
 ):
     """List available destination connector definitions for a workspace."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
@@ -91,10 +103,15 @@ def list_destination_definitions_cmd(
             return
 
         if format == "json":
-            console.print(json.dumps(definitions, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(definitions, indent=2, ensure_ascii=False)))
             return
 
-        table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE_HEAVY, expand=True)
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+        )
         table.add_column("Name", style="cyan")
         table.add_column("Definition ID", style="dim")
         table.add_column("Docker Image")
@@ -106,17 +123,17 @@ def list_destination_definitions_cmd(
             docker_image = f"{docker}:{tag}" if tag else docker
             def_id = d.get("destinationDefinitionId", d.get("definitionId", "N/A"))
             table.add_row(
-                d.get("name", "N/A"),
-                def_id,
-                docker_image,
-                d.get("documentationUrl", "N/A"),
+                cell(d.get("name", "N/A")),
+                cell(def_id),
+                cell(docker_image),
+                cell(d.get("documentationUrl", "N/A")),
             )
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(definitions)} definition(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing destination definitions: {exc}[/red]")
+        console.print(f"[red]Error listing destination definitions: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()

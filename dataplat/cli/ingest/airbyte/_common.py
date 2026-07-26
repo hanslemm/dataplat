@@ -9,6 +9,7 @@ import httpx
 import typer
 from rich.console import Console
 
+from dataplat.cli._render import esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 
@@ -25,12 +26,14 @@ def airbyte_client() -> Iterator[tuple[httpx.Client, str]]:
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     try:
         yield client, base_url
     except ServiceError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        # ServiceError carries the API's response body verbatim, so it can
+        # contain anything a warehouse or connector chose to put there.
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()

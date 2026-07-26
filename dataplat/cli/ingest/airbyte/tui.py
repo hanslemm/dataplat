@@ -1,4 +1,10 @@
-"""Textual TUI for browsing airbyte connections (``connections list --tui``)."""
+"""Textual TUI for browsing airbyte connections (``connections list --tui``).
+
+``textual`` costs ~58 ms to import and is only needed once the TUI actually
+opens, so this module is imported lazily by its caller — importing it here at
+class-definition time is unavoidable (``ConnectionsApp`` subclasses ``App``),
+which is precisely why nothing may import this module at its own module scope.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +12,7 @@ import json
 
 from textual.app import App as TextualApp
 
-# textual is a hard dependency (see pyproject), so the TUI is always available.
-TEXTUAL_AVAILABLE = True
+from dataplat.cli._render import cell, esc
 
 
 class ConnectionsApp(TextualApp):
@@ -55,7 +60,10 @@ class ConnectionsApp(TextualApp):
         from textual.widgets import DataTable
 
         table = self.query_one(DataTable)
-        table.add_columns(*self.columns)
+        # With --all-columns these labels are raw Airbyte JSON keys, and
+        # DataTable.add_column runs Text.from_markup over any str label, so an
+        # unbalanced tag in a key would abort the mount just as it would a cell.
+        table.add_columns(*[cell(col) for col in self.columns])
         self._render_rows(self.filtered_rows)
         table.cursor_type = "row"
         table.focus()
@@ -66,7 +74,9 @@ class ConnectionsApp(TextualApp):
         table = self.query_one(DataTable)
         table.clear()
         for row in rows:
-            table.add_row(*[str(v) for v in row])
+            # A str cell goes through Text.from_markup inside textual, so a
+            # connection name containing "[/x]" would abort the render.
+            table.add_row(*[cell(v) for v in row])
 
     def action_focus_search(self):
         from textual.widgets import Input
@@ -102,11 +112,7 @@ class ConnectionsApp(TextualApp):
 
         table = self.query_one(DataTable)
         row_index = table.cursor_row
-        if (
-            row_index is None
-            or row_index < 0
-            or row_index >= len(self.filtered_rows)
-        ):
+        if row_index is None or row_index < 0 or row_index >= len(self.filtered_rows):
             self.notify("No row selected", severity="warning")
             return
         row = self.filtered_rows[row_index]
@@ -115,9 +121,12 @@ class ConnectionsApp(TextualApp):
         self.notify("Row copied to clipboard")
 
     def action_export_rows(self):
-        data = [dict(zip(self.columns, row, strict=False)) for row in self.filtered_rows]
+        data = [
+            dict(zip(self.columns, row, strict=False)) for row in self.filtered_rows
+        ]
         with open(self.export_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        # Toast bodies are rendered as markup, so the user's path is escaped.
         self.notify(
-            f"Exported {len(self.filtered_rows)} rows to {self.export_path}"
+            f"Exported {len(self.filtered_rows)} rows to {esc(self.export_path)}"
         )

@@ -8,11 +8,17 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
+from dataplat.cli._options import YesOption, json_option
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.ingest.airbyte._common import airbyte_client
 from dataplat.services.airbyte.jobs import cancel_job, get_job, list_jobs
 
-app = typer.Typer(name="jobs", help="Inspect and cancel Airbyte jobs", no_args_is_help=True)
+app = typer.Typer(
+    name="jobs", help="Inspect and cancel Airbyte jobs", no_args_is_help=True
+)
 console = Console()
 
 _STATUS_STYLES = {
@@ -25,9 +31,9 @@ _STATUS_STYLES = {
 }
 
 
-def _style_status(status: str) -> str:
-    color = _STATUS_STYLES.get(status.lower())
-    return f"[{color}]{status}[/{color}]" if color else status
+def _style_status(status: str) -> Text:
+    """Colour a job status without letting the API's value act as markup."""
+    return cell(status, style=_STATUS_STYLES.get(status.lower(), ""))
 
 
 @app.command("list")
@@ -38,7 +44,10 @@ def list_cmd(
     status: str | None = typer.Option(
         None,
         "--status",
-        help="Filter by status (pending, running, succeeded, failed, cancelled, incomplete)",
+        help=(
+            "Filter by status "
+            "(pending, running, succeeded, failed, cancelled, incomplete)"
+        ),
     ),
     job_type: str | None = typer.Option(
         None, "--job-type", help="Filter by type (sync, reset, refresh, clear)"
@@ -46,7 +55,7 @@ def list_cmd(
     limit: int = typer.Option(
         20, "--limit", "-n", min=1, help="Maximum number of jobs to show"
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit JSON instead of a table"),
+    as_json: bool = json_option("Emit JSON instead of a table"),
 ):
     """List recent jobs, newest first."""
     with airbyte_client() as (client, base_url):
@@ -78,13 +87,13 @@ def list_cmd(
 
         for job in jobs:
             table.add_row(
-                str(job.get("jobId", "")),
-                str(job.get("connectionId", "")),
-                str(job.get("jobType", "")),
+                cell(job.get("jobId", "")),
+                cell(job.get("connectionId", "")),
+                cell(job.get("jobType", "")),
                 _style_status(str(job.get("status", ""))),
-                str(job.get("startTime", "")),
-                str(job.get("duration", "")),
-                str(job.get("rowsSynced", "")),
+                cell(job.get("startTime", "")),
+                cell(job.get("duration", "")),
+                cell(job.get("rowsSynced", "")),
             )
 
         console.print(table)
@@ -102,11 +111,10 @@ def get_cmd(job_id: str = typer.Argument(..., help="Job ID")):
 @app.command("cancel")
 def cancel_cmd(
     job_id: str = typer.Argument(..., help="Job ID to cancel"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    yes: bool = YesOption,
 ):
     """Cancel a running job."""
-    if not yes:
-        typer.confirm(f"Cancel job {job_id}?", abort=True)
+    confirm_or_exit(yes=yes, prompt=f"Cancel job {job_id}?", console=console)
     with airbyte_client() as (client, base_url):
         cancel_job(client, base_url, job_id)
-        console.print(f"[green]✓ Cancellation requested for job {job_id}[/green]")
+        console.print(f"[green]✓ Cancellation requested for job {esc(job_id)}[/green]")
