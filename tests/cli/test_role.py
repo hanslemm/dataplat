@@ -25,36 +25,56 @@ def _blank_role_description() -> RoleDescription:
     return RoleDescription(
         ref=RoleRef(oid=16384, name="alice", kind=RoleKind.user),
         attributes=RoleAttributes(
-            can_login=True, superuser=False, create_db=False,
-            create_role=False, inherit=True, replication=False,
-            bypass_rls=False, connection_limit=-1,
-            password_set=True, valid_until=None,
+            can_login=True,
+            superuser=False,
+            create_db=False,
+            create_role=False,
+            inherit=True,
+            replication=False,
+            bypass_rls=False,
+            connection_limit=-1,
+            password_set=True,
+            valid_until=None,
         ),
         memberships_out=[
             MembershipEdge(role="readers", inherit=True, depth=1, via="alice"),
         ],
         memberships_in=[],
-        owned=OwnedObjectsSummary(schemas=["scratch"],
-                                  relations_by_schema={"scratch": {"table": 2}},
-                                  total_relations=2),
+        owned=OwnedObjectsSummary(
+            schemas=["scratch"],
+            relations_by_schema={"scratch": {"table": 2}},
+            total_relations=2,
+        ),
         closure={"alice", "readers", "public"},
         direct_only=False,
         effective_privileges=[
             EffectivePrivilege(
-                scope="schema", qualified_name="public", kind="schema",
-                privilege="USAGE", grantor="dbadmin", via="public",
+                scope="schema",
+                qualified_name="public",
+                kind="schema",
+                privilege="USAGE",
+                grantor="dbadmin",
+                via="public",
                 grantable=False,
             ),
             EffectivePrivilege(
-                scope="relation", qualified_name="public.users", kind="table",
-                privilege="SELECT", grantor="dbadmin", via="readers",
+                scope="relation",
+                qualified_name="public.users",
+                kind="table",
+                privilege="SELECT",
+                grantor="dbadmin",
+                via="readers",
                 grantable=False,
             ),
         ],
         default_privileges=[
             DefaultPrivilege(
-                owner="dbadmin", schema="public", object_type="table",
-                privilege="SELECT", via="readers", grantable=False,
+                owner="dbadmin",
+                schema="public",
+                object_type="table",
+                privilege="SELECT",
+                via="readers",
+                grantable=False,
             ),
         ],
     )
@@ -84,6 +104,7 @@ def test_render_role_includes_via_column() -> None:
 
 def test_render_role_redshift_shows_probing_note_when_rbac_off() -> None:
     from dataclasses import replace
+
     desc = replace(
         _blank_role_description(),
         default_privileges=[],
@@ -98,6 +119,7 @@ def test_render_role_redshift_shows_probing_note_when_rbac_off() -> None:
 
 def test_render_role_redshift_rbac_note() -> None:
     from dataclasses import replace
+
     desc = replace(
         _blank_role_description(),
         default_privileges=[],
@@ -124,15 +146,15 @@ def test_db_role_cli_smoke() -> None:
         (True, False, True, True, True, False, False, -1, False, None),
     ]
     cursor.fetchall.side_effect = [
-        [("readers", True, 1, "alice")],   # memberships_out
-        [],                                  # memberships_in
-        [],                                  # owned schemas
-        [],                                  # owned relations
-        [],                                  # schemas
-        [],                                  # relations
-        [],                                  # sequences
-        [],                                  # functions
-        [],                                  # defaults
+        [("readers", True, 1, "alice")],  # memberships_out
+        [],  # memberships_in
+        [],  # owned schemas
+        [],  # owned relations
+        [],  # schemas
+        [],  # relations
+        [],  # sequences
+        [],  # functions
+        [],  # defaults
     ]
 
     fake_conn = MagicMock()
@@ -154,10 +176,16 @@ def test_db_role_cli_smoke() -> None:
 
 def test_render_role_truncates_sections() -> None:
     from dataclasses import replace
+
     many = [
         EffectivePrivilege(
-            scope="relation", qualified_name=f"public.t_{i}", kind="table",
-            privilege="SELECT", grantor="dbadmin", via="alice", grantable=False,
+            scope="relation",
+            qualified_name=f"public.t_{i}",
+            kind="table",
+            privilege="SELECT",
+            grantor="dbadmin",
+            via="alice",
+            grantable=False,
         )
         for i in range(25)
     ]
@@ -173,10 +201,16 @@ def test_render_role_truncates_sections() -> None:
 
 def test_render_role_max_rows_zero_shows_all() -> None:
     from dataclasses import replace
+
     many = [
         EffectivePrivilege(
-            scope="relation", qualified_name=f"public.t_{i}", kind="table",
-            privilege="SELECT", grantor="dbadmin", via="alice", grantable=False,
+            scope="relation",
+            qualified_name=f"public.t_{i}",
+            kind="table",
+            privilege="SELECT",
+            grantor="dbadmin",
+            via="alice",
+            grantable=False,
         )
         for i in range(25)
     ]
@@ -185,12 +219,15 @@ def test_render_role_max_rows_zero_shows_all() -> None:
     render_role_description(console, desc, SqlEngine.postgresql, max_rows=0)
     out = console.export_text()
     assert "public.t_24" in out
-    assert "more" not in out.split("Effective")[1].split("Default")[0].lower() \
-        or "more (" not in out  # no "… and N more" footer
+    assert (
+        "more" not in out.split("Effective")[1].split("Default")[0].lower()
+        or "more (" not in out
+    )  # no "… and N more" footer
 
 
 def test_role_description_to_json_roundtrips() -> None:
     import json as _json
+
     desc = _blank_role_description()
     payload = _json.loads(role_description_to_json(desc))
     assert payload["ref"]["name"] == "alice"
@@ -217,7 +254,14 @@ def test_db_role_cli_json_flag() -> None:
     ]
     cursor.fetchall.side_effect = [
         [("readers", True, 1, "alice")],
-        [], [], [], [], [], [], [], [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
     ]
     fake_conn = MagicMock()
     fake_conn.__enter__.return_value = fake_conn
@@ -251,17 +295,28 @@ def test_list_command_redshift_uses_dialect(monkeypatch) -> None:
     captured = {}
 
     class _Cur:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def execute(self, *a, **k): return None
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, *a, **k):
+            return None
 
     class _Conn:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def cursor(self): return _Cur()
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self):
+            return _Cur()
 
     monkeypatch.setattr(
-        rl, "resolve_params_or_exit",
+        rl,
+        "resolve_params_or_exit",
         lambda p: SimpleNamespace(engine=SqlEngine.redshift),
     )
     import contextlib
@@ -275,17 +330,24 @@ def test_list_command_redshift_uses_dialect(monkeypatch) -> None:
     def _fake_dialect(engine):
         captured["engine"] = engine
         return SimpleNamespace(
-            list_roles=lambda cur: [
-                RoleSummary("svc", True, False, False, False, 0, 0)
-            ]
+            list_roles=lambda cur: [RoleSummary("svc", True, False, False, False, 0, 0)]
         )
 
     monkeypatch.setattr(rl, "dialect_for", _fake_dialect)
 
     rl.list_command(
-        filter_substring=None, users_only=False, groups_only=False,
-        as_json=True, target="demo_rs", engine=None, user="u",
-        password=None, database="dev", host="h", port=5439, sslmode=None,
+        filter_substring=None,
+        users_only=False,
+        groups_only=False,
+        as_json=True,
+        target="demo_rs",
+        engine=None,
+        user="u",
+        password=None,
+        database="dev",
+        host="h",
+        port=5439,
+        sslmode=None,
         env_prefix="DEMO_RS",
     )
     assert captured["engine"] == SqlEngine.redshift
@@ -298,21 +360,36 @@ def test_drop_redshift_group_target_errors(monkeypatch) -> None:
     from dataplat.services.db.connection import SqlEngine
 
     class _Cur:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def execute(self, *a, **k): return None
-        def fetchone(self): return (1,)  # role_exists -> True
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, *a, **k):
+            return None
+
+        def fetchone(self):
+            return (1,)  # role_exists -> True
 
     class _Conn:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def cursor(self): return _Cur()
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self):
+            return _Cur()
 
     monkeypatch.setattr(
-        rd, "resolve_params_or_exit",
+        rd,
+        "resolve_params_or_exit",
         lambda p: SimpleNamespace(
             as_psycopg_kwargs=lambda: {"dbname": "dev"},
-            dbname="dev", engine=SqlEngine.redshift, user="admin",
+            dbname="dev",
+            engine=SqlEngine.redshift,
+            user="admin",
         ),
     )
     monkeypatch.setattr(rd.psycopg, "connect", lambda **kw: _Conn())
@@ -321,7 +398,8 @@ def test_drop_redshift_group_target_errors(monkeypatch) -> None:
         raise ValueError(f'"{name}" is not a Redshift user')
 
     monkeypatch.setattr(
-        rd, "dialect_for",
+        rd,
+        "dialect_for",
         lambda engine: SimpleNamespace(
             role_exists=lambda cur, n: True,
             enumerate_owned=_enumerate_raises,
@@ -330,11 +408,23 @@ def test_drop_redshift_group_target_errors(monkeypatch) -> None:
     )
     with pytest.raises(typer.Exit) as excinfo:
         rd.drop_command(
-            names=["reporting"], reassign_to=None, no_reassign=False,
-            no_grant_membership=False, databases_flag=None, all_databases=False,
-            dry_run=True, yes=True, target="demo_rs", engine=None,
-            user="admin", password=None, database="dev", host="h",
-            port=5439, sslmode=None, env_prefix="DEMO_RS",
+            names=["reporting"],
+            reassign_to=None,
+            no_reassign=False,
+            no_grant_membership=False,
+            databases_flag=None,
+            all_databases=False,
+            dry_run=True,
+            yes=True,
+            target="demo_rs",
+            engine=None,
+            user="admin",
+            password=None,
+            database="dev",
+            host="h",
+            port=5439,
+            sslmode=None,
+            env_prefix="DEMO_RS",
         )
     assert excinfo.value.exit_code == 1
 
@@ -349,41 +439,222 @@ def test_drop_redshift_defaults_reassign_owner_from_target(monkeypatch) -> None:
     captured = {}
 
     class _Cur:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def execute(self, *a, **k): return None
-        def fetchone(self): return (1,)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, *a, **k):
+            return None
+
+        def fetchone(self):
+            return (1,)
 
     class _Conn:
-        def __enter__(self): return self
-        def __exit__(self, *a): return None
-        def cursor(self): return _Cur()
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self):
+            return _Cur()
 
     monkeypatch.setattr(
-        rd, "resolve_params_or_exit",
+        rd,
+        "resolve_params_or_exit",
         lambda p: SimpleNamespace(
             as_psycopg_kwargs=lambda: {"dbname": "dev"},
-            dbname="dev", engine=SqlEngine.redshift, user="admin",
+            dbname="dev",
+            engine=SqlEngine.redshift,
+            user="admin",
         ),
     )
     monkeypatch.setattr(rd.psycopg, "connect", lambda **kw: _Conn())
-    monkeypatch.setattr(rd, "dialect_for", lambda engine: SimpleNamespace(
-        role_exists=lambda cur, n: True,
-        enumerate_owned=lambda cur, n: rd.OwnedForDrop(),
-        groups_of=lambda cur, n: [],
-    ))
+    monkeypatch.setattr(
+        rd,
+        "dialect_for",
+        lambda engine: SimpleNamespace(
+            role_exists=lambda cur, n: True,
+            enumerate_owned=lambda cur, n: rd.OwnedForDrop(),
+            groups_of=lambda cur, n: [],
+        ),
+    )
 
     def _capture(name, dbs, dialect, **kw):
         captured.update(kw)
-        return DropPlan(role=name, pre_cluster_ops=[],
-                        per_database_ops={dbs[0]: []}, cluster_ops=[])
+        return DropPlan(
+            role=name, pre_cluster_ops=[], per_database_ops={dbs[0]: []}, cluster_ops=[]
+        )
 
     monkeypatch.setattr(rd, "build_drop_plan", _capture)
     rd.drop_command(
-        names=["svc"], reassign_to=None, no_reassign=False,
-        no_grant_membership=False, databases_flag=None, all_databases=False,
-        dry_run=True, yes=True, target="demo_rs", engine=None,
-        user="admin", password=None, database="dev", host="h", port=5439,
-        sslmode=None, env_prefix="DEMO_RS",
+        names=["svc"],
+        reassign_to=None,
+        no_reassign=False,
+        no_grant_membership=False,
+        databases_flag=None,
+        all_databases=False,
+        dry_run=True,
+        yes=True,
+        target="demo_rs",
+        engine=None,
+        user="admin",
+        password=None,
+        database="dev",
+        host="h",
+        port=5439,
+        sslmode=None,
+        env_prefix="DEMO_RS",
     )
     assert captured["reassign_to"] == "admin"
+
+
+# =========================================================================
+# Markup safety: every value below reaches Rich straight from the warehouse.
+# ``[/x]`` used to raise MarkupError mid-render and kill the command;
+# ``[bold]`` used to be swallowed, misrepresenting the data.
+# =========================================================================
+
+HOSTILE_NAME = "svc[/x][bold]"
+
+
+def _hostile_role_description() -> RoleDescription:
+    from dataclasses import replace
+
+    base = _blank_role_description()
+    return replace(
+        base,
+        ref=RoleRef(oid=16385, name=HOSTILE_NAME, kind=RoleKind.user),
+        attributes=replace(base.attributes, valid_until="2030-01-01 [/x]"),
+        memberships_out=[
+            MembershipEdge(
+                role="read[/x]ers", inherit=True, depth=1, via="ali[bold]ce"
+            ),
+        ],
+        memberships_in=[
+            MembershipEdge(role="chi[/x]ld", inherit=False, depth=1, via="sv[bold]c"),
+        ],
+        owned=OwnedObjectsSummary(
+            schemas=["scr[/x]atch"],
+            relations_by_schema={"scr[/x]atch": {"ta[bold]ble": 2}},
+            total_relations=2,
+        ),
+        effective_privileges=[
+            EffectivePrivilege(
+                scope="relation",
+                qualified_name="pub[/x].use[bold]rs",
+                kind="ta[/x]ble",
+                privilege="SEL[/x]ECT",
+                grantor="dba[bold]",
+                via="read[/x]ers",
+                grantable=True,
+            ),
+        ],
+        default_privileges=[
+            DefaultPrivilege(
+                owner="dba[/x]",
+                schema="pub[bold]",
+                object_type="ta[/x]ble",
+                privilege="SEL[bold]ECT",
+                via="read[/x]ers",
+                grantable=True,
+            ),
+        ],
+    )
+
+
+def test_render_role_survives_hostile_warehouse_data() -> None:
+    console = Console(record=True, width=200)
+    render_role_description(console, _hostile_role_description(), SqlEngine.postgresql)
+    out = console.export_text()
+    for value in (
+        HOSTILE_NAME,
+        "2030-01-01 [/x]",
+        "read[/x]ers",
+        "ali[bold]ce",
+        "chi[/x]ld",
+        "scr[/x]atch",
+        "ta[bold]ble",
+        "pub[/x].use[bold]rs",
+        "SEL[/x]ECT",
+        "dba[bold]",
+        "dba[/x]",
+        "pub[bold]",
+        "SEL[bold]ECT",
+    ):
+        assert value in out, value
+
+
+def test_render_role_json_is_untouched_by_escaping() -> None:
+    """--json must stay byte-identical: no markup escaping in the payload."""
+    import json as _json
+
+    payload = _json.loads(role_description_to_json(_hostile_role_description()))
+    assert payload["ref"]["name"] == HOSTILE_NAME
+    assert payload["effective_privileges"][0]["privilege"] == "SEL[/x]ECT"
+
+
+def test_render_role_list_survives_hostile_role_name() -> None:
+    from dataplat.cli.db.role_list import _render
+    from dataplat.services.db.role_admin import RoleSummary
+
+    console = Console(record=True, width=200)
+    _render(console, [RoleSummary(HOSTILE_NAME, True, False, False, False, 1, 2)])
+    out = console.export_text()
+    assert HOSTILE_NAME in out
+
+
+def test_show_command_error_escapes_markup(monkeypatch, capsys) -> None:
+    import contextlib
+    from types import SimpleNamespace
+
+    from dataplat.cli.db import role as role_mod
+    from dataplat.services.db.role import RoleNotFoundError
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    @contextlib.contextmanager
+    def _sess(params):
+        yield _Conn()
+
+    monkeypatch.setattr(
+        role_mod,
+        "resolve_params_or_exit",
+        lambda p: SimpleNamespace(engine=SqlEngine.postgresql),
+    )
+    monkeypatch.setattr(role_mod, "db_session", _sess)
+
+    def _missing(cursor, name, *, engine, direct_only):
+        raise RoleNotFoundError(f'role "{name}" does not exist')
+
+    monkeypatch.setattr(role_mod, "describe_role", _missing)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        role_mod.show_command(
+            name=HOSTILE_NAME,
+            target=None,
+            engine=None,
+            user="u",
+            password=None,
+            database="d",
+            host="h",
+            port=5432,
+            sslmode=None,
+            env_prefix="DEMO_PG",
+            direct_only=False,
+            max_rows=10,
+            as_json=False,
+        )
+    assert excinfo.value.exit_code == 1
+    assert HOSTILE_NAME in capsys.readouterr().out

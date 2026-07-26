@@ -29,6 +29,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -71,9 +74,7 @@ def _open_credentials_file(path: Path) -> tuple[Any, bool]:
     if is_new:
         # Create with 0600 atomically via os.open; otherwise there's a window
         # where the file is readable before we chmod it.
-        fd = os.open(
-            path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600
-        )
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         file = os.fdopen(fd, "a", newline="")
     else:
         file = open(path, "a", newline="")  # noqa: SIM115
@@ -115,28 +116,28 @@ def _resolve_databases(
     return [fallback_db]
 
 
-def _render_plan(
-    console: Console, plans: list[CreatePlan], conn_ctx: Any
-) -> None:
+def _render_plan(console: Console, plans: list[CreatePlan], conn_ctx: Any) -> None:
     """Print a dry-run friendly summary of every plan, masking passwords."""
     for plan in plans:
-        console.print(f"\n[bold cyan]Role:[/bold cyan] {plan.role}")
+        console.print(f"\n[bold cyan]Role:[/bold cyan] {esc(plan.role)}")
         console.print("  [dim]Cluster:[/dim]")
         for op in plan.cluster_ops:
             _print_op(console, op, conn_ctx, indent=4)
         for db, ops in plan.per_database_ops.items():
-            console.print(f"  [dim]Database:[/dim] {db}")
+            console.print(f"  [dim]Database:[/dim] {esc(db)}")
             for op in ops:
                 _print_op(console, op, conn_ctx, indent=4)
 
 
 def _print_op(console: Console, op: SqlOp, conn_ctx: Any, *, indent: int) -> None:
     pad = " " * indent
+    # SQL is dense in brackets (arrays, quoted identifiers, driver-rendered
+    # literals), so an unescaped statement is the likeliest MarkupError here.
     if op.secret:
-        console.print(f"{pad}[yellow]{op.description};[/yellow]")
+        console.print(f"{pad}[yellow]{esc(op.description)};[/yellow]")
     else:
         rendered = op.statement.as_string(conn_ctx)
-        console.print(f"{pad}{rendered};")
+        console.print(f"{pad}{esc(rendered)};")
 
 
 def _execute_cluster_ops(
@@ -168,85 +169,97 @@ def _execute_per_db_ops(
                 for op in ops:
                     cursor.execute(op.statement)
             conn.commit()
-        console.print(f"  [green]✓[/green] {plan.role} — {db}")
+        console.print(f"  [green]✓[/green] {esc(plan.role)} — {esc(db)}")
     # Sanity: warn if connection_db wasn't part of per-database list.
     if connection_db not in plan.per_database_ops:
         console.print(
-            f"  [dim](no per-database ops on connection DB {connection_db})[/dim]"
+            f"  [dim](no per-database ops on connection DB {esc(connection_db)})[/dim]"
         )
 
 
 def create_command(
-    names: list[str] = typer.Argument(
-        ..., help="One or more role names to create."
-    ),
+    names: list[str] = typer.Argument(..., help="One or more role names to create."),
     schema_usage: list[str] | None = typer.Option(
-        None, "--schema-usage",
+        None,
+        "--schema-usage",
         help="Schemas to GRANT USAGE on. Repeatable / comma-separated.",
     ),
     schema_create: list[str] | None = typer.Option(
-        None, "--schema-create",
+        None,
+        "--schema-create",
         help="Schemas to GRANT CREATE on. Repeatable / comma-separated.",
     ),
     table_select: list[str] | None = typer.Option(
-        None, "--table-select",
+        None,
+        "--table-select",
         help="Schemas to GRANT SELECT ON ALL TABLES. Repeatable / comma-separated.",
     ),
     table_all: list[str] | None = typer.Option(
-        None, "--table-all",
+        None,
+        "--table-all",
         help="Schemas to GRANT ALL ON ALL TABLES. Repeatable / comma-separated.",
     ),
     sequence_usage: list[str] | None = typer.Option(
-        None, "--sequence-usage",
+        None,
+        "--sequence-usage",
         help="Schemas to GRANT USAGE ON ALL SEQUENCES. Repeatable / comma-separated.",
     ),
     default_table_select: list[str] | None = typer.Option(
-        None, "--default-table-select",
+        None,
+        "--default-table-select",
         help="Schemas where future tables get SELECT (ALTER DEFAULT PRIVILEGES).",
     ),
     default_table_all: list[str] | None = typer.Option(
-        None, "--default-table-all",
+        None,
+        "--default-table-all",
         help="Schemas where future tables get ALL (ALTER DEFAULT PRIVILEGES).",
     ),
     member_of: list[str] | None = typer.Option(
-        None, "--member-of",
+        None,
+        "--member-of",
         help="Parent roles to GRANT to the new role. Repeatable / comma-separated.",
     ),
     grant_to: list[str] | None = typer.Option(
-        None, "--grant-to",
+        None,
+        "--grant-to",
         help="Existing roles/users to make members of the new role "
-             "(GRANT <new> TO <target>). Repeatable / comma-separated.",
+        "(GRANT <new> TO <target>). Repeatable / comma-separated.",
     ),
     no_login: bool = typer.Option(
-        False, "--no-login",
+        False,
+        "--no-login",
         help="Create a passwordless group-style role (Postgres NOLOGIN role / "
-             "Redshift RBAC role). No credentials are generated.",
+        "Redshift RBAC role). No credentials are generated.",
     ),
     databases_flag: list[str] | None = typer.Option(
-        None, "--databases",
+        None,
+        "--databases",
         help="Comma-separated databases to apply per-DB grants. Repeatable.",
     ),
     all_databases: bool = typer.Option(
-        False, "--all-databases",
+        False,
+        "--all-databases",
         help="Apply per-DB grants to every non-template database.",
     ),
     credentials_out: Path | None = typer.Option(
-        None, "--credentials-out",
+        None,
+        "--credentials-out",
         help="CSV file to append generated credentials to. "
-             "Default: ./dp-credentials-<timestamp>.csv",
+        "Default: ./dp-credentials-<timestamp>.csv",
     ),
     password_length: int = typer.Option(
-        32, "--password-length", min=16, max=128,
+        32,
+        "--password-length",
+        min=16,
+        max=128,
         help="Length of the generated password.",
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run",
+        False,
+        "--dry-run",
         help="Print the SQL plan and exit without connecting.",
     ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y",
-        help="Skip the confirmation prompt.",
-    ),
+    yes: bool = YesOption,
     target: str | None = TargetOption,
     engine: SqlEngine | None = EngineOption,
     user: str | None = UserOption,
@@ -274,8 +287,14 @@ def create_command(
 
     conn_params = resolve_params_or_exit(
         ConnCliParams(
-            target=target, engine=engine, user=user, password=password,
-            database=database, host=host, port=port, sslmode=sslmode,
+            target=target,
+            engine=engine,
+            user=user,
+            password=password,
+            database=database,
+            host=host,
+            port=port,
+            sslmode=sslmode,
             env_prefix=env_prefix,
         )
     )
@@ -320,61 +339,66 @@ def create_command(
             if absent_parents:
                 console.print(
                     "[red]Error: --member-of parent(s) not found: "
-                    f"{', '.join(absent_parents)}[/red]"
+                    f"{', '.join(esc(p) for p in absent_parents)}[/red]"
                 )
                 raise typer.Exit(code=1)
             if absent_targets:
                 console.print(
                     "[red]Error: --grant-to target(s) not found: "
-                    f"{', '.join(absent_targets)}[/red]"
+                    f"{', '.join(esc(t) for t in absent_targets)}[/red]"
                 )
                 raise typer.Exit(code=1)
             sample_conn_for_render = conn
             specs: list[CreateRoleSpec] = []
             for name in names:
-                specs.append(CreateRoleSpec(
-                    name=name,
-                    password=None if no_login else generate_password(password_length),
-                    **spec_kwargs,
-                ))
+                specs.append(
+                    CreateRoleSpec(
+                        name=name,
+                        password=None
+                        if no_login
+                        else generate_password(password_length),
+                        **spec_kwargs,
+                    )
+                )
             try:
                 plans = [
                     build_create_plan(
-                        s, target_dbs, dialect,
-                        parent_kinds=parent_kinds, grantee_kinds=grantee_kinds,
+                        s,
+                        target_dbs,
+                        dialect,
+                        parent_kinds=parent_kinds,
+                        grantee_kinds=grantee_kinds,
                         warnings=warnings,
                     )
                     for s in specs
                 ]
             except ValueError as exc:
-                console.print(f"[red]Error: {exc}[/red]")
+                console.print(f"[red]Error: {esc(exc)}[/red]")
                 raise typer.Exit(code=1)
             if conflicts:
                 console.print(
-                    f"[red]Error: role(s) already exist: {', '.join(conflicts)}[/red]"
+                    "[red]Error: role(s) already exist: "
+                    f"{', '.join(esc(c) for c in conflicts)}[/red]"
                 )
                 raise typer.Exit(code=1)
             console.print(
                 f"[bold]Plan:[/bold] create {len(specs)} role(s) "
                 f"across {len(target_dbs)} database(s) "
-                f"({', '.join(target_dbs)})"
+                f"({', '.join(esc(d) for d in target_dbs)})"
             )
             for w in warnings:
+                # Warnings are our own fixed strings — nothing to escape.
                 console.print(f"[yellow]Warning: {w}[/yellow]")
             _render_plan(console, plans, sample_conn_for_render)
     except psycopg.Error as exc:
-        console.print(f"[red]Database error: {exc}[/red]")
+        console.print(f"[red]Database error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if dry_run:
         console.print("\n[yellow]Dry-run; no SQL executed.[/yellow]")
         return
 
-    if not yes:
-        confirmed = typer.confirm("\nProceed?", default=False)
-        if not confirmed:
-            console.print("[yellow]Aborted.[/yellow]")
-            raise typer.Exit(code=1)
+    confirm_or_exit(yes=yes, prompt="\nProceed?", console=console)
 
     # Open credentials file before executing — fail fast on permission issues.
     # --no-login generates no passwords, so no credentials file is touched.
@@ -397,29 +421,40 @@ def create_command(
             try:
                 _execute_cluster_ops(plan=plan, conn_params_kwargs=conn_kwargs)
             except psycopg.Error as exc:
-                console.print(f"[red]✗ {plan.role}: {exc}[/red]")
+                console.print(f"[red]✗ {esc(plan.role)}: {esc(exc)}[/red]")
                 # Role was not created; don't write a row for it.
                 raise typer.Exit(code=1)
             # The role (and its password) exists from this point on — record
             # the credentials immediately so a later grant failure can never
             # leave an orphaned role with an unrecoverable password.
-            if writer is not None and creds_file is not None and spec.password is not None:
-                writer.writerow([
-                    spec.name,
-                    spec.password,
-                    created_at,
-                    ",".join(plan.per_database_ops.keys()),
-                ])
+            if (
+                writer is not None
+                and creds_file is not None
+                and spec.password is not None
+            ):
+                writer.writerow(
+                    [
+                        spec.name,
+                        spec.password,
+                        created_at,
+                        ",".join(plan.per_database_ops.keys()),
+                    ]
+                )
                 creds_file.flush()
             try:
                 _execute_per_db_ops(
-                    plan=plan, conn_params_kwargs=conn_kwargs, console=console,
+                    plan=plan,
+                    conn_params_kwargs=conn_kwargs,
+                    console=console,
                 )
             except psycopg.Error as exc:
-                console.print(f"[red]✗ {plan.role}: grants failed: {exc}[/red]")
+                console.print(
+                    f"[red]✗ {esc(plan.role)}: grants failed: {esc(exc)}[/red]"
+                )
                 recorded = (
-                    f" and its password is recorded in {creds_path}"
-                    if spec.password is not None else ""
+                    f" and its password is recorded in {esc(creds_path)}"
+                    if spec.password is not None
+                    else ""
                 )
                 console.print(
                     f"[yellow]The role was created{recorded}. Re-run grants "
@@ -431,22 +466,18 @@ def create_command(
             creds_file.close()
 
     if needs_credentials:
-        console.print(
-            f"\n[green]Wrote credentials to[/green] {creds_path}"
-        )
+        console.print(f"\n[green]Wrote credentials to[/green] {esc(creds_path)}")
         if not secure:
             console.print(
-                f"[yellow]Warning: {creds_path} is readable by group/other. "
-                f"Run: chmod 600 {creds_path}[/yellow]"
+                f"[yellow]Warning: {esc(creds_path)} is readable by group/other. "
+                f"Run: chmod 600 {esc(creds_path)}[/yellow]"
             )
     else:
-        console.print(
-            "\n[dim]No credentials generated (--no-login).[/dim]"
-        )
+        console.print("\n[dim]No credentials generated (--no-login).[/dim]")
 
     table = Table(title="Created", show_header=True, header_style="bold")
     table.add_column("Role")
     table.add_column("Databases")
     for plan in plans:
-        table.add_row(plan.role, ", ".join(plan.per_database_ops.keys()))
+        table.add_row(cell(plan.role), cell(", ".join(plan.per_database_ops.keys())))
     console.print(table)

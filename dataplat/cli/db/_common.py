@@ -4,6 +4,9 @@ Every db command takes the same connection surface: a named ``--target``
 plus low-level overrides. Declaring the options here keeps flags, shorts,
 and help text identical across commands, and ``db_session`` centralizes the
 resolve/connect/error-exit dance that used to be copy-pasted per command.
+
+``--json``/``--yes`` are not db-specific, so they now come from
+:mod:`dataplat.cli._options` and are only re-exported here.
 """
 
 from __future__ import annotations
@@ -17,6 +20,11 @@ import psycopg
 import typer
 from rich.console import Console
 
+# Re-exported: db commands import --json/--yes from here, but the spelling is
+# owned by dataplat.cli._options. The redundant alias marks the re-export.
+from dataplat.cli._options import JsonOption as JsonOption
+from dataplat.cli._options import YesOption as YesOption
+from dataplat.cli._render import esc
 from dataplat.core.errors import DataplatError
 from dataplat.services.db.connection import (
     DbConnectionParams,
@@ -56,10 +64,6 @@ EnvPrefixOption = typer.Option(
     None,
     "--env-prefix",
     help="Env var prefix for connection settings (default: the target's prefix).",
-)
-JsonOption = typer.Option(False, "--json", help="Emit JSON instead of tables.")
-YesOption = typer.Option(
-    False, "--yes", "-y", help="Skip the confirmation prompt."
 )
 
 
@@ -115,7 +119,7 @@ def resolve_params_or_exit(params: ConnCliParams) -> DbConnectionParams:
     try:
         return params.resolve()
     except DataplatError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1) from exc
 
 
@@ -126,5 +130,7 @@ def db_session(params: DbConnectionParams) -> Iterator[psycopg.Connection]:
         with psycopg.connect(**params.as_psycopg_kwargs()) as conn:  # type: ignore[arg-type]
             yield conn
     except psycopg.Error as exc:
-        console.print(f"[red]Database error: {exc}[/red]")
+        # A driver message quotes the offending SQL and server hints verbatim,
+        # so it can carry anything — never let it reach Rich as markup.
+        console.print(f"[red]Database error: {esc(exc)}[/red]")
         raise typer.Exit(code=1) from exc

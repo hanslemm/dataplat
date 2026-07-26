@@ -12,7 +12,10 @@ import sys
 
 import typer
 from rich.console import Console
+from rich.text import Text
 
+from dataplat.cli._options import json_option
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -91,7 +94,9 @@ def _attributes_metadata(attrs: RoleAttributes) -> list[tuple[str, str]]:
     if attrs.connection_limit >= 0:
         metadata.append(("Conn limit", str(attrs.connection_limit)))
     if attrs.valid_until:
-        metadata.append(("Valid until", attrs.valid_until))
+        # The title card renders metadata values as markup, and this one is
+        # warehouse data (rolvaliduntil rendered by the driver).
+        metadata.append(("Valid until", esc(attrs.valid_until)))
     if attrs.password_set:
         metadata.append(("Password", "set"))
     return metadata
@@ -118,7 +123,7 @@ def _render_attributes(
         "unlimited" if attrs.connection_limit < 0 else str(attrs.connection_limit),
     )
     table.add_row("Password set", "yes" if attrs.password_set else "no")
-    table.add_row("Valid until", attrs.valid_until or "—")
+    table.add_row("Valid until", cell(attrs.valid_until or "—"))
     console.print(_indent(table))
 
 
@@ -142,9 +147,10 @@ def _render_memberships(
     table.add_column("Via", style="dim")
     for e in visible:
         table.add_row(
-            e.role, str(e.depth),
+            cell(e.role),
+            str(e.depth),
             "yes" if e.inherit else "no",
-            e.via or "",
+            cell(e.via or ""),
         )
     console.print(_indent(table))
     if hidden:
@@ -166,9 +172,8 @@ def _render_ownership(
     if owned.schemas:
         visible_schemas, hidden_schemas = _truncate(owned.schemas, max_rows)
         suffix = f" [dim](+{hidden_schemas} more)[/dim]" if hidden_schemas else ""
-        console.print(
-            f"  [dim]Schemas:[/dim] {', '.join(visible_schemas)}{suffix}"
-        )
+        names = ", ".join(esc(s) for s in visible_schemas)
+        console.print(f"  [dim]Schemas:[/dim] {names}{suffix}")
         console.print()
     if owned.relations_by_schema:
         flat = [
@@ -182,7 +187,7 @@ def _render_ownership(
         table.add_column("Kind", style="dim")
         table.add_column("Count", justify="right")
         for schema, kind, count in visible:
-            table.add_row(schema, kind, str(count))
+            table.add_row(cell(schema), cell(kind), str(count))
         console.print(_indent(table))
         if hidden:
             console.print(_more_line(hidden))
@@ -205,7 +210,9 @@ def _render_effective_privileges(
         return
     suffix = " (direct only)" if direct_only else ""
     _print_section_heading(
-        console, counter, f"Effective privileges{suffix}",
+        console,
+        counter,
+        f"Effective privileges{suffix}",
         "Grants reachable through this role, grouped by scope.",
     )
     if engine == SqlEngine.redshift and redshift_rbac is False:
@@ -215,9 +222,7 @@ def _render_effective_privileges(
         )
         console.print()
     elif engine == SqlEngine.redshift and redshift_rbac is True:
-        console.print(
-            "  [dim]Redshift: resolved via svv_*_privileges.[/dim]"
-        )
+        console.print("  [dim]Redshift: resolved via svv_*_privileges.[/dim]")
         console.print()
     elif not direct_only:
         console.print(
@@ -233,8 +238,12 @@ def _render_effective_privileges(
         scope_rows = by_scope.get(scope, [])
         if not scope_rows:
             continue
-        label = {"schema": "Schemas", "relation": "Relations",
-                 "sequence": "Sequences", "function": "Functions"}[scope]
+        label = {
+            "schema": "Schemas",
+            "relation": "Relations",
+            "sequence": "Sequences",
+            "function": "Functions",
+        }[scope]
         console.print(f"  [bold]{label}[/bold]")
         visible, hidden = _truncate(scope_rows, max_rows)
         table = _report_table(zebra=len(visible) > 5)
@@ -246,15 +255,17 @@ def _render_effective_privileges(
         table.add_column("Grantor", style="dim")
         table.add_column("With grant")
         for r in visible:
-            columns = [r.qualified_name]
+            columns: list[str | Text] = [cell(r.qualified_name)]
             if scope == "relation":
-                columns.append(r.kind)
-            columns.extend([
-                r.privilege,
-                r.via,
-                r.grantor or "",
-                "yes" if r.grantable else "",
-            ])
+                columns.append(cell(r.kind))
+            columns.extend(
+                [
+                    cell(r.privilege),
+                    cell(r.via),
+                    cell(r.grantor or ""),
+                    "yes" if r.grantable else "",
+                ]
+            )
             table.add_row(*columns)
         console.print(_indent(table))
         if hidden:
@@ -272,7 +283,9 @@ def _render_default_privileges(
     if not rows:
         return
     _print_section_heading(
-        console, counter, "Default privileges",
+        console,
+        counter,
+        "Default privileges",
         "Privileges granted on future objects created by each owner.",
     )
     visible, hidden = _truncate(rows, max_rows)
@@ -285,7 +298,11 @@ def _render_default_privileges(
     table.add_column("With grant")
     for r in visible:
         table.add_row(
-            r.owner, r.schema or "(any)", r.object_type, r.privilege, r.via,
+            cell(r.owner),
+            cell(r.schema or "(any)"),
+            cell(r.object_type),
+            cell(r.privilege),
+            cell(r.via),
             "yes" if r.grantable else "",
         )
     console.print(_indent(table))
@@ -304,7 +321,7 @@ def render_role_description(
     subtitle = "User" if desc.ref.kind == RoleKind.user else "Group / role"
     metadata = _attributes_metadata(desc.attributes)
     card = _title_card(
-        console, title=desc.ref.name, subtitle=subtitle, metadata=metadata
+        console, title=esc(desc.ref.name), subtitle=subtitle, metadata=metadata
     )
     console.print(card)
     console.print()
@@ -323,22 +340,37 @@ def render_role_description(
         else "Roles that are members of this role (recursive)."
     )
     _render_memberships(
-        console, counter, "Memberships (parents)", parent_caption,
-        desc.memberships_out, max_rows=max_rows,
+        console,
+        counter,
+        "Memberships (parents)",
+        parent_caption,
+        desc.memberships_out,
+        max_rows=max_rows,
     )
     _render_memberships(
-        console, counter, "Memberships (children)", child_caption,
-        desc.memberships_in, max_rows=max_rows,
+        console,
+        counter,
+        "Memberships (children)",
+        child_caption,
+        desc.memberships_in,
+        max_rows=max_rows,
     )
     _render_ownership(console, counter, desc.owned, max_rows=max_rows)
     _render_effective_privileges(
-        console, counter, desc.effective_privileges,
-        engine=engine, direct_only=desc.direct_only,
-        closure_size=len(desc.closure), max_rows=max_rows,
+        console,
+        counter,
+        desc.effective_privileges,
+        engine=engine,
+        direct_only=desc.direct_only,
+        closure_size=len(desc.closure),
+        max_rows=max_rows,
         redshift_rbac=desc.redshift_rbac,
     )
     _render_default_privileges(
-        console, counter, desc.default_privileges, max_rows=max_rows,
+        console,
+        counter,
+        desc.default_privileges,
+        max_rows=max_rows,
     )
 
 
@@ -362,24 +394,30 @@ def show_command(
     sslmode: str | None = SslmodeOption,
     env_prefix: str | None = EnvPrefixOption,
     direct_only: bool = typer.Option(
-        False, "--direct-only",
+        False,
+        "--direct-only",
         help="Ignore inheritance — show only grants made directly to this role.",
     ),
     max_rows: int = limit_option(
         10,
         "Cap listy sections (memberships, privileges, …) at N rows. 0 = show all.",
     ),
-    as_json: bool = typer.Option(
-        False, "--json",
-        help="Emit the full role description as JSON on stdout (ignores --limit).",
+    as_json: bool = json_option(
+        "Emit the full role description as JSON on stdout (ignores --limit)."
     ),
 ) -> None:
     """Entry point for ``dp db role show <name>``."""
     console = Console()
     conn_params = resolve_params_or_exit(
         ConnCliParams(
-            target=target, engine=engine, user=user, password=password,
-            database=database, host=host, port=port, sslmode=sslmode,
+            target=target,
+            engine=engine,
+            user=user,
+            password=password,
+            database=database,
+            host=host,
+            port=port,
+            sslmode=sslmode,
             env_prefix=env_prefix,
         )
     )
@@ -388,16 +426,22 @@ def show_command(
     try:
         with db_session(conn_params) as conn, conn.cursor() as cursor:
             desc = describe_role(
-                cursor, name, engine=resolved_engine, direct_only=direct_only,
+                cursor,
+                name,
+                engine=resolved_engine,
+                direct_only=direct_only,
             )
             if as_json:
                 sys.stdout.write(role_description_to_json(desc) + "\n")
             else:
                 render_role_description(
-                    console, desc, resolved_engine, max_rows=max_rows,
+                    console,
+                    desc,
+                    resolved_engine,
+                    max_rows=max_rows,
                 )
     except (ValueError, RoleNotFoundError, RedshiftProbeLimitError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -426,7 +470,7 @@ app.command(
 app.command(
     "create",
     help="Create one or more roles (login by default, --no-login for "
-         "passwordless group roles) with explicit privileges.",
+    "passwordless group roles) with explicit privileges.",
 )(create_command)
 app.command(
     "drop",

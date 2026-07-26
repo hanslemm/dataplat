@@ -10,7 +10,11 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
+from dataplat.cli._options import json_option, yes_option
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._report import fmt_rows, fmt_size
 from dataplat.core.errors import ConfigError, ValidationError
 from dataplat.services.db.connection import SqlEngine, resolve_connection_params
@@ -31,7 +35,7 @@ def _targets_for(name: str, console: Console) -> list[DbTarget]:
     try:
         return resolve_targets(name)
     except ValidationError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -74,7 +78,9 @@ def _render_section(
 ) -> None:
     engine = target.engine
     label = _ENGINE_LABEL[engine]
-    prefix_hint = ", ".join(f"{p}*" for p in prefixes)
+    # --schema-prefix is user input, so the hint is external everywhere it is
+    # interpolated below.
+    prefix_hint = esc(", ".join(f"{p}*" for p in prefixes))
     console.print(
         f"\n[bold cyan]{label}[/bold cyan] [dim]— schemas: {prefix_hint}[/dim]"
     )
@@ -94,9 +100,9 @@ def _render_section(
     table.add_column("% of disk", justify="right", style="magenta")
 
     for i, row in enumerate(result.rows, start=1):
-        cells = [str(i), row.schema, row.name]
+        cells: list[str | Text] = [str(i), cell(row.schema), cell(row.name)]
         if engine is SqlEngine.postgresql:
-            cells.append(row.owner or "—")
+            cells.append(cell(row.owner or "—"))
         cells.extend(
             [
                 _fmt_rows(row.row_estimate),
@@ -132,8 +138,7 @@ def _render_drop_sql(
     prefix_hint = ", ".join(f"{p}*" for p in prefixes)
     lines = [
         f"-- {label} — schemas matching {prefix_hint}",
-        f"-- Run against {target.env_prefix}_* "
-        f"(e.g. `dp db query -t {target.name} -`)",
+        f"-- Run against {target.env_prefix}_* (e.g. `dp db query -t {target.name} -`)",
         f"-- Database disk: {_fmt_size(result.disk_bytes)}; matched "
         f"{result.matched_count} tables = {_fmt_size(result.matched_bytes)} "
         f"({_pct(result.matched_bytes, result.disk_bytes)} of disk).",
@@ -165,9 +170,7 @@ def _connection_params(target: DbTarget):
     )
 
 
-def _collect(
-    target: DbTarget, prefixes: list[str], limit: int
-) -> TopTablesResult:
+def _collect(target: DbTarget, prefixes: list[str], limit: int) -> TopTablesResult:
     params = _connection_params(target)
     with (
         psycopg.connect(**params.as_psycopg_kwargs()) as conn,
@@ -176,16 +179,16 @@ def _collect(
         return fetch_top_tables(cursor, target.engine, prefixes, limit)
 
 
-def _execute_drops(
-    console: Console, target: DbTarget, result: TopTablesResult
-) -> int:
+def _execute_drops(console: Console, target: DbTarget, result: TopTablesResult) -> int:
     """Run the DROP statements for ``result.rows`` in a single transaction."""
     params = _connection_params(target)
     with psycopg.connect(**params.as_psycopg_kwargs()) as conn:
         with conn.cursor() as cursor:
             for row in result.rows:
                 cursor.execute(drop_statement(row))
-                console.print(f"  [green]✓[/green] dropped {row.schema}.{row.name}")
+                console.print(
+                    f"  [green]✓[/green] dropped {esc(row.schema)}.{esc(row.name)}"
+                )
         conn.commit()
     return len(result.rows)
 
@@ -208,9 +211,7 @@ def top_tables_command(
     limit: int = typer.Option(
         20, "--limit", "-n", min=1, help="Number of tables per database."
     ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Emit machine-readable JSON to stdout."
-    ),
+    as_json: bool = json_option("Emit machine-readable JSON to stdout."),
     drop_sql: bool = typer.Option(
         False,
         "--drop-sql",
@@ -224,9 +225,7 @@ def top_tables_command(
         "--drop",
         help="DROP the listed tables after showing them and confirming.",
     ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y", help="Skip the --drop confirmation prompt."
-    ),
+    yes: bool = yes_option("Skip the --drop confirmation prompt."),
 ) -> None:
     """Rank the largest tables in schemas matching a prefix.
 
@@ -299,7 +298,7 @@ def top_tables_command(
         if tgt.name in errors:
             console.print(
                 f"\n[bold cyan]{_ENGINE_LABEL[tgt.engine]}[/bold cyan] "
-                f"[red]— {errors[tgt.name]}[/red]"
+                f"[red]— {esc(errors[tgt.name])}[/red]"
             )
             continue
         _render_section(console, tgt, results[tgt.name], prefixes)
@@ -310,19 +309,13 @@ def top_tables_command(
             console.print("\n[yellow]Nothing to drop.[/yellow]")
         else:
             console.print()
-            if not yes:
-                if not sys.stdin.isatty():
-                    console.print(
-                        "[red]Error: --drop needs confirmation. "
-                        "Pass --yes/-y in non-interactive contexts.[/red]"
-                    )
-                    raise typer.Exit(code=1)
-                if not typer.confirm(
-                    f"DROP the {total} table(s) listed above? This cannot be undone.",
-                    default=False,
-                ):
-                    console.print("[yellow]Aborted.[/yellow]")
-                    raise typer.Exit(code=1)
+            confirm_or_exit(
+                yes=yes,
+                prompt=(
+                    f"DROP the {total} table(s) listed above? This cannot be undone."
+                ),
+                console=console,
+            )
             for tgt in targets:
                 if tgt.name not in results or not results[tgt.name].rows:
                     continue
@@ -331,7 +324,7 @@ def top_tables_command(
                     _execute_drops(console, tgt, results[tgt.name])
                 except psycopg.Error as exc:
                     errors[tgt.name] = f"database error during drop: {exc}"
-                    console.print(f"  [red]✗ {exc}[/red]")
+                    console.print(f"  [red]✗ {esc(exc)}[/red]")
 
     if errors:
         raise typer.Exit(code=1)

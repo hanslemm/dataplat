@@ -16,6 +16,8 @@ from rich import box as _box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import json_option
+from dataplat.cli._render import cell
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -78,7 +80,7 @@ def _render(console: Console, rows: list[RoleSummary]) -> None:
     for r in rows:
         kind = "user" if r.can_login else "group"
         table.add_row(
-            r.name,
+            cell(r.name),
             kind,
             "yes" if r.can_login else "no",
             "yes" if r.superuser else "",
@@ -93,18 +95,22 @@ def _render(console: Console, rows: list[RoleSummary]) -> None:
 
 def list_command(
     filter_substring: str | None = typer.Option(
-        None, "--filter", "-f",
+        None,
+        "--filter",
+        "-f",
         help="Case-insensitive substring match on role name.",
     ),
     users_only: bool = typer.Option(
-        False, "--users-only", help="Only show roles that can log in.",
+        False,
+        "--users-only",
+        help="Only show roles that can log in.",
     ),
     groups_only: bool = typer.Option(
-        False, "--groups-only", help="Only show roles that cannot log in.",
+        False,
+        "--groups-only",
+        help="Only show roles that cannot log in.",
     ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Emit roles as a JSON array on stdout.",
-    ),
+    as_json: bool = json_option("Emit roles as a JSON array on stdout."),
     target: str | None = TargetOption,
     engine: SqlEngine | None = EngineOption,
     user: str | None = UserOption,
@@ -119,8 +125,14 @@ def list_command(
     console = Console()
     conn_params = resolve_params_or_exit(
         ConnCliParams(
-            target=target, engine=engine, user=user, password=password,
-            database=database, host=host, port=port, sslmode=sslmode,
+            target=target,
+            engine=engine,
+            user=user,
+            password=password,
+            database=database,
+            host=host,
+            port=port,
+            sslmode=sslmode,
             env_prefix=env_prefix,
         )
     )

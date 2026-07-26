@@ -18,6 +18,8 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc, shorten
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -99,7 +101,11 @@ def _classify_sql(sql: str) -> str:
 
 
 def _supports_live_query_progress() -> bool:
-    return isinstance(console, Console) and console.is_terminal and not console.is_dumb_terminal
+    return (
+        isinstance(console, Console)
+        and console.is_terminal
+        and not console.is_dumb_terminal
+    )
 
 
 def _load_sql(sql: str | None) -> str:
@@ -127,15 +133,6 @@ def _default_page_limit() -> int:
     return min(100, _max_rows_for_terminal())
 
 
-def _format_cell(value: object, max_length: int) -> str:
-    if value is None:
-        return ""
-    text = str(value)
-    if max_length > 0 and len(text) > max_length:
-        return text[: max_length - 1] + "…"
-    return text
-
-
 def _render_rows(columns: list[str], rows: list[tuple], start_index: int = 1) -> None:
     display_rows = rows
     if rows and not _rows_fit_terminal(len(rows)):
@@ -159,11 +156,13 @@ def _render_rows(columns: list[str], rows: list[tuple], start_index: int = 1) ->
     )
     table.add_column("#", style="dim", justify="right", no_wrap=True, width=4)
     for column in columns:
-        table.add_column(column, overflow="fold", max_width=per_col)
+        # Column labels are result-set aliases, i.e. whatever the query asked
+        # for — `select 1 as "[/x]"` must not blow up the header.
+        table.add_column(cell(column), overflow="fold", max_width=per_col)
 
     for idx, row in enumerate(display_rows, start=start_index):
         table.add_row(
-            str(idx), *[_format_cell(value, max_cell_length) for value in row]
+            str(idx), *[cell(value, max_length=max_cell_length) for value in row]
         )
 
     console.print(table)
@@ -181,23 +180,9 @@ def _emit_json(columns: list[str], rows: list[tuple]) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str))
 
 
-def _confirm_write(sql_text: str, allow_write: bool) -> None:
-    """Gate data-modifying statements behind --write or an interactive confirm."""
-    if allow_write:
-        return
-    preview = " ".join(sql_text.split())
-    if len(preview) > 120:
-        preview = preview[:119] + "…"
-    if sys.stdin.isatty():
-        console.print(f"[yellow]This statement can modify data:[/yellow] {preview}")
-        if typer.confirm("Continue?", default=False):
-            return
-        raise typer.Exit(code=1)
-    console.print(
-        "[red]Error: this statement can modify data. "
-        "Pass --write to run it non-interactively.[/red]"
-    )
-    raise typer.Exit(code=1)
+def _write_preview(sql_text: str) -> str:
+    """One-line, length-capped echo of the statement being confirmed."""
+    return shorten(" ".join(sql_text.split()), 120)
 
 
 def _execute_query(
@@ -211,7 +196,14 @@ def _execute_query(
 ) -> None:
     sql_text = _load_sql(sql)
     if _classify_sql(sql_text) == "write":
-        _confirm_write(sql_text, write)
+        confirm_or_exit(
+            "[yellow]This statement can modify data:[/yellow] "
+            f"{esc(_write_preview(sql_text))}",
+            yes=write,
+            prompt="Continue?",
+            hint="Pass --write to run it non-interactively.",
+            console=console,
+        )
 
     cleaned = sql_text.strip().rstrip(";")
     stripped = _strip_sql_comments(cleaned).strip()
@@ -228,8 +220,10 @@ def _execute_query(
         safe_page = max(1, page)
         offset = (safe_page - 1) * safe_limit
         # Newlines guard against a trailing `-- comment` swallowing the paren.
+        # The alias leaks into server-side error messages, so it names the tool
+        # that added it.
         sql_text = (
-            f"SELECT * FROM (\n{cleaned}\n) AS dna_sql"
+            f"SELECT * FROM (\n{cleaned}\n) AS dp_query"
             f" LIMIT {safe_limit + 1} OFFSET {offset}"
         )
 

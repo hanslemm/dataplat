@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import psycopg
 import pytest
 import typer
 
-from dataplat.cli.db._common import ConnCliParams, resolve_params_or_exit
+from dataplat.cli import _options
+from dataplat.cli.db import _common
+from dataplat.cli.db._common import (
+    ConnCliParams,
+    JsonOption,
+    YesOption,
+    db_session,
+    resolve_params_or_exit,
+)
 from dataplat.services.db.connection import SqlEngine
 
 
@@ -74,3 +85,46 @@ def test_resolve_params_or_exit_missing_settings(monkeypatch, capsys) -> None:
         resolve_params_or_exit(ConnCliParams())
 
     assert "Missing required connection settings" in capsys.readouterr().out
+
+
+def test_options_are_the_shared_ones() -> None:
+    """db commands must not re-declare --json/--yes."""
+    assert JsonOption is _options.JsonOption
+    assert YesOption is _options.YesOption
+
+
+def test_resolve_params_or_exit_escapes_target_name(capsys) -> None:
+    """A closing tag in the target name used to raise MarkupError."""
+    with pytest.raises(typer.Exit):
+        resolve_params_or_exit(ConnCliParams(target="no[/x]pe"))
+
+    out = capsys.readouterr().out
+    assert "no[/x]pe" in out
+
+
+def test_resolve_params_or_exit_keeps_style_name_visible(capsys) -> None:
+    with pytest.raises(typer.Exit):
+        resolve_params_or_exit(ConnCliParams(target="[bold]"))
+
+    assert "[bold]" in capsys.readouterr().out
+
+
+def test_db_session_escapes_driver_message(monkeypatch, capsys) -> None:
+    """psycopg quotes the failing SQL verbatim, brackets included."""
+
+    def _boom(**kwargs):
+        raise psycopg.OperationalError("FATAL: closes [/issue] 42 [bold]")
+
+    params = ConnCliParams(
+        target="demo_pg", host="localhost", user="u", database="d"
+    ).resolve()
+    with (
+        patch.object(_common.psycopg, "connect", _boom),
+        pytest.raises(typer.Exit),
+        db_session(params),
+    ):
+        pass  # pragma: no cover - connect raises first
+
+    out = capsys.readouterr().out
+    assert "closes [/issue] 42" in out
+    assert "[bold]" in out
