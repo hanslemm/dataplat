@@ -6,14 +6,18 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-from dataplat.core.envrc import CONFIG_ENVRC, find_envrc, link_envrc
+from dataplat.cli._options import yes_option
+from dataplat.cli._render import cell, esc
+from dataplat.core.envrc import CONFIG_ENVRC, EnvrcSource, link_envrc, locate_envrc
 
 app = typer.Typer(
     name="config",
@@ -22,6 +26,14 @@ app = typer.Typer(
 )
 
 console = Console()
+
+# `show` and `doctor` describe a current-directory .envrc identically, and
+# both point at the same two escape hatches.
+CWD_ENVRC_DETAIL = "loaded from the current directory, not the global link"
+CWD_ENVRC_HINT = (
+    "Run `dp config init` to pin a trusted file, or set "
+    "DP_ENVRC_ALLOW_CWD=0 to ignore ./.envrc."
+)
 
 
 @dataclass(frozen=True)
@@ -109,27 +121,27 @@ def init(
     """Set up dataplat global envrc link."""
     source = Path(envrc).expanduser().resolve() if envrc else Path.cwd() / ".envrc"
     if not source.is_file():
-        console.print(f"[red]Error: {source} not found[/red]")
+        console.print(f"[red]Error: {esc(source)} not found[/red]")
         raise typer.Exit(code=1)
 
     if (
         CONFIG_ENVRC.is_symlink() or CONFIG_ENVRC.exists()
     ) and CONFIG_ENVRC.resolve() == source.resolve():
-        console.print(f"Already linked: {CONFIG_ENVRC} -> {source}")
+        console.print(f"Already linked: {esc(CONFIG_ENVRC)} -> {esc(source)}")
         return
 
     try:
         link_envrc(source)
     except OSError as exc:
-        console.print(f"[red]Failed to link envrc: {exc}[/red]")
+        console.print(f"[red]Failed to link envrc: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
-    console.print(f"Linked: {CONFIG_ENVRC} -> {source}")
+    console.print(f"Linked: {esc(CONFIG_ENVRC)} -> {esc(source)}")
 
 
 @app.command("sync")
 def sync(
-    yes: bool = typer.Option(False, "--yes", "-y", help="Install without prompting."),
+    yes: bool = yes_option("Install without prompting."),
     check: bool = typer.Option(
         False,
         "--check",
@@ -155,13 +167,17 @@ def sync(
             continue
         if missing:
             needed_extras.append(spec.extra)
-            table.add_row(name, enabled[name], f"[red]missing: {', '.join(missing)}[/red]")
+            table.add_row(
+                name, enabled[name], f"[red]missing: {', '.join(missing)}[/red]"
+            )
         else:
             table.add_row(name, enabled[name], "[green]ok[/green]")
     console.print(table)
 
     if not needed_extras:
-        console.print("[green]Every enabled area has its dependencies installed.[/green]")
+        console.print(
+            "[green]Every enabled area has its dependencies installed.[/green]"
+        )
         return
     if check:
         raise typer.Exit(code=1)
@@ -170,26 +186,39 @@ def sync(
     console.print("[green]Dependencies installed — the areas above are ready.[/green]")
 
 
-def _mask(value: str | None, secret: bool) -> str:
+def _mask(value: str | None, secret: bool) -> Text:
+    """Render one variable's state as a cell.
+
+    Both branches return :class:`~rich.text.Text` so the caller never has to
+    know which is which: the unset/secret markers are markup we author, while
+    the value itself is whatever the environment holds and must render
+    verbatim — an ``[unclosed`` tag there used to crash the whole table.
+    """
     if not value:
-        return "[dim]unset[/dim]"
+        return Text.from_markup("[dim]unset[/dim]")
     if secret:
-        return "[green]set[/green] [dim](hidden)[/dim]"
-    if len(value) > 60:
-        return value[:57] + "…"
-    return value
+        return Text.from_markup("[green]set[/green] [dim](hidden)[/dim]")
+    return cell(value, max_length=60)
 
 
 @app.command("show")
 def show() -> None:
     """Show the active .envrc and the state of every known env var."""
-    active = find_envrc()
-    console.print(
-        f"[bold]Active .envrc:[/bold] {active if active else '[red]none found[/red]'}"
-    )
+    location = locate_envrc()
+    if location is None:
+        console.print("[bold]Active .envrc:[/bold] [red]none found[/red]")
+    else:
+        console.print(
+            f"[bold]Active .envrc:[/bold] {esc(location.path)} "
+            f"[dim]({location.source.value})[/dim]"
+        )
+        if location.source is EnvrcSource.cwd:
+            console.print(f"[yellow]! {CWD_ENVRC_DETAIL}[/yellow]")
+            console.print(f"  [dim]{CWD_ENVRC_HINT}[/dim]")
     if CONFIG_ENVRC.is_symlink():
         console.print(
-            f"[bold]Global link:[/bold] {CONFIG_ENVRC} -> {CONFIG_ENVRC.resolve()}"
+            f"[bold]Global link:[/bold] {esc(CONFIG_ENVRC)} -> "
+            f"{esc(CONFIG_ENVRC.resolve())}"
         )
     else:
         console.print(
@@ -204,25 +233,45 @@ def show() -> None:
 
     for component, specs in component_vars().items():
         for i, spec in enumerate(specs):
+            # Component and variable names are built from DP_TARGETS, so they
+            # are user data too.
             table.add_row(
-                component if i == 0 else "",
-                spec.name,
+                cell(component if i == 0 else ""),
+                cell(spec.name),
                 _mask(os.getenv(spec.name), spec.secret),
             )
 
     console.print(table)
 
 
+class CheckStatus(str, Enum):
+    """Outcome of one doctor check.
+
+    ``warn`` is deliberately not a failure: doctor's exit code is a contract,
+    so surfacing a new advisory must never flip a setup that used to exit 0.
+    """
+
+    ok = "ok"
+    warn = "warn"
+    fail = "fail"
+
+
 @dataclass
 class CheckResult:
     label: str
-    ok: bool
+    status: CheckStatus
     detail: str = ""
     hint: str = ""
 
 
 def _check(label: str, ok: bool, detail: str = "", hint: str = "") -> CheckResult:
-    return CheckResult(label=label, ok=ok, detail=detail, hint=hint)
+    status = CheckStatus.ok if ok else CheckStatus.fail
+    return CheckResult(label=label, status=status, detail=detail, hint=hint)
+
+
+def _warn(label: str, detail: str = "", hint: str = "") -> CheckResult:
+    """A finding worth showing that must not fail the command."""
+    return CheckResult(label=label, status=CheckStatus.warn, detail=detail, hint=hint)
 
 
 def _offline_checks() -> list[CheckResult]:
@@ -231,15 +280,21 @@ def _offline_checks() -> list[CheckResult]:
 
     results: list[CheckResult] = []
 
-    active = find_envrc()
+    location = locate_envrc()
     results.append(
         _check(
             "envrc found",
-            active is not None,
-            detail=str(active) if active else "",
+            location is not None,
+            detail=(
+                f"{location.path} ({location.source.value})"
+                if location is not None
+                else ""
+            ),
             hint="Run `dp config init --envrc /path/to/.envrc`.",
         )
     )
+    if location is not None and location.source is EnvrcSource.cwd:
+        results.append(_warn("envrc trust", CWD_ENVRC_DETAIL, CWD_ENVRC_HINT))
 
     try:
         targets = load_targets()
@@ -379,9 +434,7 @@ def _connect_checks() -> list[CheckResult]:
                 cursor.execute("SELECT 1")
             results.append(_check(f"{name} connection", True, detail="SELECT 1 ok"))
         except (DataplatError, psycopg.Error) as exc:
-            results.append(
-                _check(f"{name} connection", False, detail=str(exc)[:120])
-            )
+            results.append(_check(f"{name} connection", False, detail=str(exc)[:120]))
 
     # Airbyte (only when configured)
     from dataplat.core.errors import AuthError, ConfigError
@@ -452,17 +505,26 @@ def _connect_checks() -> list[CheckResult]:
     return results
 
 
+_MARKS = {
+    CheckStatus.ok: "[green]✓[/green]",
+    CheckStatus.warn: "[yellow]![/yellow]",
+    CheckStatus.fail: "[red]✗[/red]",
+}
+
+
 def _render_checks(results: list[CheckResult]) -> int:
+    """Print every result and return how many *failed*; warnings never count."""
     failures = 0
     for r in results:
-        mark = "[green]✓[/green]" if r.ok else "[red]✗[/red]"
-        line = f" {mark} {r.label}"
+        # Labels, details and hints carry target names, env var names, paths
+        # and driver error text — none of it ours, all of it markup-bearing.
+        line = f" {_MARKS[r.status]} {esc(r.label)}"
         if r.detail:
-            line += f" [dim]— {r.detail}[/dim]"
+            line += f" [dim]— {esc(r.detail)}[/dim]"
         console.print(line)
-        if not r.ok and r.hint:
-            console.print(f"    [yellow]{r.hint}[/yellow]")
-        if not r.ok:
+        if r.status is not CheckStatus.ok and r.hint:
+            console.print(f"    [yellow]{esc(r.hint)}[/yellow]")
+        if r.status is CheckStatus.fail:
             failures += 1
     return failures
 
@@ -478,15 +540,25 @@ def doctor(
 ) -> None:
     """Check that the CLI's configuration and dependencies are healthy."""
     console.print("[bold]Configuration[/bold]")
-    failures = _render_checks(_offline_checks())
+    results = _offline_checks()
+    failures = _render_checks(results)
 
     if connect:
         console.print()
         console.print("[bold]Connectivity[/bold]")
-        failures += _render_checks(_connect_checks())
+        connect_results = _connect_checks()
+        results += connect_results
+        failures += _render_checks(connect_results)
 
+    warnings = sum(1 for r in results if r.status is CheckStatus.warn)
     console.print()
     if failures:
         console.print(f"[red]{failures} check(s) failed.[/red]")
         raise typer.Exit(code=1)
+    if warnings:
+        console.print(
+            f"[green]All checks passed[/green] "
+            f"[yellow]({warnings} warning(s) above).[/yellow]"
+        )
+        return
     console.print("[green]All checks passed.[/green]")
