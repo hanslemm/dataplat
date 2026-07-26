@@ -61,8 +61,12 @@ def test_resolve_connection_params_cli_engine_overrides_env(monkeypatch) -> None
     params = resolve_connection_params(
         engine=SqlEngine.redshift,  # explicit CLI flag
         env_prefix="DEMO_PG",
-        user=None, password=None, host=None, port=None,
-        database=None, sslmode=None,
+        user=None,
+        password=None,
+        host=None,
+        port=None,
+        database=None,
+        sslmode=None,
     )
     assert params.engine == SqlEngine.redshift
     # Redshift defaults should kick in — proves the CLI flag actually took effect.
@@ -70,7 +74,9 @@ def test_resolve_connection_params_cli_engine_overrides_env(monkeypatch) -> None
     assert params.client_encoding == "UTF8"
 
 
-def test_resolve_connection_params_env_engine_applies_when_cli_absent(monkeypatch) -> None:
+def test_resolve_connection_params_env_engine_applies_when_cli_absent(
+    monkeypatch,
+) -> None:
     """When no CLI flag is passed (engine=None), env var fills in."""
     monkeypatch.setenv("DEMO_PG_ENGINE", "redshift")
     monkeypatch.setenv("DEMO_PG_USER", "u")
@@ -82,14 +88,20 @@ def test_resolve_connection_params_env_engine_applies_when_cli_absent(monkeypatc
     params = resolve_connection_params(
         engine=None,
         env_prefix="DEMO_PG",
-        user=None, password=None, host=None, port=None,
-        database=None, sslmode=None,
+        user=None,
+        password=None,
+        host=None,
+        port=None,
+        database=None,
+        sslmode=None,
     )
     assert params.engine == SqlEngine.redshift
     assert params.port == 5439
 
 
-def test_resolve_connection_params_defaults_to_postgres_when_nothing_set(monkeypatch) -> None:
+def test_resolve_connection_params_defaults_to_postgres_when_nothing_set(
+    monkeypatch,
+) -> None:
     monkeypatch.delenv("DEMO_PG_ENGINE", raising=False)
     monkeypatch.setenv("DEMO_PG_USER", "u")
     monkeypatch.setenv("DEMO_PG_HOST", "h")
@@ -98,9 +110,14 @@ def test_resolve_connection_params_defaults_to_postgres_when_nothing_set(monkeyp
     monkeypatch.delenv("PGPORT", raising=False)
 
     params = resolve_connection_params(
-        engine=None, env_prefix="DEMO_PG",
-        user=None, password=None, host=None, port=None,
-        database=None, sslmode=None,
+        engine=None,
+        env_prefix="DEMO_PG",
+        user=None,
+        password=None,
+        host=None,
+        port=None,
+        database=None,
+        sslmode=None,
     )
     assert params.engine == SqlEngine.postgresql
     assert params.port == 5432

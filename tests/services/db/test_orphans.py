@@ -171,8 +171,7 @@ def test_build_rename_statement_redshift_table_uses_alter_table() -> None:
         "analytics", "t", "t_deprecated", "table", is_redshift=True
     )
     assert (
-        stmt.as_string(None)
-        == 'ALTER TABLE "analytics"."t" RENAME TO "t_deprecated"'
+        stmt.as_string(None) == 'ALTER TABLE "analytics"."t" RENAME TO "t_deprecated"'
     )
 
 
@@ -218,9 +217,7 @@ def test_resolve_params_redshift_uses_demo_rs_prefix(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_RS_PASSWORD", "rs-pass")
     monkeypatch.setenv("DEMO_RS_DATABASE", "demo_rs")
 
-    params = resolve_orphans_connection_params(
-        SqlEngine.redshift, env_prefix="DEMO_RS"
-    )
+    params = resolve_orphans_connection_params(SqlEngine.redshift, env_prefix="DEMO_RS")
     assert params is not None
     assert params.host == "rs-host"
     assert params.user == "rs-user"
@@ -232,15 +229,11 @@ def test_resolve_params_redshift_uses_demo_rs_prefix(monkeypatch) -> None:
 def test_resolve_params_returns_none_when_creds_missing(monkeypatch) -> None:
     _clear_orphan_env(monkeypatch)
     assert (
-        resolve_orphans_connection_params(
-            SqlEngine.postgresql, env_prefix="DEMO_PG"
-        )
+        resolve_orphans_connection_params(SqlEngine.postgresql, env_prefix="DEMO_PG")
         is None
     )
     assert (
-        resolve_orphans_connection_params(
-            SqlEngine.redshift, env_prefix="DEMO_RS"
-        )
+        resolve_orphans_connection_params(SqlEngine.redshift, env_prefix="DEMO_RS")
         is None
     )
 
@@ -251,9 +244,7 @@ def test_resolve_params_returns_none_when_password_missing(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_PG_USER", "u")
     monkeypatch.setenv("DEMO_PG_DATABASE", "d")
     assert (
-        resolve_orphans_connection_params(
-            SqlEngine.postgresql, env_prefix="DEMO_PG"
-        )
+        resolve_orphans_connection_params(SqlEngine.postgresql, env_prefix="DEMO_PG")
         is None
     )
 
@@ -264,9 +255,7 @@ def test_resolve_params_returns_none_when_database_missing(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_PG_USER", "u")
     monkeypatch.setenv("DEMO_PG_PASSWORD", "p")
     assert (
-        resolve_orphans_connection_params(
-            SqlEngine.postgresql, env_prefix="DEMO_PG"
-        )
+        resolve_orphans_connection_params(SqlEngine.postgresql, env_prefix="DEMO_PG")
         is None
     )
 
@@ -280,9 +269,7 @@ def test_resolve_params_raises_on_invalid_port(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_PG_PORT", "not-a-port")
 
     with pytest.raises(ConfigError):
-        resolve_orphans_connection_params(
-            SqlEngine.postgresql, env_prefix="DEMO_PG"
-        )
+        resolve_orphans_connection_params(SqlEngine.postgresql, env_prefix="DEMO_PG")
 
 
 class FakeCursorWithAll:
@@ -378,9 +365,7 @@ def test_fetch_existing_relations_postgres_merges_tables_and_matviews() -> None:
             [("public", "users_matview")],
         ]
     )
-    result = fetch_existing_relations(
-        cur, ["public", "analytics"], is_redshift=False
-    )
+    result = fetch_existing_relations(cur, ["public", "analytics"], is_redshift=False)
     assert result == {
         "public": {"users", "users_view", "users_matview"},
         "analytics": {"reports"},
@@ -430,13 +415,16 @@ def test_diff_orphans_skips_already_deprecated() -> None:
 
     live = {"public": {"fct_orders"}}
     existing = {"public": {"fct_orders", "old_deprecated"}}
-    assert diff_orphans(
-        live=live,
-        existing=existing,
-        excluded_schemas=frozenset(),
-        excluded_user_schemas=frozenset(),
-        excluded_user_relations=frozenset(),
-    ) == {}
+    assert (
+        diff_orphans(
+            live=live,
+            existing=existing,
+            excluded_schemas=frozenset(),
+            excluded_user_schemas=frozenset(),
+            excluded_user_relations=frozenset(),
+        )
+        == {}
+    )
 
 
 def test_diff_orphans_honors_excluded_schemas() -> None:
@@ -527,10 +515,7 @@ def test_build_drop_statement_matview() -> None:
     from dataplat.services.db.orphans import build_drop_statement
 
     stmt = build_drop_statement("public", "foo_deprecated", "matview")
-    assert (
-        stmt.as_string(None)
-        == 'DROP MATERIALIZED VIEW "public"."foo_deprecated"'
-    )
+    assert stmt.as_string(None) == 'DROP MATERIALIZED VIEW "public"."foo_deprecated"'
 
 
 def test_fetch_deprecated_objects_postgres_merges_tables_and_matviews() -> None:
@@ -565,9 +550,7 @@ def test_fetch_deprecated_objects_postgres_merges_tables_and_matviews() -> None:
 def test_fetch_deprecated_objects_redshift_skips_pg_matviews() -> None:
     from dataplat.services.db.orphans import fetch_deprecated_objects
 
-    cur = MultiResultCursor(
-        [[("public", "users_deprecated", "BASE TABLE")]]
-    )
+    cur = MultiResultCursor([[("public", "users_deprecated", "BASE TABLE")]])
     result = fetch_deprecated_objects(
         cur,
         is_redshift=True,

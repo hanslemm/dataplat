@@ -61,6 +61,8 @@ def invocation_command() -> str | None:
     When unset, all ``dbt build`` invocations count.
     """
     return os.getenv("DP_DBT_INVOCATION_COMMAND") or None
+
+
 LIVE_STATUSES: frozenset[str] = frozenset({"success", "error"})
 
 ObjectKind = Literal["table", "view", "matview"]
@@ -242,9 +244,7 @@ _DROP_KEYWORDS: dict[ObjectKind, str] = {
 }
 
 
-def build_drop_statement(
-    schema: str, name: str, kind: ObjectKind
-) -> sql.Composed:
+def build_drop_statement(schema: str, name: str, kind: ObjectKind) -> sql.Composed:
     """Build a ``DROP …`` statement for the given object kind."""
     return sql.SQL("{keyword} {schema}.{name}").format(
         keyword=sql.SQL(_DROP_KEYWORDS[kind]),
@@ -253,9 +253,7 @@ def build_drop_statement(
     )
 
 
-def drop_object(
-    cur: Any, schema: str, name: str, kind: ObjectKind
-) -> None:
+def drop_object(cur: Any, schema: str, name: str, kind: ObjectKind) -> None:
     cur.execute(build_drop_statement(schema, name, kind))
 
 

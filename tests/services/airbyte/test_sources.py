@@ -1,4 +1,5 @@
 """Tests for dataplat.services.airbyte.sources."""
+
 from __future__ import annotations
 
 import json
@@ -96,7 +97,12 @@ def test_create_source_ok():
     data = {"sourceId": "new-src", "name": "Test"}
     client = _mock_client(data, status_code=200)
     result = sources.create_source(
-        client, BASE, name="Test", workspace_id="ws1", definition_id="def1", configuration={"key": "val"}
+        client,
+        BASE,
+        name="Test",
+        workspace_id="ws1",
+        definition_id="def1",
+        configuration={"key": "val"},
     )
     assert result == data
     assert client.last_url == f"{BASE}/api/public/v1/sources"
@@ -112,7 +118,12 @@ def test_create_source_error():
     client = _mock_client({"message": "bad request"}, status_code=400)
     with pytest.raises(ServiceError, match="Failed to create source"):
         sources.create_source(
-            client, BASE, name="Test", workspace_id="ws1", definition_id="def1", configuration={}
+            client,
+            BASE,
+            name="Test",
+            workspace_id="ws1",
+            definition_id="def1",
+            configuration={},
         )
 
 

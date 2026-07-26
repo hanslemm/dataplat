@@ -63,7 +63,9 @@ def test_ensure_sso_login_skips_login_when_identity_works(monkeypatch) -> None:
     )
 
     called = {"run": 0}
-    monkeypatch.setattr(auth.subprocess, "run", lambda *args, **kwargs: called.__setitem__("run", 1))
+    monkeypatch.setattr(
+        auth.subprocess, "run", lambda *args, **kwargs: called.__setitem__("run", 1)
+    )
 
     auth.ensure_sso_login("my-profile")
     assert called["run"] == 0
@@ -95,7 +97,9 @@ def test_ensure_sso_login_raises_auth_error_on_failed_login(monkeypatch) -> None
     )
 
     def _boom(*args, **kwargs):
-        raise auth.subprocess.CalledProcessError(returncode=1, cmd=["cloud", "aws", "sso", "login"])
+        raise auth.subprocess.CalledProcessError(
+            returncode=1, cmd=["cloud", "aws", "sso", "login"]
+        )
 
     monkeypatch.setattr(auth.subprocess, "run", _boom)
 

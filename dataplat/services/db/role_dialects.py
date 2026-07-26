@@ -39,10 +39,10 @@ class SqlOp:
 class ParentKind(str, Enum):
     """What a ``--member-of`` parent / ``--grant-to`` target resolves to."""
 
-    user = "user"       # Redshift login user
-    group = "group"     # legacy Redshift group
-    role = "role"       # RBAC role (Redshift) / plain role (Postgres)
-    absent = "absent"   # parent does not exist
+    user = "user"  # Redshift login user
+    group = "group"  # legacy Redshift group
+    role = "role"  # RBAC role (Redshift) / plain role (Postgres)
+    absent = "absent"  # parent does not exist
 
 
 @dataclass(frozen=True)
@@ -78,13 +78,21 @@ class RoleDialect(ABC):
 
     @abstractmethod
     def grant_membership(
-        self, name: str, parent: str, kind: ParentKind, *,
+        self,
+        name: str,
+        parent: str,
+        kind: ParentKind,
+        *,
         member_is_role: bool = False,
     ) -> SqlOp: ...
 
     @abstractmethod
     def grant_role_to(
-        self, name: str, target: str, kind: ParentKind, *,
+        self,
+        name: str,
+        target: str,
+        kind: ParentKind,
+        *,
         name_is_role: bool = False,
     ) -> SqlOp: ...
 
@@ -107,7 +115,8 @@ class RoleDialect(ABC):
         return SqlOp(
             description=f"GRANT USAGE ON SCHEMA {schema} TO {label}",
             statement=sql.SQL("GRANT USAGE ON SCHEMA {s} TO {r}").format(
-                s=sql.Identifier(schema), r=grantee,
+                s=sql.Identifier(schema),
+                r=grantee,
             ),
         )
 
@@ -118,7 +127,8 @@ class RoleDialect(ABC):
         return SqlOp(
             description=f"GRANT CREATE ON SCHEMA {schema} TO {label}",
             statement=sql.SQL("GRANT CREATE ON SCHEMA {s} TO {r}").format(
-                s=sql.Identifier(schema), r=grantee,
+                s=sql.Identifier(schema),
+                r=grantee,
             ),
         )
 
@@ -128,9 +138,9 @@ class RoleDialect(ABC):
         grantee, label = self._grantee(name, as_role)
         return SqlOp(
             description=f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {label}",
-            statement=sql.SQL(
-                "GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {r}"
-            ).format(s=sql.Identifier(schema), r=grantee),
+            statement=sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {r}").format(
+                s=sql.Identifier(schema), r=grantee
+            ),
         )
 
     def grant_table_all(
@@ -139,9 +149,9 @@ class RoleDialect(ABC):
         grantee, label = self._grantee(name, as_role)
         return SqlOp(
             description=f"GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO {label}",
-            statement=sql.SQL(
-                "GRANT ALL ON ALL TABLES IN SCHEMA {s} TO {r}"
-            ).format(s=sql.Identifier(schema), r=grantee),
+            statement=sql.SQL("GRANT ALL ON ALL TABLES IN SCHEMA {s} TO {r}").format(
+                s=sql.Identifier(schema), r=grantee
+            ),
         )
 
     def alter_default_table_select(
@@ -154,8 +164,7 @@ class RoleDialect(ABC):
                 f"GRANT SELECT ON TABLES TO {label}"
             ),
             statement=sql.SQL(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} "
-                "GRANT SELECT ON TABLES TO {r}"
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT SELECT ON TABLES TO {r}"
             ).format(s=sql.Identifier(schema), r=grantee),
         )
 
@@ -169,8 +178,7 @@ class RoleDialect(ABC):
                 f"GRANT ALL ON TABLES TO {label}"
             ),
             statement=sql.SQL(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} "
-                "GRANT ALL ON TABLES TO {r}"
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT ALL ON TABLES TO {r}"
             ).format(s=sql.Identifier(schema), r=grantee),
         )
 
@@ -195,6 +203,7 @@ class RoleDialect(ABC):
     def list_roles(self, cursor: Any) -> list[Any]:
         # Postgres: cluster-wide pg_roles. Imported lazily to avoid a cycle.
         from dataplat.services.db import role_admin
+
         return role_admin.list_roles(cursor)
 
     # --- drop-side ------------------------------------------------------
@@ -213,7 +222,8 @@ class PostgresDialect(RoleDialect):
         return SqlOp(
             description=f"CREATE ROLE {name} LOGIN PASSWORD '<random>'",
             statement=sql.SQL("CREATE ROLE {role} LOGIN PASSWORD {pw}").format(
-                role=sql.Identifier(name), pw=sql.Literal(password),
+                role=sql.Identifier(name),
+                pw=sql.Literal(password),
             ),
             secret=True,
         )
@@ -227,24 +237,34 @@ class PostgresDialect(RoleDialect):
         )
 
     def grant_membership(
-        self, name: str, parent: str, kind: ParentKind, *,
+        self,
+        name: str,
+        parent: str,
+        kind: ParentKind,
+        *,
         member_is_role: bool = False,
     ) -> SqlOp:
         return SqlOp(
             description=f"GRANT {parent} TO {name}",
             statement=sql.SQL("GRANT {parent} TO {role}").format(
-                parent=sql.Identifier(parent), role=sql.Identifier(name),
+                parent=sql.Identifier(parent),
+                role=sql.Identifier(name),
             ),
         )
 
     def grant_role_to(
-        self, name: str, target: str, kind: ParentKind, *,
+        self,
+        name: str,
+        target: str,
+        kind: ParentKind,
+        *,
         name_is_role: bool = False,
     ) -> SqlOp:
         return SqlOp(
             description=f"GRANT {name} TO {target}",
             statement=sql.SQL("GRANT {role} TO {target}").format(
-                role=sql.Identifier(name), target=sql.Identifier(target),
+                role=sql.Identifier(name),
+                target=sql.Identifier(target),
             ),
         )
 
@@ -266,7 +286,8 @@ class RedshiftDialect(RoleDialect):
         return SqlOp(
             description=f"CREATE USER {name} PASSWORD '<random>'",
             statement=sql.SQL("CREATE USER {user} PASSWORD {pw}").format(
-                user=sql.Identifier(name), pw=sql.Literal(password),
+                user=sql.Identifier(name),
+                pw=sql.Literal(password),
             ),
             secret=True,
         )
@@ -288,7 +309,11 @@ class RedshiftDialect(RoleDialect):
         return sql.Identifier(name), name
 
     def grant_membership(
-        self, name: str, parent: str, kind: ParentKind, *,
+        self,
+        name: str,
+        parent: str,
+        kind: ParentKind,
+        *,
         member_is_role: bool = False,
     ) -> SqlOp:
         if kind == ParentKind.group:
@@ -297,7 +322,8 @@ class RedshiftDialect(RoleDialect):
             return SqlOp(
                 description=f"ALTER GROUP {parent} ADD USER {name}",
                 statement=sql.SQL("ALTER GROUP {g} ADD USER {u}").format(
-                    g=sql.Identifier(parent), u=sql.Identifier(name),
+                    g=sql.Identifier(parent),
+                    u=sql.Identifier(name),
                 ),
             )
         # RBAC role (ParentKind.absent must be caught by the CLI before here).
@@ -305,12 +331,17 @@ class RedshiftDialect(RoleDialect):
         return SqlOp(
             description=f"GRANT ROLE {parent} TO {label}",
             statement=sql.SQL("GRANT ROLE {r} TO {u}").format(
-                r=sql.Identifier(parent), u=grantee,
+                r=sql.Identifier(parent),
+                u=grantee,
             ),
         )
 
     def grant_role_to(
-        self, name: str, target: str, kind: ParentKind, *,
+        self,
+        name: str,
+        target: str,
+        kind: ParentKind,
+        *,
         name_is_role: bool = False,
     ) -> SqlOp:
         # Only RBAC roles are grantable on Redshift; the plan builder rejects
@@ -319,7 +350,8 @@ class RedshiftDialect(RoleDialect):
         return SqlOp(
             description=f"GRANT ROLE {name} TO {label}",
             statement=sql.SQL("GRANT ROLE {r} TO {t}").format(
-                r=sql.Identifier(name), t=grantee,
+                r=sql.Identifier(name),
+                t=grantee,
             ),
         )
 
@@ -380,9 +412,7 @@ class RedshiftDialect(RoleDialect):
         except Exception:  # noqa: BLE001  connection-level failure, bail
             return False
         try:
-            cursor.execute(
-                "SELECT 1 FROM svv_roles WHERE role_name = %s", (parent,)
-            )
+            cursor.execute("SELECT 1 FROM svv_roles WHERE role_name = %s", (parent,))
             found = cursor.fetchone() is not None
         except Exception:  # noqa: BLE001  view missing / no permission
             with contextlib.suppress(Exception):
@@ -480,37 +510,52 @@ class RedshiftDialect(RoleDialect):
         per_db: list[SqlOp] = []
         if not no_reassign:
             for schema in owned.schemas:
-                per_db.append(SqlOp(
-                    description=f"ALTER SCHEMA {schema} OWNER TO {reassign_to or default_owner}",
-                    statement=sql.SQL("ALTER SCHEMA {s} OWNER TO {o}").format(
-                        s=sql.Identifier(schema), o=owner,
-                    ),
-                ))
+                per_db.append(
+                    SqlOp(
+                        description=(
+                            f"ALTER SCHEMA {schema} "
+                            f"OWNER TO {reassign_to or default_owner}"
+                        ),
+                        statement=sql.SQL("ALTER SCHEMA {s} OWNER TO {o}").format(
+                            s=sql.Identifier(schema),
+                            o=owner,
+                        ),
+                    )
+                )
             for schema, relname, relkind in owned.relations:
                 kw = "VIEW" if relkind == "v" else "TABLE"
-                per_db.append(SqlOp(
-                    description=(
-                        f"ALTER {kw} {schema}.{relname} "
-                        f"OWNER TO {reassign_to or default_owner}"
-                    ),
-                    statement=sql.SQL(
-                        "ALTER " + kw + " {s}.{r} OWNER TO {o}"
-                    ).format(
-                        s=sql.Identifier(schema), r=sql.Identifier(relname), o=owner,
-                    ),
-                ))
+                per_db.append(
+                    SqlOp(
+                        description=(
+                            f"ALTER {kw} {schema}.{relname} "
+                            f"OWNER TO {reassign_to or default_owner}"
+                        ),
+                        statement=sql.SQL(
+                            "ALTER " + kw + " {s}.{r} OWNER TO {o}"
+                        ).format(
+                            s=sql.Identifier(schema),
+                            r=sql.Identifier(relname),
+                            o=owner,
+                        ),
+                    )
+                )
         cluster: list[SqlOp] = []
         for group in groups:
-            cluster.append(SqlOp(
-                description=f"ALTER GROUP {group} DROP USER {name}",
-                statement=sql.SQL("ALTER GROUP {g} DROP USER {u}").format(
-                    g=sql.Identifier(group), u=user,
-                ),
-            ))
-        cluster.append(SqlOp(
-            description=f"DROP USER {name}",
-            statement=sql.SQL("DROP USER {u}").format(u=user),
-        ))
+            cluster.append(
+                SqlOp(
+                    description=f"ALTER GROUP {group} DROP USER {name}",
+                    statement=sql.SQL("ALTER GROUP {g} DROP USER {u}").format(
+                        g=sql.Identifier(group),
+                        u=user,
+                    ),
+                )
+            )
+        cluster.append(
+            SqlOp(
+                description=f"DROP USER {name}",
+                statement=sql.SQL("DROP USER {u}").format(u=user),
+            )
+        )
         return DropOps(pre_cluster_ops=[], per_database_ops=per_db, cluster_ops=cluster)
 
 

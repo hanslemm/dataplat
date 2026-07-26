@@ -1,4 +1,5 @@
 """Tests for dataplat.services.airbyte.definitions."""
+
 from __future__ import annotations
 
 import json
@@ -67,10 +68,14 @@ WS = "workspace-1"
 
 
 def test_list_source_definitions_ok():
-    client = _mock_client({"data": [{"definitionId": "def1"}, {"definitionId": "def2"}]})
+    client = _mock_client(
+        {"data": [{"definitionId": "def1"}, {"definitionId": "def2"}]}
+    )
     result = list(definitions.list_source_definitions(client, BASE, WS))
     assert result == [{"definitionId": "def1"}, {"definitionId": "def2"}]
-    assert client.last_url == f"{BASE}/api/public/v1/workspaces/{WS}/definitions/sources"
+    assert (
+        client.last_url == f"{BASE}/api/public/v1/workspaces/{WS}/definitions/sources"
+    )
 
 
 def test_list_source_definitions_empty():
@@ -89,7 +94,10 @@ def test_list_destination_definitions_ok():
     client = _mock_client({"data": [{"definitionId": "dst-def1"}]})
     result = list(definitions.list_destination_definitions(client, BASE, WS))
     assert result == [{"definitionId": "dst-def1"}]
-    assert client.last_url == f"{BASE}/api/public/v1/workspaces/{WS}/definitions/destinations"
+    assert (
+        client.last_url
+        == f"{BASE}/api/public/v1/workspaces/{WS}/definitions/destinations"
+    )
 
 
 def test_list_destination_definitions_error():

@@ -14,7 +14,9 @@ from dataplat.services.db.top_tables import (
 class FakeCursor:
     """Cursor stub — queues per-query row/rows results and records calls."""
 
-    def __init__(self, *, one: list[tuple] | None = None, many: list[list[tuple]] | None = None) -> None:
+    def __init__(
+        self, *, one: list[tuple] | None = None, many: list[list[tuple]] | None = None
+    ) -> None:
         self._one = list(one or [])
         self._many = list(many or [])
         self.executed: list[tuple[str, tuple]] = []
@@ -74,9 +76,7 @@ def test_fetch_top_tables_redshift_uses_svv_table_info() -> None:
     totals = (2048 * 1024 * 1024, 1, 10_000 * 1024 * 1024)
     rows = [("dev_x", "events", "r", None, 42, 2048 * 1024 * 1024)]
     cur = FakeCursor(one=[totals], many=[rows])
-    result = fetch_top_tables(
-        cur, SqlEngine.redshift, ["dev_", "sandbox_"], limit=10
-    )
+    result = fetch_top_tables(cur, SqlEngine.redshift, ["dev_", "sandbox_"], limit=10)
     assert result.rows == [
         TopTableRow("dev_x", "events", "r", None, 42, 2048 * 1024 * 1024)
     ]
@@ -105,8 +105,13 @@ def test_fetch_top_tables_skips_rows_query_when_no_matches() -> None:
 
 def test_fetch_top_tables_empty_inputs_do_not_query() -> None:
     cur = FakeCursor()
-    assert fetch_top_tables(cur, SqlEngine.postgresql, [], limit=10) == TopTablesResult()
-    assert fetch_top_tables(cur, SqlEngine.postgresql, ["dev_"], limit=0) == TopTablesResult()
+    assert (
+        fetch_top_tables(cur, SqlEngine.postgresql, [], limit=10) == TopTablesResult()
+    )
+    assert (
+        fetch_top_tables(cur, SqlEngine.postgresql, ["dev_"], limit=0)
+        == TopTablesResult()
+    )
     assert cur.executed == []
 
 
@@ -116,11 +121,5 @@ def test_drop_statement_quotes_identifiers_and_picks_matview() -> None:
     weird = TopTableRow('dev"a', 'has"quote', "r", None, 1, 2)
 
     assert drop_statement(table) == 'DROP TABLE IF EXISTS "dev_a"."big_fact";'
-    assert (
-        drop_statement(matview)
-        == 'DROP MATERIALIZED VIEW IF EXISTS "dev_a"."mv_x";'
-    )
-    assert (
-        drop_statement(weird)
-        == 'DROP TABLE IF EXISTS "dev""a"."has""quote";'
-    )
+    assert drop_statement(matview) == 'DROP MATERIALIZED VIEW IF EXISTS "dev_a"."mv_x";'
+    assert drop_statement(weird) == 'DROP TABLE IF EXISTS "dev""a"."has""quote";'

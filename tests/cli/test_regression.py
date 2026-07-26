@@ -112,7 +112,9 @@ def test_db_query_prints_execution_time(monkeypatch) -> None:
         db_cli,
         "console",
         SimpleNamespace(
-            print=lambda *args, **kwargs: printed.append(" ".join(str(arg) for arg in args))
+            print=lambda *args, **kwargs: printed.append(
+                " ".join(str(arg) for arg in args)
+            )
         ),
     )
 
@@ -131,9 +133,7 @@ def test_db_query_prints_execution_time(monkeypatch) -> None:
 def test_secrets_resolve_profiles_expands_all_and_deduplicates(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv(
-        "DP_AWS_PROFILE_ALIASES", "prod=Admin-Prod, qa=Admin-QA"
-    )
+    monkeypatch.setenv("DP_AWS_PROFILE_ALIASES", "prod=Admin-Prod, qa=Admin-QA")
 
     profiles = secrets_cli._resolve_profiles(["prod", "all", "qa", "prod"])
 

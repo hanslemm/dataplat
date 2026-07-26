@@ -15,7 +15,8 @@ def list_tags(client: httpx.Client, base_url: str) -> list[dict]:
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to list tags (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to list tags "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
 
     try:
@@ -52,7 +53,8 @@ def create_tag(
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to create tag (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to create tag "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -104,7 +106,9 @@ class TagResolver:
         self._prime()
         if key in self._cache:
             return self._cache[key]
-        created = normalize_tag(create_tag(self._client, self._base_url, name, workspace_id, color))
+        created = normalize_tag(
+            create_tag(self._client, self._base_url, name, workspace_id, color)
+        )
         self._cache[key] = created
         return created
 

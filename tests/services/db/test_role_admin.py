@@ -153,14 +153,17 @@ def test_build_create_plan_nologin_grants_and_membership_postgres() -> None:
     cluster = [_render(op.statement) for op in plan.cluster_ops]
     assert any('GRANT "analyst" TO "readers"' in r for r in cluster)
     per_db = [_render(op.statement) for op in plan.per_database_ops["demo_pg"]]
-    assert any('GRANT SELECT ON ALL TABLES IN SCHEMA "raw" TO "readers"' in r
-               for r in per_db)
+    assert any(
+        'GRANT SELECT ON ALL TABLES IN SCHEMA "raw" TO "readers"' in r for r in per_db
+    )
     assert any('ALTER DEFAULT PRIVILEGES IN SCHEMA "raw"' in r for r in per_db)
 
 
 def test_build_create_plan_grant_to_postgres() -> None:
     spec = CreateRoleSpec(
-        name="readers", password=None, grant_to=("alice", "bob"),
+        name="readers",
+        password=None,
+        grant_to=("alice", "bob"),
     )
     plan = build_create_plan(spec, ["demo_pg"])
     rendered = [_render(op.statement) for op in plan.cluster_ops]
@@ -171,7 +174,8 @@ def test_build_create_plan_grant_to_postgres() -> None:
 def test_build_create_plan_grant_to_login_role_postgres() -> None:
     # Postgres allows granting a login role to another role.
     spec = CreateRoleSpec(
-        name="alice", password="hunter2_______________________",
+        name="alice",
+        password="hunter2_______________________",
         grant_to=("admin_group",),
     )
     plan = build_create_plan(spec, ["demo_pg"])
@@ -188,13 +192,13 @@ def test_build_create_plan_nologin_redshift_creates_rbac_role() -> None:
 
 def test_build_create_plan_nologin_redshift_grants_use_to_role() -> None:
     spec = CreateRoleSpec(
-        name="readers", password=None, table_select=("public",),
+        name="readers",
+        password=None,
+        table_select=("public",),
     )
     plan = build_create_plan(spec, ["dev"], RedshiftDialect())
     per_db = [_render(op.statement) for op in plan.per_database_ops["dev"]]
-    assert any(
-        'GRANT USAGE ON SCHEMA "public" TO ROLE "readers"' in r for r in per_db
-    )
+    assert any('GRANT USAGE ON SCHEMA "public" TO ROLE "readers"' in r for r in per_db)
     assert any(
         'GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO ROLE "readers"' in r
         for r in per_db
@@ -204,7 +208,9 @@ def test_build_create_plan_nologin_redshift_grants_use_to_role() -> None:
 def test_build_create_plan_nologin_redshift_membership_role_to_role() -> None:
     spec = CreateRoleSpec(name="readers", password=None, member_of=("rbac",))
     plan = build_create_plan(
-        spec, ["dev"], RedshiftDialect(),
+        spec,
+        ["dev"],
+        RedshiftDialect(),
         parent_kinds={"rbac": ParentKind.role},
     )
     rendered = [_render(op.statement) for op in plan.cluster_ops]
@@ -215,17 +221,23 @@ def test_build_create_plan_nologin_redshift_group_parent_rejected() -> None:
     spec = CreateRoleSpec(name="readers", password=None, member_of=("grp",))
     with pytest.raises(ValueError, match="legacy group"):
         build_create_plan(
-            spec, ["dev"], RedshiftDialect(),
+            spec,
+            ["dev"],
+            RedshiftDialect(),
             parent_kinds={"grp": ParentKind.group},
         )
 
 
 def test_build_create_plan_grant_to_redshift_user_and_role() -> None:
     spec = CreateRoleSpec(
-        name="readers", password=None, grant_to=("alice", "rbac"),
+        name="readers",
+        password=None,
+        grant_to=("alice", "rbac"),
     )
     plan = build_create_plan(
-        spec, ["dev"], RedshiftDialect(),
+        spec,
+        ["dev"],
+        RedshiftDialect(),
         grantee_kinds={"alice": ParentKind.user, "rbac": ParentKind.role},
     )
     rendered = [_render(op.statement) for op in plan.cluster_ops]
@@ -237,27 +249,34 @@ def test_build_create_plan_grant_to_redshift_group_target_rejected() -> None:
     spec = CreateRoleSpec(name="readers", password=None, grant_to=("grp",))
     with pytest.raises(ValueError, match="legacy group"):
         build_create_plan(
-            spec, ["dev"], RedshiftDialect(),
+            spec,
+            ["dev"],
+            RedshiftDialect(),
             grantee_kinds={"grp": ParentKind.group},
         )
 
 
 def test_build_create_plan_grant_to_redshift_login_user_rejected() -> None:
     spec = CreateRoleSpec(
-        name="svc", password="hunter2_______________________",
+        name="svc",
+        password="hunter2_______________________",
         grant_to=("alice",),
     )
     with pytest.raises(ValueError, match="--no-login"):
         build_create_plan(
-            spec, ["dev"], RedshiftDialect(),
+            spec,
+            ["dev"],
+            RedshiftDialect(),
             grantee_kinds={"alice": ParentKind.user},
         )
 
 
 def test_build_create_plan_nologin_redshift_skips_default_privileges() -> None:
     spec = CreateRoleSpec(
-        name="readers", password=None,
-        default_table_select=("public",), default_table_all=("staging",),
+        name="readers",
+        password=None,
+        default_table_select=("public",),
+        default_table_all=("staging",),
     )
     warnings: list[str] = []
     plan = build_create_plan(spec, ["dev"], RedshiftDialect(), warnings=warnings)
@@ -269,7 +288,8 @@ def test_build_create_plan_nologin_redshift_skips_default_privileges() -> None:
 
 def test_build_create_plan_login_redshift_default_privileges_kept() -> None:
     spec = CreateRoleSpec(
-        name="svc", password="hunter2_______________________",
+        name="svc",
+        password="hunter2_______________________",
         default_table_select=("public",),
     )
     plan = build_create_plan(spec, ["dev"], RedshiftDialect())
@@ -289,10 +309,7 @@ def test_resolve_reassign_owner_per_db_defaults() -> None:
         resolve_reassign_owner("demo_pg", explicit=None, defaults=_OWNERS)
         == "demo_pg_root"
     )
-    assert (
-        resolve_reassign_owner("demo_rs", explicit=None, defaults=_OWNERS)
-        == "admin"
-    )
+    assert resolve_reassign_owner("demo_rs", explicit=None, defaults=_OWNERS) == "admin"
 
 
 def test_resolve_reassign_owner_unknown_db_raises() -> None:
@@ -315,8 +332,7 @@ def test_build_drop_plan_uses_per_db_default() -> None:
         _render(op.statement) for op in plan.per_database_ops["demo_rs"]
     ]
     assert any(
-        'REASSIGN OWNED BY "bd_dputri" TO "demo_pg_root"' in r
-        for r in rendered_demo_pg
+        'REASSIGN OWNED BY "bd_dputri" TO "demo_pg_root"' in r for r in rendered_demo_pg
     )
     assert any(
         'REASSIGN OWNED BY "bd_dputri" TO "admin"' in r for r in rendered_demo_rs
@@ -331,7 +347,10 @@ def test_build_drop_plan_uses_per_db_default() -> None:
 
 def test_build_drop_plan_no_reassign_skips_reassign() -> None:
     plan = build_drop_plan(
-        "alice", ["demo_pg"], reassign_to=None, no_reassign=True,
+        "alice",
+        ["demo_pg"],
+        reassign_to=None,
+        no_reassign=True,
     )
     rendered = [_render(op.statement) for op in plan.per_database_ops["demo_pg"]]
     assert not any("REASSIGN OWNED" in r for r in rendered)
@@ -340,7 +359,10 @@ def test_build_drop_plan_no_reassign_skips_reassign() -> None:
 
 def test_build_drop_plan_explicit_owner_overrides_default() -> None:
     plan = build_drop_plan(
-        "alice", ["demo_pg"], reassign_to="postgres", no_reassign=False,
+        "alice",
+        ["demo_pg"],
+        reassign_to="postgres",
+        no_reassign=False,
     )
     rendered = [_render(op.statement) for op in plan.per_database_ops["demo_pg"]]
     assert any('REASSIGN OWNED BY "alice" TO "postgres"' in r for r in rendered)
@@ -349,14 +371,20 @@ def test_build_drop_plan_explicit_owner_overrides_default() -> None:
 def test_build_drop_plan_unknown_db_without_default_errors() -> None:
     with pytest.raises(MissingReassignOwnerError):
         build_drop_plan(
-            "alice", ["new_db"], reassign_to=None, no_reassign=False,
+            "alice",
+            ["new_db"],
+            reassign_to=None,
+            no_reassign=False,
         )
 
 
 def test_build_drop_plan_mutually_exclusive_flags() -> None:
     with pytest.raises(ValueError):
         build_drop_plan(
-            "alice", ["demo_pg"], reassign_to="x", no_reassign=True,
+            "alice",
+            ["demo_pg"],
+            reassign_to="x",
+            no_reassign=True,
         )
 
 
@@ -376,7 +404,10 @@ def test_build_drop_plan_grant_membership_prepends_grant() -> None:
 
 def test_build_drop_plan_no_grant_membership_when_omitted() -> None:
     plan = build_drop_plan(
-        "alice", ["demo_pg"], reassign_to=None, no_reassign=False,
+        "alice",
+        ["demo_pg"],
+        reassign_to=None,
+        no_reassign=False,
         defaults=_OWNERS,
     )
     assert plan.pre_cluster_ops == []
@@ -394,10 +425,12 @@ class _FakeCursor:
 
 
 def test_list_roles_maps_columns() -> None:
-    cursor = _FakeCursor([
-        ("alice", True, False, False, False, 2, 0),
-        ("readers", False, False, False, False, 0, 5),
-    ])
+    cursor = _FakeCursor(
+        [
+            ("alice", True, False, False, False, 2, 0),
+            ("readers", False, False, False, False, 0, 5),
+        ]
+    )
     rows = list_roles(cursor)
     assert [r.name for r in rows] == ["alice", "readers"]
     assert rows[0].can_login is True
@@ -409,7 +442,9 @@ def test_list_roles_maps_columns() -> None:
 def test_build_create_plan_redshift_uses_create_user() -> None:
     spec = CreateRoleSpec(name="svc", password="hunter2_______________________")
     plan = build_create_plan(spec, ["dev"], RedshiftDialect())
-    assert _render(plan.cluster_ops[0].statement).startswith('CREATE USER "svc" PASSWORD ')
+    assert _render(plan.cluster_ops[0].statement).startswith(
+        'CREATE USER "svc" PASSWORD '
+    )
 
 
 def test_build_create_plan_redshift_membership_group_and_role() -> None:
@@ -419,7 +454,9 @@ def test_build_create_plan_redshift_membership_group_and_role() -> None:
         member_of=("grp", "rbac"),
     )
     plan = build_create_plan(
-        spec, ["dev"], RedshiftDialect(),
+        spec,
+        ["dev"],
+        RedshiftDialect(),
         parent_kinds={"grp": ParentKind.group, "rbac": ParentKind.role},
     )
     rendered = [_render(op.statement) for op in plan.cluster_ops]
@@ -435,7 +472,10 @@ def test_build_create_plan_redshift_skips_sequences_with_warning() -> None:
     )
     warnings: list[str] = []
     plan = build_create_plan(
-        spec, ["dev"], RedshiftDialect(), warnings=warnings,
+        spec,
+        ["dev"],
+        RedshiftDialect(),
+        warnings=warnings,
     )
     rendered = [_render(op.statement) for op in plan.per_database_ops["dev"]]
     assert not any("SEQUENCES" in r for r in rendered)
@@ -448,9 +488,13 @@ def test_build_drop_plan_redshift_reassigns_then_drops_user() -> None:
         relations=[("public", "orders", "r"), ("public", "orders_v", "v")],
     )
     plan = build_drop_plan(
-        "svc", ["dev"], RedshiftDialect(),
-        reassign_to="admin", no_reassign=False,
-        owned=owned, groups=["reporting"],
+        "svc",
+        ["dev"],
+        RedshiftDialect(),
+        reassign_to="admin",
+        no_reassign=False,
+        owned=owned,
+        groups=["reporting"],
     )
     per_db = [_render(op.statement) for op in plan.per_database_ops["dev"]]
     cluster = [_render(op.statement) for op in plan.cluster_ops]
@@ -466,8 +510,13 @@ def test_build_drop_plan_redshift_reassigns_then_drops_user() -> None:
 def test_build_drop_plan_redshift_no_reassign_skips_owner_transfer() -> None:
     owned = OwnedForDrop(schemas=["analytics"], relations=[])
     plan = build_drop_plan(
-        "svc", ["dev"], RedshiftDialect(),
-        reassign_to=None, no_reassign=True, owned=owned, groups=[],
+        "svc",
+        ["dev"],
+        RedshiftDialect(),
+        reassign_to=None,
+        no_reassign=True,
+        owned=owned,
+        groups=[],
     )
     per_db = [_render(op.statement) for op in plan.per_database_ops["dev"]]
     assert not any("OWNER TO" in r for r in per_db)
@@ -476,7 +525,10 @@ def test_build_drop_plan_redshift_no_reassign_skips_owner_transfer() -> None:
 def test_build_drop_plan_postgres_unchanged() -> None:
     # Regression guard: the default (Postgres) path is byte-for-byte identical.
     plan = build_drop_plan(
-        "alice", ["demo_pg"], reassign_to=None, no_reassign=False,
+        "alice",
+        ["demo_pg"],
+        reassign_to=None,
+        no_reassign=False,
         defaults=_OWNERS,
     )
     rendered = [_render(op.statement) for op in plan.per_database_ops["demo_pg"]]

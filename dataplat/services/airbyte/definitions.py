@@ -1,4 +1,5 @@
 """Airbyte connector definition API helpers."""
+
 from __future__ import annotations
 
 import httpx
@@ -12,7 +13,10 @@ def list_source_definitions(
     workspace_id: str,
     limit: int = 100,
 ):
-    """Paginated generator. GET /api/public/v1/workspaces/{workspace_id}/definitions/sources"""
+    """Paginated generator.
+
+    GET /api/public/v1/workspaces/{workspace_id}/definitions/sources
+    """
     offset = 0
     while True:
         response = client.get(
@@ -24,7 +28,8 @@ def list_source_definitions(
         except httpx.HTTPStatusError as exc:
             snippet = (response.text or "").strip()[:500]
             raise ServiceError(
-                f"Failed to list source definitions (status={response.status_code}, body={snippet})"
+                "Failed to list source definitions "
+                f"(status={response.status_code}, body={snippet})"
             ) from exc
 
         payload = response.json() or {}
@@ -41,7 +46,10 @@ def list_destination_definitions(
     workspace_id: str,
     limit: int = 100,
 ):
-    """Paginated generator. GET /api/public/v1/workspaces/{workspace_id}/definitions/destinations"""
+    """Paginated generator.
+
+    GET /api/public/v1/workspaces/{workspace_id}/definitions/destinations
+    """
     offset = 0
     while True:
         response = client.get(
@@ -53,7 +61,8 @@ def list_destination_definitions(
         except httpx.HTTPStatusError as exc:
             snippet = (response.text or "").strip()[:500]
             raise ServiceError(
-                f"Failed to list destination definitions (status={response.status_code}, body={snippet})"
+                "Failed to list destination definitions "
+                f"(status={response.status_code}, body={snippet})"
             ) from exc
 
         payload = response.json() or {}

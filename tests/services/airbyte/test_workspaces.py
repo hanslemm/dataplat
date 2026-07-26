@@ -1,4 +1,5 @@
 """Tests for dataplat.services.airbyte.workspaces."""
+
 from __future__ import annotations
 
 import json

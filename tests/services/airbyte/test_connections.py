@@ -1,4 +1,5 @@
 """Tests for create_connection and delete_connection in connections.py."""
+
 from __future__ import annotations
 
 import json
@@ -72,7 +73,9 @@ BASE = "http://airbyte.test"
 def test_create_connection_minimal():
     data = {"connectionId": "conn1", "sourceId": "src1", "destinationId": "dst1"}
     client = _mock_client(data, status_code=200)
-    result = connections.create_connection(client, BASE, source_id="src1", destination_id="dst1")
+    result = connections.create_connection(
+        client, BASE, source_id="src1", destination_id="dst1"
+    )
     assert result == data
     assert client.last_url == f"{BASE}/api/public/v1/connections"
     assert client.last_json == {"sourceId": "src1", "destinationId": "dst1"}
@@ -107,7 +110,9 @@ def test_create_connection_full():
 def test_create_connection_error():
     client = _mock_client({"message": "bad request"}, status_code=400)
     with pytest.raises(ServiceError, match="Failed to create connection"):
-        connections.create_connection(client, BASE, source_id="src1", destination_id="dst1")
+        connections.create_connection(
+            client, BASE, source_id="src1", destination_id="dst1"
+        )
 
 
 def test_delete_connection_ok():

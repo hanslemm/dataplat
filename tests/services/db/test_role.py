@@ -4,11 +4,22 @@ import pytest
 
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role import (
+    DefaultPrivilege,
+    EffectivePrivilege,
+    MembershipEdge,
     RoleAttributes,
+    RoleDescription,
     RoleKind,
     RoleNotFoundError,
     RoleRef,
+    build_closure,
+    describe_role,
     fetch_attributes,
+    fetch_default_privileges,
+    fetch_effective_privileges,
+    fetch_memberships_in,
+    fetch_memberships_out,
+    fetch_owned_objects,
     resolve_role,
 )
 
@@ -63,10 +74,20 @@ def test_resolve_role_redshift_group() -> None:
 
 
 def test_fetch_attributes_postgres() -> None:
-    rows = [(
-        True, False, True, True, True, False, False, -1,
-        None, "2030-01-01 00:00:00+00",
-    )]
+    rows = [
+        (
+            True,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            -1,
+            None,
+            "2030-01-01 00:00:00+00",
+        )
+    ]
     cursor = FakeCursor([rows[0]])
     attrs = fetch_attributes(cursor, "alice", SqlEngine.postgresql)
     assert attrs == RoleAttributes(
@@ -84,7 +105,9 @@ def test_fetch_attributes_postgres() -> None:
 
 
 def test_fetch_attributes_postgres_dispatches_pg_roles() -> None:
-    cursor = FakeCursor([(False, False, False, False, True, False, False, -1, None, None)])
+    cursor = FakeCursor(
+        [(False, False, False, False, True, False, False, -1, None, None)]
+    )
     fetch_attributes(cursor, "svc", SqlEngine.postgresql)
     query_text, params = cursor.queries[0]
     assert "pg_roles" in query_text
@@ -109,16 +132,9 @@ def test_fetch_attributes_redshift() -> None:
     )
 
 
-from dataplat.services.db.role import (
-    MembershipEdge,
-    fetch_memberships_in,
-    fetch_memberships_out,
-)
-
-
 def test_fetch_memberships_out_postgres_recursive() -> None:
     rows = [
-        ("readers",  True, 1, "dbadmin"),
+        ("readers", True, 1, "dbadmin"),
         ("analysts", True, 2, "readers"),
     ]
     cursor = FakeCursor([rows])
@@ -141,13 +157,13 @@ def test_fetch_memberships_out_postgres_query_shape() -> None:
 def test_fetch_memberships_in_postgres_recursive() -> None:
     rows = [
         ("alice", True, 1, "readers"),
-        ("bob",   True, 1, "readers"),
+        ("bob", True, 1, "readers"),
     ]
     cursor = FakeCursor([rows])
     edges = fetch_memberships_in(cursor, 16385, SqlEngine.postgresql)
     assert edges == [
         MembershipEdge(role="alice", inherit=True, depth=1, via="readers"),
-        MembershipEdge(role="bob",   inherit=True, depth=1, via="readers"),
+        MembershipEdge(role="bob", inherit=True, depth=1, via="readers"),
     ]
 
 
@@ -163,17 +179,11 @@ def test_fetch_memberships_redshift_single_level() -> None:
     assert "WITH RECURSIVE" not in query_text
 
 
-from dataplat.services.db.role import (
-    build_closure,
-    fetch_owned_objects,
-)
-
-
 def test_build_closure_includes_self_and_inheriting_ancestors() -> None:
     edges = [
-        MembershipEdge("readers",  True,  1, "alice"),
-        MembershipEdge("analysts", True,  2, "readers"),
-        MembershipEdge("admins",   False, 1, "alice"),  # NOINHERIT
+        MembershipEdge("readers", True, 1, "alice"),
+        MembershipEdge("analysts", True, 2, "readers"),
+        MembershipEdge("admins", False, 1, "alice"),  # NOINHERIT
     ]
     closure = build_closure(self_name="alice", ancestors=edges)
     assert closure == {"alice", "readers", "analysts", "public"}
@@ -184,10 +194,12 @@ def test_build_closure_no_ancestors() -> None:
 
 
 def test_fetch_owned_objects_postgres() -> None:
-    cursor = FakeCursor([
-        [("analytics",), ("staging",)],
-        [("public", "r", 12), ("public", "v", 3), ("analytics", "r", 47)],
-    ])
+    cursor = FakeCursor(
+        [
+            [("analytics",), ("staging",)],
+            [("public", "r", 12), ("public", "v", 3), ("analytics", "r", 47)],
+        ]
+    )
     summary = fetch_owned_objects(cursor, 16384, SqlEngine.postgresql)
     assert summary.schemas == ["analytics", "staging"]
     assert summary.relations_by_schema == {
@@ -197,44 +209,59 @@ def test_fetch_owned_objects_postgres() -> None:
     assert summary.total_relations == 62
 
 
-from dataplat.services.db.role import (
-    EffectivePrivilege,
-    fetch_effective_privileges,
-)
-
-
 def test_fetch_effective_privileges_postgres_groups_by_scope() -> None:
-    cursor = FakeCursor([
-        # schemas
-        [("analytics", "USAGE",  "dbadmin", "alice", False)],
-        # relations
+    cursor = FakeCursor(
         [
-            ("public", "users",  "table", "SELECT", "dbadmin", "readers", False),
-            ("public", "orders", "table", "INSERT", "dbadmin", "alice",   False),
-        ],
-        # sequences
-        [("public", "orders_id_seq", "USAGE", "dbadmin", "alice", False)],
-        # functions
-        [("public", "to_cents(numeric)", "EXECUTE", "dbadmin", "public", False)],
-    ])
+            # schemas
+            [("analytics", "USAGE", "dbadmin", "alice", False)],
+            # relations
+            [
+                ("public", "users", "table", "SELECT", "dbadmin", "readers", False),
+                ("public", "orders", "table", "INSERT", "dbadmin", "alice", False),
+            ],
+            # sequences
+            [("public", "orders_id_seq", "USAGE", "dbadmin", "alice", False)],
+            # functions
+            [("public", "to_cents(numeric)", "EXECUTE", "dbadmin", "public", False)],
+        ]
+    )
     closure = {"alice", "readers", "public"}
     rows = fetch_effective_privileges(
         cursor, closure=closure, engine=SqlEngine.postgresql
     )
-    assert [r.scope for r in rows] == ["schema", "relation", "relation", "sequence", "function"]
+    assert [r.scope for r in rows] == [
+        "schema",
+        "relation",
+        "relation",
+        "sequence",
+        "function",
+    ]
     assert rows[0] == EffectivePrivilege(
-        scope="schema", qualified_name="analytics", kind="schema",
-        privilege="USAGE", grantor="dbadmin", via="alice", grantable=False,
+        scope="schema",
+        qualified_name="analytics",
+        kind="schema",
+        privilege="USAGE",
+        grantor="dbadmin",
+        via="alice",
+        grantable=False,
     )
     assert rows[3] == EffectivePrivilege(
-        scope="sequence", qualified_name="public.orders_id_seq",
-        kind="sequence", privilege="USAGE",
-        grantor="dbadmin", via="alice", grantable=False,
+        scope="sequence",
+        qualified_name="public.orders_id_seq",
+        kind="sequence",
+        privilege="USAGE",
+        grantor="dbadmin",
+        via="alice",
+        grantable=False,
     )
     assert rows[4] == EffectivePrivilege(
-        scope="function", qualified_name="public.to_cents(numeric)",
-        kind="function", privilege="EXECUTE",
-        grantor="dbadmin", via="public", grantable=False,
+        scope="function",
+        qualified_name="public.to_cents(numeric)",
+        kind="function",
+        privilege="EXECUTE",
+        grantor="dbadmin",
+        via="public",
+        grantable=False,
     )
 
 
@@ -288,17 +315,23 @@ def test_redshift_rbac_probe_releases_savepoint_on_success() -> None:
 def test_fetch_effective_privileges_redshift_rbac_uses_svv() -> None:
     # FakeCursor returns [] on fetchall after the probe (no rows), so
     # _redshift_rbac_available returns True. Queue rows for the SVV queries.
-    cursor = FakeCursor([
-        [],  # probe fetchall
-        # svv_schema_privileges
-        [("analytics", "USAGE", "etl", False),
-         ("public",    "USAGE", "public", False)],
-        # svv_relation_privileges
-        [("public", "users",  "table", "SELECT", "readers", False),
-         ("public", "orders", "table", "INSERT", "etl",     False)],
-        # svv_function_privileges
-        [("public", "to_cents(numeric)", "EXECUTE", "public", False)],
-    ])
+    cursor = FakeCursor(
+        [
+            [],  # probe fetchall
+            # svv_schema_privileges
+            [
+                ("analytics", "USAGE", "etl", False),
+                ("public", "USAGE", "public", False),
+            ],
+            # svv_relation_privileges
+            [
+                ("public", "users", "table", "SELECT", "readers", False),
+                ("public", "orders", "table", "INSERT", "etl", False),
+            ],
+            # svv_function_privileges
+            [("public", "to_cents(numeric)", "EXECUTE", "public", False)],
+        ]
+    )
     rows = fetch_effective_privileges(
         cursor, closure={"etl", "readers", "public"}, engine=SqlEngine.redshift
     )
@@ -317,25 +350,27 @@ def test_fetch_effective_privileges_redshift_rbac_uses_svv() -> None:
 def test_fetch_effective_privileges_redshift_info_schema_fallback() -> None:
     """When svv_* views are unavailable, relations + functions resolve via
     information_schema (one query each, no probing). Schemas still probe."""
-    cursor = FakeCursorNoRBAC([
-        # information_schema.table_privileges result
+    cursor = FakeCursorNoRBAC(
         [
-            ("public", "users",  "SELECT", "etl", "NO"),
-            ("public", "orders", "SELECT", "etl", "NO"),
-            ("public", "orders", "INSERT", "etl", "NO"),
-        ],
-        # information_schema.routine_privileges result
-        [],
-        # candidate schemas for the schema-probe tail
-        [("analytics",), ("public",)],
-        # schema probe union result
-        [
-            ("etl", "analytics", "USAGE",  True),
-            ("etl", "analytics", "CREATE", False),
-            ("etl", "public",    "USAGE",  True),
-            ("etl", "public",    "CREATE", False),
-        ],
-    ])
+            # information_schema.table_privileges result
+            [
+                ("public", "users", "SELECT", "etl", "NO"),
+                ("public", "orders", "SELECT", "etl", "NO"),
+                ("public", "orders", "INSERT", "etl", "NO"),
+            ],
+            # information_schema.routine_privileges result
+            [],
+            # candidate schemas for the schema-probe tail
+            [("analytics",), ("public",)],
+            # schema probe union result
+            [
+                ("etl", "analytics", "USAGE", True),
+                ("etl", "analytics", "CREATE", False),
+                ("etl", "public", "USAGE", True),
+                ("etl", "public", "CREATE", False),
+            ],
+        ]
+    )
     rows = fetch_effective_privileges(
         cursor, closure={"etl", "public"}, engine=SqlEngine.redshift
     )
@@ -360,16 +395,10 @@ def test_fetch_effective_privileges_redshift_info_schema_fallback() -> None:
     ]
 
 
-from dataplat.services.db.role import (
-    DefaultPrivilege,
-    fetch_default_privileges,
-)
-
-
 def test_fetch_default_privileges_postgres() -> None:
     rows = [
-        ("dbadmin", "public",     "r", "SELECT", "readers",   False),
-        ("dbadmin", "analytics",  "S", "USAGE",  "analysts",  False),
+        ("dbadmin", "public", "r", "SELECT", "readers", False),
+        ("dbadmin", "analytics", "S", "USAGE", "analysts", False),
     ]
     cursor = FakeCursor([rows])
     defs = fetch_default_privileges(
@@ -377,44 +406,50 @@ def test_fetch_default_privileges_postgres() -> None:
     )
     assert defs == [
         DefaultPrivilege(
-            owner="dbadmin", schema="public", object_type="table",
-            privilege="SELECT", via="readers", grantable=False,
+            owner="dbadmin",
+            schema="public",
+            object_type="table",
+            privilege="SELECT",
+            via="readers",
+            grantable=False,
         ),
         DefaultPrivilege(
-            owner="dbadmin", schema="analytics", object_type="sequence",
-            privilege="USAGE", via="analysts", grantable=False,
+            owner="dbadmin",
+            schema="analytics",
+            object_type="sequence",
+            privilege="USAGE",
+            via="analysts",
+            grantable=False,
         ),
     ]
 
 
-from dataplat.services.db.role import (
-    RoleDescription,
-    describe_role,
-)
-
-
 def test_describe_role_postgres_composes_sections() -> None:
-    cursor = FakeCursor([
-        # resolve_role: pg_roles
-        (16384, True, False),
-        # attributes
-        (True, False, True, True, True, False, False, -1, False, None),
-        # memberships out (recursive)
-        [("readers", True, 1, "alice")],
-        # memberships in
-        [],
-        # owned schemas, owned relations
-        [("scratch",)],
-        [("scratch", "r", 2)],
-        # effective privileges: schemas, relations, sequences, functions
-        [("public", "USAGE", "dbadmin", "alice", False)],
-        [],
-        [],
-        [],
-        # default privileges
-        [],
-    ])
-    desc = describe_role(cursor, "alice", engine=SqlEngine.postgresql, direct_only=False)
+    cursor = FakeCursor(
+        [
+            # resolve_role: pg_roles
+            (16384, True, False),
+            # attributes
+            (True, False, True, True, True, False, False, -1, False, None),
+            # memberships out (recursive)
+            [("readers", True, 1, "alice")],
+            # memberships in
+            [],
+            # owned schemas, owned relations
+            [("scratch",)],
+            [("scratch", "r", 2)],
+            # effective privileges: schemas, relations, sequences, functions
+            [("public", "USAGE", "dbadmin", "alice", False)],
+            [],
+            [],
+            [],
+            # default privileges
+            [],
+        ]
+    )
+    desc = describe_role(
+        cursor, "alice", engine=SqlEngine.postgresql, direct_only=False
+    )
     assert isinstance(desc, RoleDescription)
     assert desc.ref.name == "alice"
     assert desc.attributes.can_login is True
@@ -429,19 +464,21 @@ def test_describe_role_postgres_composes_sections() -> None:
 
 
 def test_describe_role_direct_only_excludes_ancestors() -> None:
-    cursor = FakeCursor([
-        (16384, True, False),
-        (True, False, True, True, True, False, False, -1, False, None),
-        [("readers", True, 1, "alice")],
-        [],
-        [],
-        [],
-        [],  # schemas
-        [],  # relations
-        [],  # sequences
-        [],  # functions
-        [],  # defaults
-    ])
+    cursor = FakeCursor(
+        [
+            (16384, True, False),
+            (True, False, True, True, True, False, False, -1, False, None),
+            [("readers", True, 1, "alice")],
+            [],
+            [],
+            [],
+            [],  # schemas
+            [],  # relations
+            [],  # sequences
+            [],  # functions
+            [],  # defaults
+        ]
+    )
     desc = describe_role(cursor, "alice", engine=SqlEngine.postgresql, direct_only=True)
     assert desc.closure == {"alice", "public"}
 
@@ -455,11 +492,13 @@ def test_fetch_effective_privileges_redshift_probe_cap_raises() -> None:
 
     # 1 role × 15000 schemas × 2 privs = 30k probes — over the 20k cap.
     schemas = [(f"ns_{i}",) for i in range(15000)]
-    cursor = FakeCursorNoRBAC([
-        [],       # information_schema.table_privileges — no rows
-        [],       # information_schema.routine_privileges — no rows
-        schemas,  # candidate schemas (too many to probe safely)
-    ])
+    cursor = FakeCursorNoRBAC(
+        [
+            [],  # information_schema.table_privileges — no rows
+            [],  # information_schema.routine_privileges — no rows
+            schemas,  # candidate schemas (too many to probe safely)
+        ]
+    )
     with pytest.raises(RedshiftProbeLimitError, match="schema-privilege probes"):
         fetch_effective_privileges(
             cursor, closure={"etl", "public"}, engine=SqlEngine.redshift

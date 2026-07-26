@@ -28,7 +28,8 @@ def list_connections(client: httpx.Client, base_url: str, limit: int = 100):
         except httpx.HTTPStatusError as exc:
             snippet = (response.text or "").strip()[:500]
             raise ServiceError(
-                f"Failed to list connections (status={response.status_code}, body={snippet})"
+                "Failed to list connections "
+                f"(status={response.status_code}, body={snippet})"
             ) from exc
 
         content_type = response.headers.get("content-type", "").lower()
@@ -116,7 +117,8 @@ def patch_connection(
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to update connection (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to update connection "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -197,7 +199,8 @@ def get_connection_state(
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to get connection state (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to get connection state "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -220,7 +223,8 @@ def update_connection_state(
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to update connection state (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to update connection state "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -237,7 +241,8 @@ def trigger_sync_job(client: httpx.Client, base_url: str, connection_id: str) ->
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to trigger sync job (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to trigger sync job "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -250,7 +255,8 @@ def get_job(client: httpx.Client, base_url: str, job_id: str) -> dict:
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to get job status (status={response.status_code}, body={snippet or 'empty'})"
+            "Failed to get job status "
+            f"(status={response.status_code}, body={snippet or 'empty'})"
         ) from exc
     return response.json()
 
@@ -266,7 +272,10 @@ def create_connection(
     status: str | None = None,
     configurations: dict | None = None,
 ) -> dict:
-    """POST /api/public/v1/connections with payload: {sourceId, destinationId, ...optional fields}"""
+    """POST /api/public/v1/connections.
+
+    Payload: {sourceId, destinationId, ...optional fields}
+    """
     payload: dict = {"sourceId": source_id, "destinationId": destination_id}
     if name is not None:
         payload["name"] = name
@@ -288,7 +297,8 @@ def create_connection(
     except httpx.HTTPStatusError as exc:
         snippet = (response.text or "").strip()[:500]
         raise ServiceError(
-            f"Failed to create connection (status={response.status_code}, body={snippet})"
+            "Failed to create connection "
+            f"(status={response.status_code}, body={snippet})"
         ) from exc
     return response.json()
 
@@ -302,5 +312,6 @@ def delete_connection(client: httpx.Client, base_url: str, connection_id: str) -
         except httpx.HTTPStatusError as exc:
             snippet = (response.text or "").strip()[:500]
             raise ServiceError(
-                f"Failed to delete connection (status={response.status_code}, body={snippet})"
+                "Failed to delete connection "
+                f"(status={response.status_code}, body={snippet})"
             ) from exc
