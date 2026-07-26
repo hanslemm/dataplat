@@ -13,7 +13,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-from dataplat.core.deps import AREAS, AreaDeps
+from dataplat.core.deps import AREAS, AreaDeps, ready
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,38 @@ BUILTIN_AREAS: tuple[AreaMount, ...] = (
 def all_areas() -> tuple[AreaMount, ...]:
     """Every mountable area, in display order."""
     return BUILTIN_AREAS
+
+
+def area_by_name(name: str) -> AreaMount | None:
+    """The mount registered as ``name``, or ``None`` if nothing claims it.
+
+    Scanned instead of indexed in a module-level dict: the CLI resolves a name
+    once per invocation, and a plugin mechanism that makes :func:`all_areas`
+    grow would leave a prebuilt index stale.
+    """
+    return next((mount for mount in all_areas() if mount.name == name), None)
+
+
+def missing_extra_help(help_text: str, spec: AreaDeps) -> str:
+    """``help_text`` plus the extra an area is waiting on.
+
+    One template, two renderers: the root command lists the area this way while
+    it is still a placeholder, and the stub that eventually explains the missing
+    extra shows the same line as its own help.
+    """
+    return f"{help_text} (needs extra: {spec.extra})"
+
+
+def mount_help(mount: AreaMount) -> str:
+    """``mount``'s help line, flagging an area whose extra is not installed.
+
+    The root command lists areas without importing them, so the hint has to be
+    answerable from the mount alone — hence ``mount.deps`` rather than a lookup
+    in the ``AREAS`` global, which a third-party mount is not in.
+    """
+    if mount.deps is None or ready(mount.deps):
+        return mount.help_text
+    return missing_extra_help(mount.help_text, mount.deps)
 
 
 def load_app(mount: AreaMount) -> Any:
