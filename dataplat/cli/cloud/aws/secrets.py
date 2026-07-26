@@ -11,8 +11,19 @@ from botocore.exceptions import ClientError
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
-from dataplat.cli.cloud.aws._common import default_profile, default_region
+from dataplat.cli._options import JsonOption, YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
+from dataplat.cli.cloud.aws._common import (
+    default_region,
+    effective_profile,
+    profile_aliases,
+    profile_option,
+    region_option,
+    resolve_profiles,
+)
 from dataplat.core.errors import AuthError
 from dataplat.services.aws.auth import get_client
 
@@ -24,113 +35,70 @@ app = typer.Typer(
 
 console = Console()
 
-# ── environment aliases ─────────────────────────────────────────────────────
-def _profile_aliases() -> dict[str, str]:
-    """Short profile aliases from ``DP_AWS_PROFILE_ALIASES``.
-
-    Format: ``alias=ProfileName,alias2=OtherProfile`` — e.g.
-    ``prod=AdminAccess-Prod,qa=AdminAccess-QA``.
-    """
-    aliases: dict[str, str] = {}
-    for chunk in os.getenv("DP_AWS_PROFILE_ALIASES", "").split(","):
-        alias, sep, full = chunk.partition("=")
-        if sep and alias.strip() and full.strip():
-            aliases[alias.strip()] = full.strip()
-    return aliases
-
-
-def _resolve_profile(name: str) -> str:
-    """Resolve a short alias to the full AWS profile name."""
-    return _profile_aliases().get(name, name)
-
-
-def _resolve_profiles(profiles: list[str]) -> list[str]:
-    """Resolve a list of profile names / aliases, expanding the special 'all' keyword."""
-    resolved: list[str] = []
-    for p in profiles:
-        if p == "all":
-            resolved.extend(_profile_aliases().values())
-        else:
-            resolved.append(_resolve_profile(p))
-    # deduplicate while preserving order
-    seen: set[str] = set()
-    return [p for p in resolved if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
+# Alias resolution lives in _common so `-p prod` means the same thing for rds,
+# redshift and secrets. The private spelling stays: this module's call sites —
+# and the tests that patch them — address it as a local seam.
+_resolve_profiles = resolve_profiles
 
 
 def _get_client(profile: str | None = None, region: str | None = None):
     """Return a boto3 Secrets Manager client, triggering SSO login if needed."""
-    resolved = _resolve_profile(profile) if profile else default_profile()
+    resolved = effective_profile(profile)
     try:
         return get_client(
             service_name="secretsmanager",
             profile=resolved,
             region=region or default_region(),
-            notify=lambda msg: console.print(f"[yellow]{msg}[/yellow]"),
+            notify=lambda msg: console.print(f"[yellow]{esc(msg)}[/yellow]"),
         )
     except AuthError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
 
 def _get_sts_client(profile: str | None = None, region: str | None = None):
     """Return a boto3 STS client, triggering SSO login if needed."""
-    resolved = _resolve_profile(profile) if profile else default_profile()
+    resolved = effective_profile(profile)
     try:
         return get_client(
             service_name="sts",
             profile=resolved,
             region=region or default_region(),
-            notify=lambda msg: console.print(f"[yellow]{msg}[/yellow]"),
+            notify=lambda msg: console.print(f"[yellow]{esc(msg)}[/yellow]"),
         )
     except AuthError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
 
 # ── shared options ──────────────────────────────────────────────────────────
-ProfileOption = typer.Option(
-    None,
-    "--profile",
-    "-p",
-    help="AWS profile name or alias (see DP_AWS_PROFILE_ALIASES). "
-    "Defaults to DP_AWS_PROFILE.",
-)
-RegionOption = typer.Option(
-    None,
-    "--region",
-    "-r",
-    help="AWS region. Defaults to DP_AWS_REGION/AWS_REGION or the profile's region.",
-)
-JsonOption = typer.Option(False, "--json", help="Emit JSON instead of a table.")
-YesOption = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt.")
+ProfileOption = profile_option()
+RegionOption = region_option()
 
 
 def _alias_for(profile: str) -> str:
     """Return the short alias for a full profile name, or the name itself."""
-    return next((a for a, p in _profile_aliases().items() if p == profile), profile)
+    return next((a for a, p in profile_aliases().items() if p == profile), profile)
 
 
 def _confirm_or_abort(summary: str, yes: bool) -> None:
-    """Require confirmation before a write. Non-interactive runs need --yes."""
-    if yes:
-        return
-    console.print(summary)
-    if sys.stdin.isatty():
-        if typer.confirm("Proceed?", default=False):
-            return
-        console.print("[yellow]Aborted.[/yellow]")
-        raise typer.Exit(code=1)
-    console.print(
-        "[red]Error: refusing to write without confirmation. "
-        "Pass --yes/-y in non-interactive contexts.[/red]"
-    )
-    raise typer.Exit(code=1)
+    """Require confirmation before a write. Non-interactive runs need --yes.
+
+    ``summary`` is markup: escape any interpolated secret name, key or alias.
+    """
+    confirm_or_exit(summary, yes=yes, console=console)
 
 
 def _confirm_write(action: str, name: str, profs: list[str], yes: bool) -> None:
+    """Confirm ``action`` on ``name`` in every targeted profile.
+
+    ``action`` is plain text — callers build it from key names, which is why it
+    is escaped here rather than trusted.
+    """
     aliases = ", ".join(_alias_for(p) for p in profs)
     _confirm_or_abort(
-        f"[bold]{action}[/bold] [cyan]{name}[/cyan] in: [yellow]{aliases}[/yellow]",
+        f"[bold]{esc(action)}[/bold] [cyan]{esc(name)}[/cyan] in: "
+        f"[yellow]{esc(aliases)}[/yellow]",
         yes,
     )
 
@@ -138,7 +106,7 @@ def _confirm_write(action: str, name: str, profs: list[str], yes: bool) -> None:
 def _client_error_exit(action: str, exc: ClientError) -> None:
     code = exc.response.get("Error", {}).get("Code", "ClientError")
     msg = exc.response.get("Error", {}).get("Message", str(exc))
-    console.print(f"[red]{code} on {action}: {msg}[/red]")
+    console.print(f"[red]{esc(code)} on {action}: {esc(msg)}[/red]")
     raise typer.Exit(code=1)
 
 
@@ -193,7 +161,11 @@ def list_secrets(
     table.add_column("Description")
     table.add_column("Last Changed", style="dim")
     for entry in entries:
-        table.add_row(entry["name"], entry["description"], entry["last_changed"])
+        table.add_row(
+            cell(entry["name"]),
+            cell(entry["description"]),
+            cell(entry["last_changed"]),
+        )
 
     console.print(table)
     console.print(f"\n[dim]{len(entries)} secret(s) found[/dim]")
@@ -217,7 +189,7 @@ def get_secret(
     try:
         resp = client.get_secret_value(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("get_secret_value", exc)
@@ -231,7 +203,7 @@ def get_secret(
             console.print("[red]Secret is not valid JSON — cannot extract key[/red]")
             raise typer.Exit(code=1)
         if key not in data:
-            console.print(f"[red]Key '{key}' not found in secret[/red]")
+            console.print(f"[red]Key '{esc(key)}' not found in secret[/red]")
             raise typer.Exit(code=1)
         value = str(data[key])
 
@@ -243,9 +215,13 @@ def get_secret(
     try:
         parsed = json.loads(value)
         formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
+        # Syntax renders its source literally; escaping here would show the
+        # backslashes as part of the secret.
         console.print(Syntax(formatted, "json", theme="monokai"))
     except json.JSONDecodeError:
-        console.print(value)
+        # A secret value is the most hostile string in the codebase: printing it
+        # as markup drops [bold] silently and crashes on [/anything].
+        console.print(cell(value))
 
 
 @app.command("compare")
@@ -281,11 +257,12 @@ def compare_secret(
                 env_data[alias] = json.loads(raw)
             except json.JSONDecodeError:
                 console.print(
-                    f"[yellow]\\[{alias}] Secret is not JSON — showing raw value[/yellow]"
+                    f"[yellow]\\[{esc(alias)}] Secret is not JSON — "
+                    "showing raw value[/yellow]"
                 )
                 env_data[alias] = {"<raw>": raw}
         except client.exceptions.ResourceNotFoundException:
-            console.print(f"[yellow]\\[{alias}] Secret not found[/yellow]")
+            console.print(f"[yellow]\\[{esc(alias)}] Secret not found[/yellow]")
             env_data[alias] = None
         except ClientError as exc:
             _client_error_exit("get_secret_value", exc)
@@ -306,29 +283,32 @@ def compare_secret(
 
     aliases = list(env_data.keys())
 
-    table = Table(title=f"Secret: {name}")
+    table = Table(title=f"Secret: {esc(name)}")
     table.add_column("Key", style="cyan bold")
     for alias in aliases:
-        table.add_column(alias, overflow="fold")
+        # The alias comes from DP_AWS_PROFILE_ALIASES, so even the header is
+        # data we did not author.
+        table.add_column(cell(alias), overflow="fold")
 
     for k in all_keys:
-        row_values: list[str] = []
         vals_for_diff: list[str | None] = []
         for alias in aliases:
             data = env_data[alias]
-            val = str(data[k]) if data is not None and k in data else None
-            vals_for_diff.append(val)
-            row_values.append(val if val is not None else "[dim]null[/dim]")
+            vals_for_diff.append(
+                str(data[k]) if data is not None and k in data else None
+            )
 
         # highlight differences across environments
-        unique = set(v for v in vals_for_diff if v is not None)
-        if len(unique) > 1:
-            # values differ — colour them
-            row_values = [
-                f"[red]{v}[/red]" if v != "[dim]null[/dim]" else v for v in row_values
-            ]
+        unique = {v for v in vals_for_diff if v is not None}
+        differs = len(unique) > 1
+        row_values = [
+            Text("null", style="dim")
+            if val is None
+            else cell(val, style="red" if differs else "")
+            for val in vals_for_diff
+        ]
 
-        table.add_row(k, *row_values)
+        table.add_row(cell(k), *row_values)
 
     console.print(table)
 
@@ -397,7 +377,7 @@ def set_secret(
             with open(path) as fh:
                 secret_value = fh.read()
         except OSError as exc:
-            console.print(f"[red]Cannot read file: {exc}[/red]")
+            console.print(f"[red]Cannot read file: {esc(exc)}[/red]")
             raise typer.Exit(code=1)
     elif from_json:
         try:
@@ -419,17 +399,24 @@ def set_secret(
             client.put_secret_value(SecretId=name, SecretString=secret_value)
             if description is not None:
                 client.update_secret(SecretId=name, Description=description)
-            console.print(f"[green]\\[{alias}] Updated secret:[/green] {name}")
+            console.print(
+                f"[green]\\[{esc(alias)}] Updated secret:[/green] {esc(name)}"
+            )
         except client.exceptions.ResourceNotFoundException:
             kwargs: dict = {"Name": name, "SecretString": secret_value}
             if description is not None:
                 kwargs["Description"] = description
             client.create_secret(**kwargs)
-            console.print(f"[green]\\[{alias}] Created secret:[/green] {name}")
+            console.print(
+                f"[green]\\[{esc(alias)}] Created secret:[/green] {esc(name)}"
+            )
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "ClientError")
             msg = exc.response.get("Error", {}).get("Message", str(exc))
-            console.print(f"[red]\\[{alias}] {code} on put_secret_value: {msg}[/red]")
+            console.print(
+                f"[red]\\[{esc(alias)}] {esc(code)} on put_secret_value: "
+                f"{esc(msg)}[/red]"
+            )
 
 
 @app.command("edit")
@@ -452,7 +439,8 @@ def edit_secret(
         "--from-file",
         "-f",
         help="Path to a JSON file whose keys will be merged into the secret "
-        "(new keys are added, existing keys are overwritten, untouched keys preserved).",
+        "(new keys are added, existing keys are overwritten, untouched keys "
+        "preserved).",
     ),
     profiles: list[str] = typer.Option(
         ["prod"],
@@ -481,9 +469,7 @@ def edit_secret(
         value = _read_stdin_value()
     using_pair = key is not None or value is not None
     if using_pair and from_file is not None:
-        console.print(
-            "[red]Use either --key/--value or --from-file, not both[/red]"
-        )
+        console.print("[red]Use either --key/--value or --from-file, not both[/red]")
         raise typer.Exit(code=1)
     if from_file is None:
         if key is None or value is None:
@@ -498,21 +484,21 @@ def edit_secret(
             with open(path) as fh:
                 raw_patch = fh.read()
         except OSError as exc:
-            console.print(f"[red]Cannot read file: {exc}[/red]")
+            console.print(f"[red]Cannot read file: {esc(exc)}[/red]")
             raise typer.Exit(code=1)
         try:
             patch = json.loads(raw_patch)
         except json.JSONDecodeError as exc:
-            console.print(f"[red]File is not valid JSON: {exc}[/red]")
+            console.print(f"[red]File is not valid JSON: {esc(exc)}[/red]")
             raise typer.Exit(code=1)
         if not isinstance(patch, dict):
-            console.print("[red]JSON file must contain an object at the top level[/red]")
+            console.print(
+                "[red]JSON file must contain an object at the top level[/red]"
+            )
             raise typer.Exit(code=1)
 
     resolved = _resolve_profiles(profiles)
-    _confirm_write(
-        f"Edit key(s) {', '.join(patch)} in secret", name, resolved, yes
-    )
+    _confirm_write(f"Edit key(s) {', '.join(patch)} in secret", name, resolved, yes)
 
     for prof in resolved:
         alias = _alias_for(prof)
@@ -520,29 +506,31 @@ def edit_secret(
         try:
             ident = sts.get_caller_identity()
             console.print(
-                f"[dim]\\[{alias}] Authenticated as {ident.get('Arn')} "
-                f"(account {ident.get('Account')})[/dim]"
+                f"[dim]\\[{esc(alias)}] Authenticated as {esc(ident.get('Arn'))} "
+                f"(account {esc(ident.get('Account'))})[/dim]"
             )
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "ClientError")
             msg = exc.response.get("Error", {}).get("Message", str(exc))
             console.print(
-                f"[red]\\[{alias}] {code} on get_caller_identity: {msg}[/red]"
+                f"[red]\\[{esc(alias)}] {esc(code)} on get_caller_identity: "
+                f"{esc(msg)}[/red]"
             )
             continue
-        console.print(f"[dim]\\[{alias}] Fetching {name} …[/dim]")
+        console.print(f"[dim]\\[{esc(alias)}] Fetching {esc(name)} …[/dim]")
         client = _get_client(prof, region)
 
         try:
             resp = client.get_secret_value(SecretId=name)
         except client.exceptions.ResourceNotFoundException:
-            console.print(f"[red]\\[{alias}] Secret not found: {name}[/red]")
+            console.print(f"[red]\\[{esc(alias)}] Secret not found: {esc(name)}[/red]")
             continue
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "ClientError")
             msg = exc.response.get("Error", {}).get("Message", str(exc))
             console.print(
-                f"[red]\\[{alias}] {code} on get_secret_value: {msg}[/red]"
+                f"[red]\\[{esc(alias)}] {esc(code)} on get_secret_value: "
+                f"{esc(msg)}[/red]"
             )
             continue
 
@@ -551,7 +539,8 @@ def edit_secret(
             data = json.loads(raw)
         except json.JSONDecodeError:
             console.print(
-                f"[red]\\[{alias}] Existing secret is not valid JSON — cannot edit key[/red]"
+                f"[red]\\[{esc(alias)}] Existing secret is not valid JSON — "
+                "cannot edit key[/red]"
             )
             continue
 
@@ -568,7 +557,8 @@ def edit_secret(
 
         if not added and not updated:
             console.print(
-                f"[yellow]\\[{alias}] No changes for[/yellow] [cyan]{name}[/cyan]"
+                f"[yellow]\\[{esc(alias)}] No changes for[/yellow] "
+                f"[cyan]{esc(name)}[/cyan]"
             )
             continue
 
@@ -578,18 +568,19 @@ def edit_secret(
             code = exc.response.get("Error", {}).get("Code", "ClientError")
             msg = exc.response.get("Error", {}).get("Message", str(exc))
             console.print(
-                f"[red]\\[{alias}] {code} on put_secret_value: {msg}[/red]"
+                f"[red]\\[{esc(alias)}] {esc(code)} on put_secret_value: "
+                f"{esc(msg)}[/red]"
             )
             continue
         console.print(
-            f"[green]\\[{alias}] Updated[/green] [cyan]{name}[/cyan]  "
+            f"[green]\\[{esc(alias)}] Updated[/green] [cyan]{esc(name)}[/cyan]  "
             f"({len(added)} added, {len(updated)} changed)"
         )
         # Values are masked: terminal scrollback and CI logs must not hold secrets.
         for k, _v in added:
-            console.print(f"  + [bold]{k}[/bold]")
+            console.print(f"  + [bold]{esc(k)}[/bold]")
         for k, _old, _v in updated:
-            console.print(f"  ~ [bold]{k}[/bold] (changed)")
+            console.print(f"  ~ [bold]{esc(k)}[/bold] (changed)")
 
 
 @app.command("rename-key")
@@ -610,7 +601,8 @@ def rename_key(
 
     Pass --profile multiple times (or 'all') to target several accounts:
 
-        dp cloud aws secrets rename-key my/secret --old-key user --new-key username -p all
+        dp cloud aws secrets rename-key my/secret \\
+            --old-key user --new-key username -p all
     """
     resolved = _resolve_profiles(profiles)
     _confirm_write(
@@ -624,7 +616,7 @@ def rename_key(
         try:
             resp = client.get_secret_value(SecretId=name)
         except client.exceptions.ResourceNotFoundException:
-            console.print(f"[red]\\[{alias}] Secret not found: {name}[/red]")
+            console.print(f"[red]\\[{esc(alias)}] Secret not found: {esc(name)}[/red]")
             continue
 
         raw = resp.get("SecretString", "{}")
@@ -632,17 +624,21 @@ def rename_key(
             data = json.loads(raw)
         except json.JSONDecodeError:
             console.print(
-                f"[red]\\[{alias}] Existing secret is not valid JSON — cannot rename key[/red]"
+                f"[red]\\[{esc(alias)}] Existing secret is not valid JSON — "
+                "cannot rename key[/red]"
             )
             continue
 
         if old_key not in data:
-            console.print(f"[red]\\[{alias}] Key '{old_key}' not found in secret[/red]")
+            console.print(
+                f"[red]\\[{esc(alias)}] Key '{esc(old_key)}' not found in secret[/red]"
+            )
             continue
 
         if new_key in data:
             console.print(
-                f"[red]\\[{alias}] Key '{new_key}' already exists in secret — aborting to avoid data loss[/red]"
+                f"[red]\\[{esc(alias)}] Key '{esc(new_key)}' already exists in "
+                "secret — aborting to avoid data loss[/red]"
             )
             continue
 
@@ -652,8 +648,10 @@ def rename_key(
             renamed[new_key if k == old_key else k] = v
 
         client.put_secret_value(SecretId=name, SecretString=json.dumps(renamed))
-        console.print(f"[green]\\[{alias}] Renamed key[/green] in [cyan]{name}[/cyan]")
-        console.print(f"  '{old_key}' → '{new_key}'")
+        console.print(
+            f"[green]\\[{esc(alias)}] Renamed key[/green] in [cyan]{esc(name)}[/cyan]"
+        )
+        console.print(f"  '{esc(old_key)}' → '{esc(new_key)}'")
 
 
 @app.command("delete")
@@ -665,12 +663,12 @@ def delete_secret(
     yes: bool = YesOption,
 ) -> None:
     """Schedule a secret for deletion (or force-delete immediately)."""
-    resolved_profile = _resolve_profile(profile) if profile else default_profile()
+    resolved_profile = effective_profile(profile)
     if force:
         _confirm_or_abort(
-            f"[bold red]PERMANENTLY delete[/bold red] [cyan]{name}[/cyan] in "
-            f"[yellow]{_alias_for(resolved_profile)}[/yellow] — no recovery window, "
-            "cannot be restored.",
+            f"[bold red]PERMANENTLY delete[/bold red] [cyan]{esc(name)}[/cyan] in "
+            f"[yellow]{esc(_alias_for(resolved_profile))}[/yellow] — no recovery "
+            "window, cannot be restored.",
             yes,
         )
     else:
@@ -692,19 +690,20 @@ def delete_secret(
     try:
         client.delete_secret(**kwargs)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("delete_secret", exc)
 
     if force:
-        console.print(f"[yellow]Permanently deleted:[/yellow] {name}")
+        console.print(f"[yellow]Permanently deleted:[/yellow] {esc(name)}")
     else:
         console.print(
-            f"[yellow]Scheduled for deletion (30-day recovery window):[/yellow] {name}"
+            "[yellow]Scheduled for deletion (30-day recovery window):[/yellow] "
+            f"{esc(name)}"
         )
         console.print(
-            "[dim]Cancel with: dp cloud aws secrets restore " + name + "[/dim]"
+            f"[dim]Cancel with: dp cloud aws secrets restore {esc(name)}[/dim]"
         )
 
 
@@ -719,11 +718,11 @@ def restore_secret(
     try:
         client.restore_secret(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("restore_secret", exc)
-    console.print(f"[green]Restored (deletion cancelled):[/green] {name}")
+    console.print(f"[green]Restored (deletion cancelled):[/green] {esc(name)}")
 
 
 @app.command("describe")
@@ -738,7 +737,7 @@ def describe_secret(
     try:
         resp = client.describe_secret(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("describe_secret", exc)
@@ -748,7 +747,7 @@ def describe_secret(
         typer.echo(json.dumps(resp, indent=2, default=str))
         return
 
-    table = Table(title=f"Secret: {name}", show_header=False)
+    table = Table(title=f"Secret: {esc(name)}", show_header=False)
     table.add_column("Field", style="cyan", no_wrap=True)
     table.add_column("Value", overflow="fold")
     fields = [
@@ -771,7 +770,7 @@ def describe_secret(
     ]
     for label, val in fields:
         if val not in (None, ""):
-            table.add_row(label, str(val))
+            table.add_row(label, cell(val))
     console.print(table)
 
 
@@ -787,7 +786,7 @@ def list_versions(
     try:
         resp = client.list_secret_version_ids(SecretId=name, IncludeDeprecated=True)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("list_secret_version_ids", exc)
@@ -809,15 +808,15 @@ def list_versions(
         typer.echo(json.dumps(payload, indent=2))
         return
 
-    table = Table(title=f"Versions: {name}")
+    table = Table(title=f"Versions: {esc(name)}")
     table.add_column("Version ID", style="cyan")
     table.add_column("Stages")
     table.add_column("Created", style="dim")
     for v in versions:
         table.add_row(
-            v.get("VersionId", ""),
-            ", ".join(v.get("VersionStages", [])),
-            str(v.get("CreatedDate", "")),
+            cell(v.get("VersionId", "")),
+            cell(", ".join(v.get("VersionStages", []))),
+            cell(v.get("CreatedDate", "")),
         )
     console.print(table)
 
@@ -834,7 +833,7 @@ def rollback_secret(
     try:
         resp = client.list_secret_version_ids(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
-        console.print(f"[red]Secret not found: {name}[/red]")
+        console.print(f"[red]Secret not found: {esc(name)}[/red]")
         raise typer.Exit(code=1)
     except ClientError as exc:
         _client_error_exit("list_secret_version_ids", exc)
@@ -856,8 +855,8 @@ def rollback_secret(
         raise typer.Exit(code=1)
 
     _confirm_or_abort(
-        f"Roll back [cyan]{name}[/cyan]: AWSCURRENT "
-        f"{current_id[:8]}… -> {previous_id[:8]}…",
+        f"Roll back [cyan]{esc(name)}[/cyan]: AWSCURRENT "
+        f"{esc(current_id[:8])}… -> {esc(previous_id[:8])}…",
         yes,
     )
 
@@ -871,5 +870,5 @@ def rollback_secret(
     except ClientError as exc:
         _client_error_exit("update_secret_version_stage", exc)
     console.print(
-        f"[green]Rolled back {name}: AWSCURRENT is now {previous_id}[/green]"
+        f"[green]Rolled back {esc(name)}: AWSCURRENT is now {esc(previous_id)}[/green]"
     )

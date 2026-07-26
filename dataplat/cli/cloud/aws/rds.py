@@ -13,9 +13,12 @@ import typer
 from botocore.exceptions import ClientError
 from rich.console import Console
 
+from dataplat.cli._options import JsonOption
+from dataplat.cli._render import cell, esc
 from dataplat.cli.cloud.aws._common import (
-    JsonOption,
     cli_session,
+    default_region,
+    effective_profile,
     make_table,
     profile_option,
     region_option,
@@ -239,18 +242,15 @@ def metrics(
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         msg = exc.response.get("Error", {}).get("Message", str(exc))
-        console.print(f"[red]{code} on get_metric_data: {msg}[/red]")
+        console.print(f"[red]{esc(code)} on get_metric_data: {esc(msg)}[/red]")
         raise typer.Exit(code=1)
 
     if as_json:
-        payload = [
-            {"metric": name, **(summary or {})}
-            for name, summary in summaries
-        ]
+        payload = [{"metric": name, **(summary or {})} for name, summary in summaries]
         typer.echo(json.dumps(payload, indent=2))
         return
 
-    table = _make_table(f"RDS Metrics — {instance}")
+    table = _make_table(f"RDS Metrics — {esc(instance)}")
     table.add_column("Metric", style="bold cyan", min_width=24)
     table.add_column("Latest", justify="right", min_width=12, style="bright_white")
     table.add_column("Average", justify="right", min_width=12, style="bright_white")
@@ -280,7 +280,7 @@ def metrics(
     console.print(table)
     console.print(
         f"\n[dim]Window: last {hours}h  ·  Period: {period}s  ·  "
-        f"Database: {instance}[/dim]"
+        f"Database: {esc(instance)}[/dim]"
     )
 
 
@@ -334,7 +334,7 @@ def plot(
             key = m.lower().strip()
             if key not in _METRIC_ALIASES:
                 console.print(
-                    f"[red]Unknown metric '{m}'. "
+                    f"[red]Unknown metric '{esc(m)}'. "
                     f"Choose from: {', '.join(_METRIC_ALIASES)}[/red]"
                 )
                 raise typer.Exit(code=1)
@@ -368,7 +368,7 @@ def plot(
                     Unit=unit,
                 )
             except Exception as exc:
-                console.print(f"[red]Error fetching {metric_name}: {exc}[/red]")
+                console.print(f"[red]Error fetching {metric_name}: {esc(exc)}[/red]")
                 continue
 
             datapoints = resp.get("Datapoints", [])
@@ -609,7 +609,7 @@ def plot(
 
     console.print(
         f"\n[dim]Window: last {hours}h  ·  Period: {period}s  ·  "
-        f"Database: {instance}[/dim]"
+        f"Database: {esc(instance)}[/dim]"
     )
 
 
@@ -632,7 +632,7 @@ def list_instances(
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         msg = exc.response.get("Error", {}).get("Message", str(exc))
-        console.print(f"[red]{code} on describe_db_instances: {msg}[/red]")
+        console.print(f"[red]{esc(code)} on describe_db_instances: {esc(msg)}[/red]")
         raise typer.Exit(code=1)
 
     if as_json:
@@ -664,23 +664,21 @@ def list_instances(
 
     for inst in sorted(instances, key=lambda i: i["DBInstanceIdentifier"]):
         status = inst["DBInstanceStatus"]
-        status_styled = (
-            f"[green]{status}[/green]"
-            if status == "available"
-            else f"[yellow]{status}[/yellow]"
-        )
         table.add_row(
-            inst["DBInstanceIdentifier"],
-            inst["DBInstanceClass"],
-            f"{inst['Engine']} {inst.get('EngineVersion', '')}",
-            status_styled,
-            str(inst.get("AllocatedStorage", "—")),
+            cell(inst["DBInstanceIdentifier"]),
+            cell(inst["DBInstanceClass"]),
+            cell(f"{inst['Engine']} {inst.get('EngineVersion', '')}"),
+            cell(status, style="green" if status == "available" else "yellow"),
+            cell(inst.get("AllocatedStorage", "—")),
             "Yes" if inst.get("MultiAZ") else "No",
         )
 
     console.print()
     console.print(table)
+    # Report what the session was actually built with: when --profile is an
+    # alias, the flag holds the shorthand, not the profile boto3 received.
     console.print(
         f"\n[dim]{len(instances)} instance(s)  ·  "
-        f"Profile: {profile}  ·  Region: {region}[/dim]"
+        f"Profile: {esc(effective_profile(profile))}  ·  "
+        f"Region: {esc(region or default_region())}[/dim]"
     )
