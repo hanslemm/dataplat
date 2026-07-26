@@ -49,6 +49,8 @@ dp
 
 ## Installation
 
+Requires Python 3.12 or newer.
+
 ```bash
 uv tool install "dataplat[all]"     # recommended: everything
 # or
@@ -88,6 +90,11 @@ missing, `dp db query ...` shows exactly what it will run, asks, installs,
 and re-runs your original command. Non-interactive sessions never install
 silently — they print the command and exit instead. `dp config doctor`
 also reports per-area dependency status.
+
+Either path only ever *adds* to your install: the command is pinned to the
+`dataplat` version you already run, so installing an extra never upgrades the
+tool underneath you, and it carries your existing extras along, so adding
+`db` cannot drop an `ingest` you already had.
 
 ## Quick start
 
@@ -136,11 +143,21 @@ already set in your shell. Lookup order:
 1. `DP_ENVRC_PATH`
 2. `~/.config/dataplat/.envrc` (the global link — set it with `dp config init`)
 3. `.envrc` in the current directory
+4. the `.envrc` beside a development checkout of dataplat itself
+
+Candidate 3 makes every command sensitive to where you run it: standing in a
+cloned repo points `dp` at whatever host and credentials that repo's `.envrc`
+exports. `dp config show` and `dp config doctor` always name the active file
+*and* which candidate produced it, and warn when it came from the current
+directory. Set `DP_ENVRC_ALLOW_CWD=0` to drop that candidate entirely and
+rely only on the global link you chose.
 
 ## Configuration reference
 
 | Variable | Purpose |
 | --- | --- |
+| `DP_ENVRC_PATH` | Explicit `.envrc` to load, ahead of every other candidate. |
+| `DP_ENVRC_ALLOW_CWD` | Set to `0` to stop picking up `.envrc` from the current directory. |
 | `DP_TARGETS` | Comma-separated DB target names (e.g. `warehouse,lake`). |
 | `DP_DEFAULT_TARGET` | Target used when `--target` is omitted (default: first of `DP_TARGETS`). |
 | `<NAME>_ENGINE` | `postgresql` (default) or `redshift`, per target. |
@@ -268,13 +285,19 @@ cd dataplat
 uv sync --group dev --all-extras
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy dataplat
 ```
 
+CI runs those four across Python 3.12 and 3.13 — the floor the wheel
+advertises as well as the pinned dev version.
+
 ## Releasing
 
-Tag `X.Y.Z` (bare semver, no `v` prefix) on `main`; GitHub Actions builds
-and publishes to PyPI via Trusted Publishing. Commits follow
+Bump `[project].version`, then tag `X.Y.Z` (bare semver, no `v` prefix) on
+`main`. The release workflow refuses to publish unless the tag matches that
+version, and runs the full check matrix first; only then does GitHub Actions
+build and publish to PyPI via Trusted Publishing. Commits follow
 [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## License
