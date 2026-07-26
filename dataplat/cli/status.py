@@ -15,12 +15,20 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from dataplat.cli._options import json_option
+from dataplat.cli._render import esc
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.targets import load_targets
 
 console = Console()
+# Spinners, notices and warnings go here, never to stdout: `dp status --json`
+# must stay a parseable document, and an expired SSO token used to write its
+# "running aws sso login" notice straight into the middle of the payload.
+err_console = Console(stderr=True)
 
-app = typer.Typer(name="status", help="One-shot health overview", invoke_without_command=True)
+app = typer.Typer(
+    name="status", help="One-shot health overview", invoke_without_command=True
+)
 
 _LONG_QUERY_THRESHOLD_S = 60
 
@@ -126,9 +134,13 @@ def _runners_section() -> dict[str, Any]:
     try:
         proc = subprocess.run(
             [
-                "docker", "ps", "-a",
-                "--filter", "name=gha-runner-",
-                "--format", "{{.Names}}\t{{.Status}}",
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=gha-runner-",
+                "--format",
+                "{{.Names}}\t{{.Status}}",
             ],
             capture_output=True,
             text=True,
@@ -177,7 +189,7 @@ def _aws_section() -> dict[str, Any]:
         session = get_session(
             profile=default_profile(),
             region=default_region(),
-            notify=lambda msg: console.print(f"[yellow]{msg}[/yellow]"),
+            notify=lambda msg: err_console.print(f"[yellow]{esc(msg)}[/yellow]"),
         )
         cw = session.client("cloudwatch")
         now = datetime.now(UTC)
@@ -204,9 +216,13 @@ def _print_db(section: dict[str, Any]) -> None:
     console.print("[bold cyan]Databases[/bold cyan]")
     if not section:
         console.print("  [dim]no targets configured (set DP_TARGETS)[/dim]")
+    # Target names come from DP_TARGETS and the errors from psycopg: both are
+    # external, so each is escaped on its own, never the whole markup string.
     for name, info in section.items():
         if not info.get("reachable"):
-            console.print(f"  [red]✗ {name}[/red] [dim]— {info.get('error')}[/dim]")
+            console.print(
+                f"  [red]✗ {esc(name)}[/red] [dim]— {esc(info.get('error'))}[/dim]"
+            )
             continue
         count = info.get("long_running", 0)
         marker = "[yellow]![/yellow]" if count else "[green]✓[/green]"
@@ -215,13 +231,15 @@ def _print_db(section: dict[str, Any]) -> None:
             if count
             else "no long-running queries"
         )
-        console.print(f"  {marker} {name} [dim]— {detail}[/dim]")
+        console.print(f"  {marker} {esc(name)} [dim]— {detail}[/dim]")
 
 
 def _print_airbyte(section: dict[str, Any]) -> None:
     console.print("[bold cyan]Airbyte[/bold cyan]")
     if not section.get("available"):
-        console.print(f"  [red]✗ unavailable[/red] [dim]— {section.get('error')}[/dim]")
+        console.print(
+            f"  [red]✗ unavailable[/red] [dim]— {esc(section.get('error'))}[/dim]"
+        )
         return
     failed = section.get("failed", [])
     marker = "[red]✗[/red]" if failed else "[green]✓[/green]"
@@ -230,16 +248,19 @@ def _print_airbyte(section: dict[str, Any]) -> None:
         f"{len(failed)} failed, {section.get('running', 0)} running"
     )
     for job in failed[:5]:
+        # Job and connection ids are whatever the Airbyte API returned.
         console.print(
-            f"    [red]failed[/red] job {job.get('jobId')} "
-            f"[dim](connection {job.get('connectionId')})[/dim]"
+            f"    [red]failed[/red] job {esc(job.get('jobId'))} "
+            f"[dim](connection {esc(job.get('connectionId'))})[/dim]"
         )
 
 
 def _print_runners(section: dict[str, Any]) -> None:
     console.print("[bold cyan]GitHub runners[/bold cyan]")
     if not section.get("available"):
-        console.print(f"  [red]✗ unavailable[/red] [dim]— {section.get('error')}[/dim]")
+        console.print(
+            f"  [red]✗ unavailable[/red] [dim]— {esc(section.get('error'))}[/dim]"
+        )
         return
     runners = section.get("runners", [])
     if not runners:
@@ -247,14 +268,15 @@ def _print_runners(section: dict[str, Any]) -> None:
         return
     for r in runners:
         marker = "[green]✓[/green]" if r["running"] else "[yellow]![/yellow]"
-        console.print(f"  {marker} {r['name']} [dim]— {r['status']}[/dim]")
+        # Container names and status strings are docker's, not ours.
+        console.print(f"  {marker} {esc(r['name'])} [dim]— {esc(r['status'])}[/dim]")
 
 
 def _print_aws(section: dict[str, Any]) -> None:
     console.print("[bold cyan]AWS (RDS)[/bold cyan]")
     if not section.get("available"):
         console.print(
-            f"  [yellow]! unavailable[/yellow] [dim]— {section.get('error')}[/dim]"
+            f"  [yellow]! unavailable[/yellow] [dim]— {esc(section.get('error'))}[/dim]"
         )
         return
     metrics = section.get("metrics", {})
@@ -265,8 +287,9 @@ def _print_aws(section: dict[str, Any]) -> None:
         parts.append(f"CPU {cpu:.1f}%")
     if storage is not None:
         parts.append(f"free storage {storage / 1024**3:.1f} GB")
+    # The instance id comes from DP_RDS_INSTANCE; the metric strings are ours.
     console.print(
-        f"  [green]✓[/green] {section.get('instance')} "
+        f"  [green]✓[/green] {esc(section.get('instance'))} "
         f"[dim]— {' · '.join(parts) if parts else 'no datapoints'}[/dim]"
     )
 
@@ -279,14 +302,14 @@ def status(
         help="Include the AWS (RDS) section. Runs `aws sso login` if the "
         "SSO token is expired; pass --no-aws to skip.",
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit JSON instead of text."),
+    as_json: bool = json_option("Emit JSON instead of text."),
 ) -> None:
     """Health overview: databases, Airbyte jobs, runners, and RDS."""
     payload: dict[str, Any] = {}
 
-    with console.status("[bold blue]Checking databases…[/bold blue]"):
+    with err_console.status("[bold blue]Checking databases…[/bold blue]"):
         payload["databases"] = _db_section()
-    with console.status("[bold blue]Checking Airbyte…[/bold blue]"):
+    with err_console.status("[bold blue]Checking Airbyte…[/bold blue]"):
         payload["airbyte"] = _airbyte_section()
     payload["runners"] = _runners_section()
     if aws:
