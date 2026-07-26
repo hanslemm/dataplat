@@ -9,9 +9,12 @@ import typer
 from botocore.exceptions import ClientError
 from rich.console import Console
 
+from dataplat.cli._options import JsonOption
+from dataplat.cli._render import cell, esc
 from dataplat.cli.cloud.aws._common import (
-    JsonOption,
     cli_session,
+    default_region,
+    effective_profile,
     make_table,
     profile_option,
     region_option,
@@ -24,6 +27,7 @@ app = typer.Typer(
 )
 
 console = Console()
+
 
 def _get_session(profile: str | None, region: str | None):
     """Return a boto3 Session with shared AWS auth handling."""
@@ -226,7 +230,7 @@ def metrics(
 
         if not workgroups:
             message = (
-                f"No workgroup named '{workgroup}' found."
+                f"No workgroup named '{esc(workgroup)}' found."
                 if workgroup
                 else "No Redshift Serverless workgroups found."
             )
@@ -236,9 +240,7 @@ def metrics(
         # Discover dimension sets per metric, then batch every summary in a
         # single get_metric_data call.
         scoped: list[tuple[str, str, list[dict]]] = []
-        with console.status(
-            "[bold blue]Collecting CloudWatch datapoints…[/bold blue]"
-        ):
+        with console.status("[bold blue]Collecting CloudWatch datapoints…[/bold blue]"):
             for wg in sorted(workgroups, key=lambda g: g.get("workgroupName", "")):
                 wg_name = wg.get("workgroupName")
                 ns_name = wg.get("namespaceName")
@@ -258,30 +260,28 @@ def metrics(
                             [{"Name": "Namespace", "Value": ns_name}],
                         )
                         if dims:
-                            scoped.append(
-                                (f"namespace:{ns_name}", metric_name, dims)
-                            )
+                            scoped.append((f"namespace:{ns_name}", metric_name, dims))
 
             summaries = _batch_metric_summaries(cw, scoped, start, now, period)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         msg = exc.response.get("Error", {}).get("Message", str(exc))
-        console.print(f"[red]{code} while fetching metrics: {msg}[/red]")
+        console.print(f"[red]{esc(code)} while fetching metrics: {esc(msg)}[/red]")
         raise typer.Exit(code=1)
 
     rows = [(scope, name, s) for scope, name, s in summaries if s is not None]
 
     if as_json:
         payload = [
-            {"scope": scope, "metric": name, **summary}
-            for scope, name, summary in rows
+            {"scope": scope, "metric": name, **summary} for scope, name, summary in rows
         ]
         typer.echo(json.dumps(payload, indent=2))
         return
 
     if not rows:
         console.print(
-            "[yellow]No datapoints found for selected Redshift Serverless metrics.[/yellow]"
+            "[yellow]No datapoints found for selected "
+            "Redshift Serverless metrics.[/yellow]"
         )
         raise typer.Exit()
 
@@ -296,7 +296,8 @@ def metrics(
     for scope, metric_name, summary in rows:
         unit = _METRIC_UNITS.get(metric_name)
         table.add_row(
-            scope,
+            # The scope carries workgroup/namespace names straight from the API.
+            cell(scope),
             metric_name,
             _human_value(summary["latest"], unit, metric_name),
             _human_value(summary["average"], unit, metric_name),
@@ -306,7 +307,10 @@ def metrics(
 
     console.print()
     console.print(table)
+    # Report what the session was actually built with: when --profile is an
+    # alias, the flag holds the shorthand, not the profile boto3 received.
     console.print(
         f"\n[dim]Window: last {hours}h  ·  Period: {period}s  ·  "
-        f"Profile: {profile}  ·  Region: {region}[/dim]"
+        f"Profile: {esc(effective_profile(profile))}  ·  "
+        f"Region: {esc(region or default_region())}[/dim]"
     )
