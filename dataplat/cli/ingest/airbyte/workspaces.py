@@ -9,23 +9,28 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._render import cell, esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.workspaces import get_workspace, list_workspaces
 
-app = typer.Typer(name="workspaces", help="Manage Airbyte workspaces", no_args_is_help=True)
+app = typer.Typer(
+    name="workspaces", help="Manage Airbyte workspaces", no_args_is_help=True
+)
 console = Console()
 
 
 @app.command("list")
 def list_workspaces_cmd(
-    format: str = typer.Option("table", "--format", "-f", help="Output format: table or json"),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format: table or json"
+    ),
 ):
     """List Airbyte workspaces."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
@@ -36,24 +41,29 @@ def list_workspaces_cmd(
             return
 
         if format == "json":
-            console.print(json.dumps(workspaces, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(workspaces, indent=2, ensure_ascii=False)))
             return
 
-        table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE_HEAVY, expand=True)
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+        )
         table.add_column("Name", style="cyan")
         table.add_column("Workspace ID", style="dim")
 
         for ws in workspaces:
             table.add_row(
-                ws.get("name", "N/A"),
-                ws.get("workspaceId", "N/A"),
+                cell(ws.get("name", "N/A")),
+                cell(ws.get("workspaceId", "N/A")),
             )
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(workspaces)} workspace(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing workspaces: {exc}[/red]")
+        console.print(f"[red]Error listing workspaces: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -67,14 +77,14 @@ def get_workspace_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
         workspace = get_workspace(client, base_url, workspace_id)
-        console.print(json.dumps(workspace, indent=2, ensure_ascii=False))
+        console.print(cell(json.dumps(workspace, indent=2, ensure_ascii=False)))
     except ServiceError as exc:
-        console.print(f"[red]Error getting workspace: {exc}[/red]")
+        console.print(f"[red]Error getting workspace: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()

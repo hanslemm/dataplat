@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +12,9 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import YesOption, json_option
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.ingest.airbyte._common import airbyte_client
 from dataplat.cli.ingest.airbyte._cursor import (
     parse_target_date,
@@ -25,7 +27,6 @@ from dataplat.cli.ingest.airbyte.enums import (
     ScheduleType,
     SchemaUpdatesBehavior,
 )
-from dataplat.cli.ingest.airbyte.tui import TEXTUAL_AVAILABLE, ConnectionsApp
 from dataplat.core.errors import AuthError, ConfigError
 from dataplat.services.airbyte.client import (
     build_authenticated_client,
@@ -49,27 +50,10 @@ from dataplat.services.airbyte.connections import (
 from dataplat.services.airbyte.jobs import list_jobs
 from dataplat.services.airbyte.tags import TagResolver, merge_tags
 
-app = typer.Typer(name="connections", help="Manage Airbyte connections", no_args_is_help=True)
+app = typer.Typer(
+    name="connections", help="Manage Airbyte connections", no_args_is_help=True
+)
 console = Console()
-
-YesOption = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt.")
-
-
-def _confirm_bulk(summary: str, yes: bool) -> None:
-    """Require confirmation before a bulk mutation. Non-interactive needs --yes."""
-    if yes:
-        return
-    console.print(f"[yellow]{summary}[/yellow]")
-    if sys.stdin.isatty():
-        if typer.confirm("Proceed?", default=False):
-            return
-        console.print("[yellow]Aborted.[/yellow]")
-        raise typer.Exit(code=1)
-    console.print(
-        "[red]Error: refusing bulk operation without confirmation. "
-        "Pass --yes/-y in non-interactive contexts.[/red]"
-    )
-    raise typer.Exit(code=1)
 
 BUSY_STATUSES = {"running", "pending", "incomplete"}
 
@@ -88,21 +72,28 @@ def _backup_path(backup_dir: str, conn_id: str) -> Path:
 
 
 def _print_cursor_plan(conn_label: str, actions: list[dict]) -> None:
-    """Render the per-stream rewrite/skip plan for one connection."""
-    console.print(f"- {conn_label}")
+    """Render the per-stream rewrite/skip plan for one connection.
+
+    Stream names, cursor field names and cursor values are connector-defined;
+    only ``action`` is a literal from ``_cursor``, so only it may stay raw.
+    """
+    console.print(cell(f"- {conn_label}"))
     if not actions:
         console.print("  [dim]no cursor state to change[/dim]")
         return
     for a in actions:
-        stream = f"{a['namespace']}.{a['stream']}" if a.get("namespace") else a["stream"]
+        stream = (
+            f"{a['namespace']}.{a['stream']}" if a.get("namespace") else a["stream"]
+        )
         action = a["action"]
+        where = f"{esc(stream)}:{esc(a['key'])}"
         if action.startswith("rewrite") or action == "reset:count":
             console.print(
-                f"  [green]{action}[/green] {stream}:{a['key']} {a['old']} -> {a['new']}"
+                f"  [green]{action}[/green] {where} {esc(a['old'])} -> {esc(a['new'])}"
             )
         else:
             console.print(
-                f"  [yellow]{action}[/yellow] {stream}:{a['key']} ({a['old']!r})"
+                f"  [yellow]{action}[/yellow] {where} ({esc(repr(a['old']))})"
             )
 
 
@@ -115,9 +106,8 @@ def _matches_filters(
         return False
     if source_id and connection.get("sourceId") != source_id:
         return False
-    return not (
-        destination_id and connection.get("destinationId") != destination_id
-    )
+    return not (destination_id and connection.get("destinationId") != destination_id)
+
 
 @app.command("list")
 def list_connections_cmd(
@@ -156,9 +146,7 @@ def list_connections_cmd(
         "--pager",
         help="Show output in an interactive pager",
     ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Emit connections as JSON on stdout"
-    ),
+    as_json: bool = json_option("Emit connections as JSON on stdout"),
     output_file: str | None = typer.Option(
         None,
         "--output-file",
@@ -174,7 +162,7 @@ def list_connections_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if not as_json:
@@ -186,9 +174,11 @@ def list_connections_cmd(
             # Filter by status if specified
             if status_filter and conn.get("status") != status_filter.value:
                 continue
-            if workspace_id and (
-                conn.get("workspaceId") or conn.get("workspace_id")
-            ) != workspace_id:
+            if (
+                workspace_id
+                and (conn.get("workspaceId") or conn.get("workspace_id"))
+                != workspace_id
+            ):
                 continue
             if source_id and conn.get("sourceId") != source_id:
                 continue
@@ -205,8 +195,8 @@ def list_connections_cmd(
                     detail = get_connection(client, base_url, conn_id)
                 except Exception as exc:
                     console.print(
-                        f"[yellow]Warning: could not inspect {conn_id}: "
-                        f"{exc}[/yellow]"
+                        f"[yellow]Warning: could not inspect {esc(conn_id)}: "
+                        f"{esc(exc)}[/yellow]"
                     )
                     continue
                 if connection_has_active_streams(detail):
@@ -221,7 +211,7 @@ def list_connections_cmd(
         if output_file:
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(connections, f, indent=2)
-            console.print(f"[green]Saved connections to {output_file}[/green]")
+            console.print(f"[green]Saved connections to {esc(output_file)}[/green]")
 
         if as_json:
             typer.echo(json.dumps(connections, indent=2, ensure_ascii=False))
@@ -265,9 +255,14 @@ def list_connections_cmd(
                 rows.append([name, conn_id, schedule_display, status])
 
         if tui:
-            if not TEXTUAL_AVAILABLE:
+            # Imported here, not at module scope: textual costs ~58 ms and this
+            # is the only command that ever needs it.
+            try:
+                from dataplat.cli.ingest.airbyte.tui import ConnectionsApp
+            except ImportError:
                 console.print(
-                    "[red]Textual is not installed. Install with: pip install textual[/red]"
+                    "[red]Textual is not installed. "
+                    "Install with: pip install textual[/red]"
                 )
                 raise typer.Exit(code=1)
 
@@ -285,7 +280,10 @@ def list_connections_cmd(
                 # Distribute width across columns, keep a sensible minimum
                 per_col = max(12, (term_width - 4) // max(1, len(columns)))
                 for col in columns:
-                    table.add_column(col, overflow="ellipsis", max_width=per_col)
+                    # Headers here are raw Airbyte JSON keys, and Rich parses
+                    # markup in a header exactly as it does in a cell: a key
+                    # containing "[/x]" would abort the whole render.
+                    table.add_column(cell(col), overflow="ellipsis", max_width=per_col)
             else:
                 # Fit key columns to terminal width
                 status_w = 10
@@ -320,7 +318,7 @@ def list_connections_cmd(
                     no_wrap=True,
                 )
             for row in rows:
-                table.add_row(*[str(v) for v in row])
+                table.add_row(*[cell(v) for v in row])
 
             if pager:
                 with console.pager():
@@ -333,7 +331,7 @@ def list_connections_cmd(
                 console.print(f"\n[dim]Total: {len(connections)} connection(s)[/dim]")
 
     except Exception as e:
-        console.print(f"[red]Error fetching connections: {e}[/red]")
+        console.print(f"[red]Error fetching connections: {esc(e)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -345,7 +343,10 @@ def update(
         None,
         "--connection-id",
         "-c",
-        help="Specific connection ID to update (if not provided, updates all active connections)",
+        help=(
+            "Specific connection ID to update "
+            "(if not provided, updates all active connections)"
+        ),
     ),
     source_id: str | None = typer.Option(
         None,
@@ -370,7 +371,11 @@ def update(
     cron: str | None = typer.Option(
         None,
         "--cron",
-        help="Quartz cron expression (required if schedule-type=cron). Optional timezone suffix is allowed (e.g. '0 0 0,12 ? * * Europe/Berlin')",
+        help=(
+            "Quartz cron expression (required if schedule-type=cron). "
+            "Optional timezone suffix is allowed "
+            "(e.g. '0 0 0,12 ? * * Europe/Berlin')"
+        ),
     ),
     cron_time_zone: str | None = typer.Option(
         None,
@@ -447,14 +452,16 @@ def update(
         raise typer.Exit(code=2)
 
     if cron and not validate_cron_expression(cron):
-        console.print(f"[red]Error: Invalid cron expression: {cron}[/red]")
+        console.print(f"[red]Error: Invalid cron expression: {esc(cron)}[/red]")
         raise typer.Exit(code=2)
 
     if cron_time_zone:
         try:
             ZoneInfo(cron_time_zone)
         except Exception:
-            console.print(f"[red]Error: Invalid cron timezone: {cron_time_zone}[/red]")
+            console.print(
+                f"[red]Error: Invalid cron timezone: {esc(cron_time_zone)}[/red]"
+            )
             raise typer.Exit(code=2)
 
     cron_tz = None
@@ -478,7 +485,8 @@ def update(
             cron_expr, cron_tz = split_cron_timezone(cron)
             if cron_tz and cron_time_zone:
                 console.print(
-                    "[yellow]Ignoring timezone in --cron because --cron-timezone was provided[/yellow]"
+                    "[yellow]Ignoring timezone in --cron because "
+                    "--cron-timezone was provided[/yellow]"
                 )
             # Always send timezone separately (never inline in cronExpression)
             updates["schedule"]["cronExpression"] = cron_expr
@@ -537,7 +545,7 @@ def update(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     # Update connection(s)
@@ -558,29 +566,31 @@ def update(
 
         if connection_id:
             # Update single connection
-            console.print(f"[blue]Updating connection {connection_id}...[/blue]\n")
+            console.print(f"[blue]Updating connection {esc(connection_id)}...[/blue]\n")
 
             try:
                 conn = get_connection(client, base_url, connection_id)
                 conn_name = conn.get("name", "")
                 if source_id and conn.get("sourceId") != source_id:
                     console.print(
-                        f"[yellow]Skipping: sourceId {conn.get('sourceId')} does not match {source_id}[/yellow]"
+                        f"[yellow]Skipping: sourceId {esc(conn.get('sourceId'))} "
+                        f"does not match {esc(source_id)}[/yellow]"
                     )
                     raise typer.Exit(code=0)
                 if destination_id and conn.get("destinationId") != destination_id:
                     console.print(
-                        f"[yellow]Skipping: destinationId {conn.get('destinationId')} does not match {destination_id}[/yellow]"
+                        "[yellow]Skipping: destinationId "
+                        f"{esc(conn.get('destinationId'))} does not match "
+                        f"{esc(destination_id)}[/yellow]"
                     )
                     raise typer.Exit(code=0)
-                console.print(f"- {conn_name} ({connection_id})")
+                console.print(cell(f"- {conn_name} ({connection_id})"))
                 web_backend_updates_for_conn = web_backend_updates
                 if use_web_backend and tag_names:
                     web_backend_updates_for_conn = _tags_update_for(conn)
 
-                console.print(
-                    f"  Updates: {web_backend_updates_for_conn if use_web_backend else updates}"
-                )
+                shown = web_backend_updates_for_conn if use_web_backend else updates
+                console.print(cell(f"  Updates: {shown}"))
 
                 if not dry_run:
                     if use_web_backend:
@@ -601,7 +611,7 @@ def update(
                 # Clean skips/exits must not be re-reported as errors.
                 raise
             except Exception as e:
-                console.print(f"[red]Error updating connection: {e}[/red]")
+                console.print(f"[red]Error updating connection: {esc(e)}[/red]")
                 raise typer.Exit(code=1)
 
         else:
@@ -615,8 +625,11 @@ def update(
                 console.print("[yellow]No matching active connections.[/yellow]")
                 raise typer.Exit(code=0)
             if not dry_run:
-                _confirm_bulk(
-                    f"About to update {len(targets)} active connection(s).", yes
+                confirm_or_exit(
+                    f"[yellow]About to update {len(targets)} active "
+                    f"connection(s).[/yellow]",
+                    yes=yes,
+                    console=console,
                 )
             console.print("[blue]Updating all active connections...[/blue]\n")
 
@@ -625,7 +638,7 @@ def update(
                     "connection_id"
                 )
                 conn_name = connection.get("name", "")
-                console.print(f"- {conn_name} ({conn_id})")
+                console.print(cell(f"- {conn_name} ({conn_id})"))
 
                 updates_for_conn = updates
                 web_backend_updates_for_conn = web_backend_updates
@@ -633,9 +646,12 @@ def update(
                     web_backend_updates_for_conn = _tags_update_for(connection)
 
                 if dry_run:
-                    console.print(
-                        f"  Updates: {web_backend_updates_for_conn if use_web_backend else updates_for_conn}"
+                    shown = (
+                        web_backend_updates_for_conn
+                        if use_web_backend
+                        else updates_for_conn
                     )
+                    console.print(cell(f"  Updates: {shown}"))
                     console.print("  [dim](dry run - no changes made)[/dim]")
                     continue
 
@@ -650,14 +666,16 @@ def update(
                     if sleep:
                         time.sleep(sleep)
                 except Exception as e:
-                    console.print(f"  [yellow]Warning: Failed to update: {e}[/yellow]")
+                    console.print(
+                        f"  [yellow]Warning: Failed to update: {esc(e)}[/yellow]"
+                    )
 
         console.print(f"\n[green]Updated: {updated} (dry-run={dry_run})[/green]")
 
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red]Error updating connections: {e}[/red]")
+        console.print(f"[red]Error updating connections: {esc(e)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -679,7 +697,10 @@ def set_cursor(
     xmin_factor: float | None = typer.Option(
         None,
         "--xmin-factor",
-        help="Scale xmin cursors: new xid = round(old * factor), e.g. 0.1 rewinds to 10%.",
+        help=(
+            "Scale xmin cursors: new xid = round(old * factor), "
+            "e.g. 0.1 rewinds to 10%."
+        ),
     ),
     connection_id: str | None = typer.Option(
         None, "--connection-id", "-c", help="Operate on a single connection."
@@ -764,7 +785,8 @@ def set_cursor(
         target = parse_target_date(to)
         if target is None:
             console.print(
-                f"[red]Error: --to must be an ISO date/timestamp (got {to!r})[/red]"
+                "[red]Error: --to must be an ISO date/timestamp "
+                f"(got {esc(repr(to))})[/red]"
             )
             raise typer.Exit(code=2)
 
@@ -774,12 +796,15 @@ def set_cursor(
             conn = get_connection(client, base_url, connection_id)
             if source_id and conn.get("sourceId") != source_id:
                 console.print(
-                    f"[yellow]Skipping: sourceId {conn.get('sourceId')} != {source_id}[/yellow]"
+                    f"[yellow]Skipping: sourceId {esc(conn.get('sourceId'))} "
+                    f"!= {esc(source_id)}[/yellow]"
                 )
                 raise typer.Exit(code=0)
             if destination_id and conn.get("destinationId") != destination_id:
                 console.print(
-                    f"[yellow]Skipping: destinationId {conn.get('destinationId')} != {destination_id}[/yellow]"
+                    "[yellow]Skipping: destinationId "
+                    f"{esc(conn.get('destinationId'))} "
+                    f"!= {esc(destination_id)}[/yellow]"
                 )
                 raise typer.Exit(code=0)
             targets = [conn]
@@ -806,11 +831,13 @@ def set_cursor(
         op_desc = "; ".join(ops)
 
         if not dry_run:
-            _confirm_bulk(
-                f"About to rewrite cursors ({op_desc}) on up to {len(targets)} "
-                f"connection(s). Editing state on a running connection is unsafe; "
-                f"busy connections are skipped unless --force.",
-                yes,
+            confirm_or_exit(
+                f"[yellow]About to rewrite cursors ({op_desc}) on up to "
+                f"{len(targets)} connection(s). Editing state on a running "
+                f"connection is unsafe; busy connections are skipped unless "
+                f"--force.[/yellow]",
+                yes=yes,
+                console=console,
             )
 
         rewritten = 0
@@ -824,13 +851,16 @@ def set_cursor(
             conn_label = f"{conn.get('name', '')} ({conn_id})"
             try:
                 if not force and _connection_is_busy(client, base_url, conn_id):
-                    console.print(f"- {conn_label}")
+                    console.print(cell(f"- {conn_label}"))
                     console.print("  [yellow]skip: busy (running job)[/yellow]")
                     continue
 
                 state = get_connection_state(client, base_url, conn_id)
                 new_state, actions = plan_cursor_rewrites(
-                    state, target, xmin_value=xmin, xmin_factor=xmin_factor,
+                    state,
+                    target,
+                    xmin_value=xmin,
+                    xmin_factor=xmin_factor,
                     only_rewind=only_rewind,
                 )
                 _print_cursor_plan(conn_label, actions)
@@ -841,7 +871,7 @@ def set_cursor(
                     if backup and n_rewrite:
                         console.print(
                             f"  [dim](dry run - would back up state to "
-                            f"{_backup_path(backup_dir, conn_id)})[/dim]"
+                            f"{esc(_backup_path(backup_dir, conn_id))})[/dim]"
                         )
                     if sync and n_rewrite:
                         console.print("  [dim](dry run - would trigger sync)[/dim]")
@@ -857,7 +887,7 @@ def set_cursor(
                         json.dumps(state, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
-                    console.print(f"  [green]✓ Backed up state to {path}[/green]")
+                    console.print(f"  [green]✓ Backed up state to {esc(path)}[/green]")
 
                 update_connection_state(client, base_url, conn_id, new_state)
                 console.print(f"  [green]✓ Wrote {n_rewrite} cursor(s)[/green]")
@@ -869,7 +899,7 @@ def set_cursor(
                     job_id = job.get("id") or job.get("jobId") or job.get("job_id")
                     console.print(
                         "  [green]✓ Sync triggered[/green]"
-                        + (f" (jobId={job_id})" if job_id else "")
+                        + (f" (jobId={esc(job_id)})" if job_id else "")
                     )
                     synced += 1
                 if sleep:
@@ -877,7 +907,10 @@ def set_cursor(
             except typer.Exit:
                 raise
             except Exception as exc:  # per-connection isolation
-                console.print(f"  [yellow]Warning: failed on {conn_label}: {exc}[/yellow]")
+                console.print(
+                    f"  [yellow]Warning: failed on {esc(conn_label)}: "
+                    f"{esc(exc)}[/yellow]"
+                )
 
         summary = (
             f"\n[green]Rewrote {rewritten} cursor(s) across "
@@ -927,7 +960,7 @@ def sync(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     if wait and not connection_id:
@@ -936,14 +969,16 @@ def sync(
 
     try:
         if connection_id and dry_run:
-            console.print(f"[dim](dry run) Would sync {connection_id}[/dim]")
+            console.print(f"[dim](dry run) Would sync {esc(connection_id)}[/dim]")
             raise typer.Exit(code=0)
         if connection_id:
-            console.print(f"[blue]Triggering sync for {connection_id}...[/blue]")
+            console.print(f"[blue]Triggering sync for {esc(connection_id)}...[/blue]")
             job = trigger_sync_job(client, base_url, connection_id)
             job_id = job.get("id") or job.get("jobId") or job.get("job_id")
             if job_id:
-                console.print(f"[green]✓ Sync job started[/green] (jobId={job_id})")
+                console.print(
+                    f"[green]✓ Sync job started[/green] (jobId={esc(job_id)})"
+                )
             else:
                 console.print("[green]✓ Sync job started[/green]")
 
@@ -961,11 +996,11 @@ def sync(
                     details = get_job(client, base_url, str(job_id))
                     status = details.get("status") or details.get("jobStatus")
                     if status:
-                        console.print(f"[dim]Status: {status}[/dim]")
+                        console.print(f"[dim]Status: {esc(status)}[/dim]")
 
                     if status in {"succeeded", "failed", "cancelled", "canceled"}:
                         console.print(
-                            f"[green]Job finished with status: {status}[/green]"
+                            f"[green]Job finished with status: {esc(status)}[/green]"
                         )
                         break
                     time.sleep(poll_interval)
@@ -986,12 +1021,14 @@ def sync(
                     conn_id = connection.get("connectionId") or connection.get(
                         "connection_id"
                     )
-                    console.print(f"- {connection.get('name', '')} ({conn_id})")
+                    console.print(cell(f"- {connection.get('name', '')} ({conn_id})"))
                 raise typer.Exit(code=0)
 
-            _confirm_bulk(
-                f"About to trigger a sync on {len(targets)} active connection(s).",
-                yes,
+            confirm_or_exit(
+                f"[yellow]About to trigger a sync on {len(targets)} active "
+                f"connection(s).[/yellow]",
+                yes=yes,
+                console=console,
             )
             console.print("[blue]Triggering sync for active connections...[/blue]")
             for connection in targets:
@@ -999,17 +1036,19 @@ def sync(
                     "connection_id"
                 )
                 conn_name = connection.get("name", "")
-                console.print(f"- {conn_name} ({conn_id})")
+                console.print(cell(f"- {conn_name} ({conn_id})"))
                 try:
                     trigger_sync_job(client, base_url, conn_id)
                     if sleep:
                         time.sleep(sleep)
                 except Exception as e:
-                    console.print(f"  [yellow]Warning: Failed to sync: {e}[/yellow]")
+                    console.print(
+                        f"  [yellow]Warning: Failed to sync: {esc(e)}[/yellow]"
+                    )
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red]Error triggering sync: {e}[/red]")
+        console.print(f"[red]Error triggering sync: {esc(e)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -1017,20 +1056,22 @@ def sync(
 
 @app.command("get")
 def get_connection_cmd(
-    connection_id: str = typer.Option(..., "--connection-id", "-c", help="Connection ID"),
+    connection_id: str = typer.Option(
+        ..., "--connection-id", "-c", help="Connection ID"
+    ),
 ):
     """Get connection details."""
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
         conn = get_connection(client, base_url, connection_id)
-        console.print(json.dumps(conn, indent=2, ensure_ascii=False))
+        console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
     except Exception as exc:
-        console.print(f"[red]Error getting connection: {exc}[/red]")
+        console.print(f"[red]Error getting connection: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -1047,7 +1088,10 @@ def create_connection_cmd(
     cron: str | None = typer.Option(
         None,
         "--cron",
-        help="Quartz cron expression (required if schedule-type=cron). Optional timezone suffix allowed.",
+        help=(
+            "Quartz cron expression (required if schedule-type=cron). "
+            "Optional timezone suffix allowed."
+        ),
     ),
     namespace_definition: NamespaceDefinition | None = typer.Option(
         None, "--namespace-definition", help="Namespace definition"
@@ -1066,7 +1110,7 @@ def create_connection_cmd(
         raise typer.Exit(code=2)
 
     if cron and not validate_cron_expression(cron):
-        console.print(f"[red]Error: Invalid cron expression: {cron}[/red]")
+        console.print(f"[red]Error: Invalid cron expression: {esc(cron)}[/red]")
         raise typer.Exit(code=2)
 
     schedule: dict | None = None
@@ -1081,7 +1125,7 @@ def create_connection_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
@@ -1092,12 +1136,14 @@ def create_connection_cmd(
             destination_id=destination_id,
             name=name,
             schedule=schedule,
-            namespace_definition=namespace_definition.value if namespace_definition else None,
+            namespace_definition=namespace_definition.value
+            if namespace_definition
+            else None,
             status=status.value if status else None,
         )
-        console.print(json.dumps(conn, indent=2, ensure_ascii=False))
+        console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
     except Exception as exc:
-        console.print(f"[red]Error creating connection: {exc}[/red]")
+        console.print(f"[red]Error creating connection: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -1105,24 +1151,29 @@ def create_connection_cmd(
 
 @app.command("delete")
 def delete_connection_cmd(
-    connection_id: str = typer.Option(..., "--connection-id", "-c", help="Connection ID"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    connection_id: str = typer.Option(
+        ..., "--connection-id", "-c", help="Connection ID"
+    ),
+    yes: bool = YesOption,
 ):
     """Delete an Airbyte connection."""
-    if not yes:
-        typer.confirm(f"Delete connection {connection_id}?", abort=True)
+    confirm_or_exit(
+        yes=yes,
+        prompt=f"Delete connection {connection_id}?",
+        console=console,
+    )
 
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {exc}[/red]")
+        console.print(f"[red]Error: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
 
     try:
         delete_connection(client, base_url, connection_id)
-        console.print(f"[green]Connection {connection_id} deleted[/green]")
+        console.print(f"[green]Connection {esc(connection_id)} deleted[/green]")
     except Exception as exc:
-        console.print(f"[red]Error deleting connection: {exc}[/red]")
+        console.print(f"[red]Error deleting connection: {esc(exc)}[/red]")
         raise typer.Exit(code=1)
     finally:
         client.close()
@@ -1137,7 +1188,9 @@ def refresh(
         None, "--source-id", help="Only refresh connections with this source ID."
     ),
     destination_id: str | None = typer.Option(
-        None, "--destination-id", help="Only refresh connections with this destination ID."
+        None,
+        "--destination-id",
+        help="Only refresh connections with this destination ID.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List the connections that would be refreshed."
@@ -1153,14 +1206,18 @@ def refresh(
     with airbyte_client() as (client, base_url):
         if connection_id:
             if dry_run:
-                console.print(f"[dim](dry run) Would refresh {connection_id}[/dim]")
+                console.print(
+                    f"[dim](dry run) Would refresh {esc(connection_id)}[/dim]"
+                )
                 raise typer.Exit(code=0)
-            console.print(f"[blue]Triggering refresh for {connection_id}...[/blue]")
+            console.print(
+                f"[blue]Triggering refresh for {esc(connection_id)}...[/blue]"
+            )
             job = trigger_job(client, base_url, connection_id, "refresh")
             job_id = job.get("jobId") or job.get("id")
             console.print(
                 "[green]✓ Refresh job started[/green]"
-                + (f" (jobId={job_id})" if job_id else "")
+                + (f" (jobId={esc(job_id)})" if job_id else "")
             )
             raise typer.Exit(code=0)
 
@@ -1174,26 +1231,32 @@ def refresh(
             raise typer.Exit(code=0)
 
         if dry_run:
-            console.print(f"[dim](dry run) Would refresh {len(targets)} connection(s):[/dim]")
+            console.print(
+                f"[dim](dry run) Would refresh {len(targets)} connection(s):[/dim]"
+            )
             for conn in targets:
                 conn_id = conn.get("connectionId") or conn.get("connection_id")
-                console.print(f"- {conn.get('name', '')} ({conn_id})")
+                console.print(cell(f"- {conn.get('name', '')} ({conn_id})"))
             raise typer.Exit(code=0)
 
-        _confirm_bulk(
-            f"About to trigger a refresh on {len(targets)} active connection(s).",
-            yes,
+        confirm_or_exit(
+            f"[yellow]About to trigger a refresh on {len(targets)} active "
+            f"connection(s).[/yellow]",
+            yes=yes,
+            console=console,
         )
         console.print("[blue]Triggering refresh for active connections...[/blue]")
         for conn in targets:
             conn_id = conn.get("connectionId") or conn.get("connection_id")
-            console.print(f"- {conn.get('name', '')} ({conn_id})")
+            console.print(cell(f"- {conn.get('name', '')} ({conn_id})"))
             try:
                 trigger_job(client, base_url, conn_id, "refresh")
                 if sleep:
                     time.sleep(sleep)
             except Exception as exc:
-                console.print(f"  [yellow]Warning: Failed to refresh: {exc}[/yellow]")
+                console.print(
+                    f"  [yellow]Warning: Failed to refresh: {esc(exc)}[/yellow]"
+                )
 
 
 @app.command("reset")
@@ -1206,29 +1269,31 @@ def reset_connection_cmd(
         "--clear",
         help="Trigger a 'clear' job (drop data without re-syncing) instead of a reset.",
     ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    yes: bool = YesOption,
 ):
     """Reset a connection's data (drops and re-syncs all streams)."""
     from dataplat.cli.ingest.airbyte._common import airbyte_client
     from dataplat.services.airbyte.jobs import trigger_job
 
     job_type = "clear" if clear else "reset"
-    if not yes:
-        typer.confirm(
+    confirm_or_exit(
+        yes=yes,
+        prompt=(
             f"Trigger a {job_type} of ALL streams on connection {connection_id}? "
-            "This drops destination data for the connection.",
-            abort=True,
-        )
+            "This drops destination data for the connection."
+        ),
+        console=console,
+    )
 
     with airbyte_client() as (client, base_url):
         job = trigger_job(client, base_url, connection_id, job_type)
         job_id = job.get("jobId") or job.get("id")
         console.print(
             f"[green]✓ {job_type.capitalize()} job started[/green]"
-            + (f" (jobId={job_id})" if job_id else "")
+            + (f" (jobId={esc(job_id)})" if job_id else "")
         )
         console.print(
-            f"[dim]Watch it with: dp ingest airbyte jobs get {job_id}[/dim]"
+            f"[dim]Watch it with: dp ingest airbyte jobs get {esc(job_id)}[/dim]"
             if job_id
             else ""
         )

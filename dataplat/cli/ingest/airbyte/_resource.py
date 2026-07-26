@@ -15,6 +15,9 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._options import YesOption
+from dataplat.cli._prompt import confirm_or_exit
+from dataplat.cli._render import cell, esc
 from dataplat.cli.ingest.airbyte._common import airbyte_client
 
 console = Console()
@@ -29,10 +32,10 @@ def _load_config(config_path: str) -> dict:
                 raw = f.read()
         return json.loads(raw)
     except FileNotFoundError:
-        console.print(f"[red]Error: config file not found: {config_path}[/red]")
+        console.print(f"[red]Error: config file not found: {esc(config_path)}[/red]")
         raise typer.Exit(code=2)
     except json.JSONDecodeError as exc:
-        console.print(f"[red]Error: invalid JSON in config: {exc}[/red]")
+        console.print(f"[red]Error: invalid JSON in config: {esc(exc)}[/red]")
         raise typer.Exit(code=2)
 
 
@@ -84,7 +87,7 @@ def make_resource_app(
                 return
 
             if format == "json":
-                console.print(json.dumps(items, indent=2, ensure_ascii=False))
+                console.print(cell(json.dumps(items, indent=2, ensure_ascii=False)))
                 return
 
             table = Table(
@@ -100,12 +103,12 @@ def make_resource_app(
 
             for item in items:
                 table.add_row(
-                    item.get("name", "N/A"),
-                    item.get(id_key, "N/A"),
-                    item.get(
-                        connector_keys[0], item.get(connector_keys[1], "N/A")
+                    cell(item.get("name", "N/A")),
+                    cell(item.get(id_key, "N/A")),
+                    cell(
+                        item.get(connector_keys[0], item.get(connector_keys[1], "N/A"))
                     ),
-                    item.get("workspaceId", "N/A"),
+                    cell(item.get("workspaceId", "N/A")),
                 )
 
             console.print(table)
@@ -119,7 +122,7 @@ def make_resource_app(
     ):
         with airbyte_client() as (client, base_url):
             item = get_fn(client, base_url, resource_id)
-            console.print(json.dumps(item, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
 
     get_cmd.__doc__ = f"Get {kind} details."
 
@@ -141,16 +144,14 @@ def make_resource_app(
             item = create_fn(
                 client, base_url, name, workspace_id, definition_id, configuration
             )
-            console.print(json.dumps(item, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
 
     create_cmd.__doc__ = f"Create a new Airbyte {kind}."
 
     @app.command("update")
     def update_cmd(
         resource_id: str = typer.Option(..., id_flag, id_short, help=id_help),
-        name: str | None = typer.Option(
-            None, "--name", "-n", help=f"New {kind} name"
-        ),
+        name: str | None = typer.Option(None, "--name", "-n", help=f"New {kind} name"),
         config_path: str | None = typer.Option(
             None, "--config", help="Path to JSON config file, or '-' for stdin"
         ),
@@ -169,23 +170,26 @@ def make_resource_app(
 
         with airbyte_client() as (client, base_url):
             item = update_fn(client, base_url, resource_id, updates)
-            console.print(json.dumps(item, indent=2, ensure_ascii=False))
+            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
 
     update_cmd.__doc__ = f"Update an Airbyte {kind}."
 
     @app.command("delete")
     def delete_cmd(
         resource_id: str = typer.Option(..., id_flag, id_short, help=id_help),
-        yes: bool = typer.Option(
-            False, "--yes", "-y", help="Skip confirmation prompt"
-        ),
+        yes: bool = YesOption,
     ):
-        if not yes:
-            typer.confirm(f"Delete {kind} {resource_id}?", abort=True)
+        # The prompt reaches the terminal through click, which does not parse
+        # markup, so resource_id must stay unescaped here.
+        confirm_or_exit(
+            yes=yes, prompt=f"Delete {kind} {resource_id}?", console=console
+        )
 
         with airbyte_client() as (client, base_url):
             delete_fn(client, base_url, resource_id)
-            console.print(f"[green]{kind.capitalize()} {resource_id} deleted[/green]")
+            console.print(
+                f"[green]{kind.capitalize()} {esc(resource_id)} deleted[/green]"
+            )
 
     delete_cmd.__doc__ = f"Delete an Airbyte {kind}."
 
