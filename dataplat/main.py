@@ -8,19 +8,24 @@ import typer
 
 from dataplat.core.envrc import load_envrc
 
-# Load .envrc before the command modules import: option defaults (profiles,
-# regions, DNS) read the environment at import time.
+# Load .envrc here, at module scope, and nowhere else: Typer evaluates an
+# area's option defaults (profiles, regions, DNS) while that area module is
+# being imported, and click resolves — and therefore imports — the subcommand
+# *before* the root callback runs. So the environment has to be in place before
+# any area import, which module scope is the only point that guarantees.
+# Lazy mounting moves those imports later, never earlier, so it does not change
+# this: loading from the callback would still be too late.
 load_envrc()
 
-from dataplat.cli._missing import build_missing_deps_app  # noqa: E402
+from dataplat.cli._lazy import LazyRootGroup, area_placeholder  # noqa: E402
 from dataplat.cli.config import app as config_app  # noqa: E402
 from dataplat.cli.open import app as open_app  # noqa: E402
 from dataplat.cli.status import app as status_app  # noqa: E402
-from dataplat.core.deps import area_ready  # noqa: E402
-from dataplat.core.registry import all_areas, load_app  # noqa: E402
+from dataplat.core.registry import all_areas  # noqa: E402
 
 app = typer.Typer(
     name="dp",
+    cls=LazyRootGroup,
     help="dataplat — one command to manage any shape of data platform",
     no_args_is_help=True,
 )
@@ -47,22 +52,22 @@ def bootstrap(
         help="Show the CLI version and exit.",
     ),
 ) -> None:
-    """Load environment variables once at CLI startup."""
-    load_envrc()
+    """Declare the root options; there is nothing left to do here.
+
+    Environment loading used to be repeated in this body. It was already a
+    no-op (loading is ``setdefault``-based) and it could never have been
+    anything else: click has imported and parsed the subcommand by the time it
+    calls this.
+    """
 
 
 app.add_typer(config_app, name="config")
 
-# Areas mount through the registry: for real when their dependencies are
-# installed, otherwise as a stub that offers to install the missing extra.
+# Areas mount as placeholders in registry order: the name and help text come
+# from the registry, and LazyRootGroup imports the area (or its missing-deps
+# stub) only when a command inside it is resolved.
 for _mount in all_areas():
-    if _mount.deps is None or area_ready(_mount.name):
-        app.add_typer(load_app(_mount), name=_mount.name)
-    else:
-        app.add_typer(
-            build_missing_deps_app(_mount.name, _mount.help_text),
-            name=_mount.name,
-        )
+    app.add_typer(area_placeholder(_mount), name=_mount.name)
 
 app.add_typer(status_app, name="status")
 app.add_typer(open_app, name="open")
