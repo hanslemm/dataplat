@@ -22,12 +22,16 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Database",
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
-requires-python = ">=3.13"
+# 3.12 is the real floor: the only construct above 3.11 anywhere in the package
+# is the PEP 695 generic in dataplat/cli/db/role.py, and no 3.13-only stdlib API
+# is used. .python-version stays at 3.13 -- that is the dev pin, not the floor.
+requires-python = ">=3.12"
 dependencies = [
     "rich>=14.2.0",
     "typer>=0.21.1",
@@ -68,11 +72,17 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.ruff]
-target-version = "py313"
+# Track requires-python, not .python-version: the linters must judge the oldest
+# interpreter we advertise, or UP rewrites land syntax the floor cannot parse.
+target-version = "py312"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["F", "I", "B", "UP", "SIM"]
+# E/W make line-length above enforceable: without pycodestyle selected it was a
+# number nothing checked, and the tree had drifted to 164 violations. `ruff
+# format` owns layout; E501 is what it cannot fix (long string literals), so it
+# stays a lint error a human has to answer.
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
 ignore = [
     # Typer's API is built on function-call defaults; B008 fights the framework.
     "B008",
@@ -86,7 +96,7 @@ ignore = [
 ]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true
