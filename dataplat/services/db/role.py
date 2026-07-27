@@ -178,9 +178,13 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
 @dataclass(frozen=True)
 class MembershipEdge:
     role: str  # other end of the edge (ancestor or descendant)
-    inherit: bool  # INHERIT flag on the edge closest to the target
-    depth: int  # distance from target; 1 = direct
-    via: str  # for ancestor walks: parent that granted this row
+    # True when AT LEAST ONE membership path between the target and ``role``
+    # inherits end to end. A role reachable by several paths inherits as soon
+    # as one of them does, so this is an OR across paths rather than the flag
+    # of any single edge -- ``build_closure`` depends on that.
+    inherit: bool
+    depth: int  # distance from target along the shortest path; 1 = direct
+    via: str  # for ancestor walks: parent that granted the shortest-path row
 
 
 # The recursive walks carry a `path` array of oids already visited so the
@@ -203,9 +207,16 @@ WITH RECURSIVE up(member_oid, role_oid, inherit, depth, via, path) AS (
 )
 SELECT rolname, inherit, depth, via FROM (
     SELECT DISTINCT ON (r.rolname)
-           r.rolname, inherit, depth, via
+           r.rolname,
+           -- One ancestor can be reachable by several paths. Privileges flow
+           -- as soon as ONE path inherits end to end, so OR across every path
+           -- to this ancestor. Taking the flag off whichever row DISTINCT ON
+           -- happened to keep made the answer depend on pg_auth_members' row
+           -- order and dropped genuinely inherited ancestors from the closure.
+           bool_or(up.inherit) OVER (PARTITION BY r.rolname) AS inherit,
+           up.depth, up.via
     FROM up JOIN pg_roles r ON r.oid = up.role_oid
-    ORDER BY r.rolname, depth
+    ORDER BY r.rolname, up.depth
 ) sub
 ORDER BY depth, rolname
 """
@@ -228,9 +239,13 @@ WITH RECURSIVE down(role_oid, member_oid, inherit, depth, via, path) AS (
 )
 SELECT rolname, inherit, depth, via FROM (
     SELECT DISTINCT ON (r.rolname)
-           r.rolname, inherit, depth, via
+           r.rolname,
+           -- Same OR-across-paths rule as the ancestor walk above: a member
+           -- inherits this role's privileges if any of its paths inherits.
+           bool_or(down.inherit) OVER (PARTITION BY r.rolname) AS inherit,
+           down.depth, down.via
     FROM down JOIN pg_roles r ON r.oid = down.member_oid
-    ORDER BY r.rolname, depth
+    ORDER BY r.rolname, down.depth
 ) sub
 ORDER BY depth, rolname
 """
