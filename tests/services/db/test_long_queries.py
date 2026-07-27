@@ -10,6 +10,7 @@ from dataplat.services.db.long_queries import (
     LongQueryRow,
     build_long_queries_query,
     fetch_long_queries,
+    fetch_query_history_postgres,
 )
 
 # A representative sys_query_history column set.
@@ -163,3 +164,96 @@ def test_fetch_long_queries_raises_on_unexpected_schema() -> None:
         fetch_long_queries(
             cur, min_seconds=60, limit=20, cutoff=_CUTOFF, running_only=False
         )
+
+
+# --- fetch_query_history_postgres -----------------------------------------
+
+# A modern pg_stat_statements column set, trimmed to what the history query
+# actually picks from: enough for discovery to resolve every lookup.
+_PGSS_COLUMNS = ["calls", "total_exec_time", "mean_exec_time", "max_exec_time", "query"]
+
+
+class _FakeDriverError(Exception):
+    """Stand-in for a psycopg error, carrying only what is matched on.
+
+    The service layer never imports psycopg, so the not-preloaded branch keys
+    off the ``sqlstate`` attribute every DB-API driver exposes rather than an
+    exception class. This fake keeps that branch covered on a machine without
+    Docker, where no server that reproduces the misconfiguration exists.
+    """
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class FakePgssCursor(FakeCursor):
+    """Serves the pg_stat_statements column probe, then fails the real scan.
+
+    That asymmetry *is* the defect being pinned: PostgreSQL answers
+    ``SELECT * FROM pg_stat_statements LIMIT 0`` from the view definition
+    without invoking the extension's C function, so column discovery succeeds
+    on a server where every real read of the view fails.
+    """
+
+    def __init__(self, *, error: Exception) -> None:
+        super().__init__(columns=list(_PGSS_COLUMNS), rows=[])
+        self._error = error
+
+    def execute(self, sql: str, params: tuple | None = None) -> None:
+        super().execute(sql, params)
+        if "limit 0" not in sql.lower():
+            raise self._error
+
+
+def test_history_translates_a_non_preloaded_extension() -> None:
+    """SQLSTATE 55000 becomes a ValidationError naming the actual remedy."""
+    cur = FakePgssCursor(
+        error=_FakeDriverError(
+            "pg_stat_statements must be loaded via shared_preload_libraries",
+            "55000",
+        )
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        fetch_query_history_postgres(cur, min_seconds=0, limit=10)
+
+    message = str(excinfo.value)
+    assert "shared_preload_libraries" in message
+    # A reload does not load a preloaded library, so the text must say restart.
+    assert "restart" in message.lower()
+    # Discovery still ran and still resolved: the probe cannot see this problem,
+    # which is why the translation has to sit on the scan.
+    assert len(cur.executed) == 2
+    assert "limit 0" in cur.executed[0][0].lower()
+    assert isinstance(excinfo.value.__cause__, _FakeDriverError)
+
+
+def test_history_does_not_swallow_unrelated_driver_errors() -> None:
+    """Only 55000 is translated; anything else keeps its type and reaches the CLI.
+
+    ``dp db long-queries --history`` runs inside ``db_session``, which handles
+    ``psycopg.Error`` itself, so a broadened catch here would replace real
+    connection failures with a misleading "not preloaded" message.
+    """
+    boom = _FakeDriverError("server closed the connection unexpectedly", "08006")
+    cur = FakePgssCursor(error=boom)
+
+    with pytest.raises(_FakeDriverError) as excinfo:
+        fetch_query_history_postgres(cur, min_seconds=0, limit=10)
+
+    assert excinfo.value is boom
+
+
+def test_history_maps_rows_when_the_extension_works() -> None:
+    """The happy path is untouched by the not-preloaded guard."""
+    cur = FakeCursor(
+        columns=list(_PGSS_COLUMNS),
+        rows=[(3, 1.5, 0.5, 0.9, "SELECT 1")],
+    )
+
+    rows = fetch_query_history_postgres(cur, min_seconds=0, limit=10)
+
+    assert [(r.calls, r.total_s, r.mean_s, r.max_s, r.query_text) for r in rows] == [
+        (3, 1.5, 0.5, 0.9, "SELECT 1")
+    ]

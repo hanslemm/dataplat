@@ -9,10 +9,17 @@ the history query discovers them at runtime — depend on the server version.
 
 So these tests open a second connection, make it run a slow query, watch the
 scan find it, and then kill it.
+
+The last section goes further and starts a second *server*: the
+installed-but-not-preloaded ``pg_stat_statements`` failure only exists on a
+server configured without the preload, which the suite's own server is not.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -469,3 +476,215 @@ def test_history_without_the_extension_raises_undefined_table(
         fetch_query_history_postgres(pg_cursor, min_seconds=0, limit=10)
 
     assert "pg_stat_statements" in str(excinfo.value)
+
+
+# --- pg_stat_statements installed but NOT preloaded ------------------------
+#
+# The single most common pg_stat_statements misconfiguration: `CREATE EXTENSION`
+# was run but the library was never added to shared_preload_libraries. The view
+# then exists with all its columns, and every read of it fails.
+#
+# This cannot be staged on the suite's own server, which is documented as
+# preloaded (see conftest), and it cannot be staged with a shadow view either:
+# only the extension's C function raises the error. So it needs a second server
+# started without the preload, which means Docker.
+
+_NOPRELOAD_IMAGE = "postgres:16"
+_NOPRELOAD_DB = "dataplat_test"
+_NOPRELOAD_PASSWORD = "postgres"
+# The pid keeps two concurrent runs against the same Docker daemon from fighting
+# over one container name, the way conftest's generated identifiers do.
+_NOPRELOAD_CONTAINER = f"dp-it-pgss-nopreload-{os.getpid()}"
+_NOPRELOAD_READY_TIMEOUT = 60.0
+
+
+def _docker(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
+    """Run one docker command, capturing output; a non-zero exit is not raised.
+
+    Every caller wants to decide for itself whether a failure means "skip,
+    Docker is not usable here" or "fail, Docker is usable and something else
+    broke", so the exit status is returned rather than thrown.
+    """
+    return subprocess.run(
+        ["docker", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _require_docker() -> None:
+    """Skip unless Docker can actually hand us a PostgreSQL container.
+
+    Three separate reasons get three separate messages, because "skipped" with a
+    vague reason is how a test quietly stops running everywhere.
+    """
+    if shutil.which("docker") is None:
+        pytest.skip(
+            "no docker executable on PATH: this test needs a SECOND PostgreSQL "
+            "started without pg_stat_statements in shared_preload_libraries, "
+            "and the suite's own server is preloaded, so the not-loaded failure "
+            "cannot be reproduced against it"
+        )
+    info = _docker("info", "--format", "{{.ServerVersion}}", timeout=30)
+    if info.returncode != 0:
+        pytest.skip(
+            "the docker daemon is not responding, so the second PostgreSQL "
+            "(one without pg_stat_statements preloaded) cannot be started: "
+            f"{(info.stderr or info.stdout).strip()}"
+        )
+    if _docker("image", "inspect", _NOPRELOAD_IMAGE, timeout=60).returncode != 0:
+        pull = _docker("pull", _NOPRELOAD_IMAGE, timeout=600)
+        if pull.returncode != 0:
+            pytest.skip(
+                f"the {_NOPRELOAD_IMAGE} image is not present and cannot be "
+                "pulled, so the second PostgreSQL (one without "
+                "pg_stat_statements preloaded) cannot be started: "
+                f"{(pull.stderr or pull.stdout).strip()}"
+            )
+
+
+def _published_port(container: str) -> str:
+    """Read back the host port Docker assigned to the container's 5432."""
+    result = _docker("port", container, "5432", timeout=30)
+    if result.returncode != 0:
+        pytest.fail(
+            f"docker could not report the published port of {container}: "
+            f"{(result.stderr or result.stdout).strip()}",
+            pytrace=False,
+        )
+    # One line per published binding, "127.0.0.1:32768"; any of them reaches
+    # the same server, so the first is enough.
+    mapping = result.stdout.strip().splitlines()[0].strip()
+    return mapping.rsplit(":", 1)[1]
+
+
+def _wait_until_ready(dsn: str, container: str) -> None:
+    """Block until the fresh container accepts queries, or fail loudly.
+
+    The official entrypoint runs initdb over a unix socket with an empty
+    ``listen_addresses``, so a successful TCP connection already means
+    initialisation finished — no separate readiness handshake needed.
+    """
+    import psycopg
+
+    deadline = time.monotonic() + _NOPRELOAD_READY_TIMEOUT
+    last: BaseException | None = None
+    while time.monotonic() < deadline:
+        try:
+            with psycopg.connect(dsn, connect_timeout=3) as probe:
+                probe.execute("SELECT 1")
+            return
+        except psycopg.Error as exc:
+            last = exc
+            time.sleep(0.5)
+    logs = _docker("logs", "--tail", "25", container, timeout=30)
+    pytest.fail(
+        f"{container} never accepted connections within "
+        f"{_NOPRELOAD_READY_TIMEOUT}s: {last}\n{logs.stdout}{logs.stderr}",
+        pytrace=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def unpreloaded_pg_dsn() -> Iterator[str]:
+    """DSN of a throwaway server where pg_stat_statements exists but is unloaded.
+
+    Deliberately independent of ``pg_dsn``: this server has to be the wrong one.
+    Removed unconditionally on teardown — a leaked container would hold a host
+    port and, worse, make a later run look like it exercised something it did
+    not.
+    """
+    import psycopg
+
+    _require_docker()
+
+    # A crashed earlier run with the same pid could have left this behind.
+    _docker("rm", "-f", _NOPRELOAD_CONTAINER, timeout=60)
+    run = _docker(
+        "run",
+        "-d",
+        "--name",
+        _NOPRELOAD_CONTAINER,
+        # Loopback-only, and an ephemeral host port picked by Docker: a
+        # hard-coded port would turn "something else already uses it" into a
+        # test failure that has nothing to do with the code under test.
+        "-p",
+        "127.0.0.1::5432",
+        "-e",
+        f"POSTGRES_PASSWORD={_NOPRELOAD_PASSWORD}",
+        "-e",
+        f"POSTGRES_DB={_NOPRELOAD_DB}",
+        _NOPRELOAD_IMAGE,
+        # NO -c shared_preload_libraries=... on purpose. That omission is the
+        # entire fixture.
+    )
+    if run.returncode != 0:
+        # Docker was proven usable above, so this is a real failure rather than
+        # an environment without Docker.
+        pytest.fail(
+            f"could not start {_NOPRELOAD_CONTAINER}: "
+            f"{(run.stderr or run.stdout).strip()}",
+            pytrace=False,
+        )
+
+    try:
+        port = _published_port(_NOPRELOAD_CONTAINER)
+        dsn = (
+            f"postgresql://postgres:{_NOPRELOAD_PASSWORD}@127.0.0.1:{port}/"
+            f"{_NOPRELOAD_DB}"
+        )
+        _wait_until_ready(dsn, _NOPRELOAD_CONTAINER)
+
+        with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cursor:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            preloaded = _scalar(cursor, "SHOW shared_preload_libraries")
+            # If a future image preloaded the library by default, this test
+            # would still pass while proving nothing, so the setup is asserted.
+            assert "pg_stat_statements" not in preloaded, (
+                "this container must have pg_stat_statements installed and NOT "
+                f"preloaded; shared_preload_libraries={preloaded!r}"
+            )
+        yield dsn
+    finally:
+        _docker("rm", "-f", _NOPRELOAD_CONTAINER, timeout=60)
+
+
+def test_history_raises_a_validation_error_when_pgss_is_not_preloaded(
+    unpreloaded_pg_dsn: str,
+) -> None:
+    """The guard has to survive the misconfiguration it was written for.
+
+    Regression test for a real defect: the guard probed the columns with
+    ``SELECT * FROM pg_stat_statements LIMIT 0``, which PostgreSQL answers from
+    the view definition without ever invoking the extension's C function. On an
+    installed-but-not-preloaded server the probe therefore succeeded with the
+    full column list, every lookup resolved, and the actual read died with a
+    raw ``ObjectNotInPrerequisiteState`` traceback instead of the actionable
+    error — the CLI only translates ``ValidationError``.
+    """
+    import psycopg
+
+    with (
+        psycopg.connect(unpreloaded_pg_dsn, autocommit=True) as conn,
+        conn.cursor() as cursor,
+    ):
+        # First, the reason the old guard could not work: discovery is happy.
+        cursor.execute("SELECT * FROM pg_stat_statements LIMIT 0")
+        probed = {desc.name for desc in (cursor.description or [])}
+        assert {"calls", "total_exec_time", "mean_exec_time", "query"} <= probed
+
+        with pytest.raises(ValidationError) as excinfo:
+            fetch_query_history_postgres(cursor, min_seconds=0, limit=10)
+
+    message = str(excinfo.value)
+    # The remedy has to be in the text: the library goes in
+    # shared_preload_libraries, and only a restart picks it up.
+    assert "shared_preload_libraries" in message
+    assert "restart" in message.lower()
+    # ... and it is that specific server error that was translated, not some
+    # other failure that happened to look similar.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, psycopg.errors.ObjectNotInPrerequisiteState)
+    assert cause.sqlstate == "55000"
