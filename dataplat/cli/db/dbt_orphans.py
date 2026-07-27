@@ -20,6 +20,8 @@ from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
     DEPRECATED_SUFFIX,
     LIVE_STATUSES,
+    BlockedEntry,
+    DependentObjectsError,
     DropEntry,
     ObjectKind,
     RenameEntry,
@@ -661,7 +663,19 @@ def purge_cmd(
         help="Path to a file with one exclusion token per line.",
     ),
 ) -> None:
-    """Permanently drop every object ending in _deprecated (irreversible)."""
+    """Permanently drop every object ending in _deprecated (irreversible).
+
+    All-or-nothing per target, by design: every drop for one warehouse runs
+    inside a single transaction, so if the warehouse refuses one of them
+    nothing is dropped for that target and the error names the blocking
+    relation. Keeping the drops that already succeeded would need either a
+    SAVEPOINT per object (Redshift has none) or a commit per object (which
+    would break the guarantee that --dry-run writes nothing) — and for a
+    destructive batch, stopping on the first surprise is the safer default. No
+    CASCADE is issued either, so a live view or foreign key still pointing at a
+    _deprecated relation is a real signal: resolve the dependents the error
+    lists, then re-run.
+    """
     if log is None:
         log = _timestamped_log_path(PURGE_LOG_PREFIX)
 
@@ -691,24 +705,48 @@ def purge_cmd(
     )
 
     all_drops: list[DropEntry] = []
+    blocked: list[BlockedEntry] = []
     try:
         for label, engine, env_prefix in engines:
-            all_drops.extend(
-                _purge_for_engine(
-                    label,
-                    engine,
-                    env_prefix=env_prefix,
-                    excluded_user_schemas=excluded_user_schemas,
-                    excluded_user_relations=excluded_user_relations,
-                    dry_run=dry_run,
-                    renamed_at=renamed_at,
-                    cutoff=cutoff,
-                    include_unknown=include_unknown,
+            try:
+                all_drops.extend(
+                    _purge_for_engine(
+                        label,
+                        engine,
+                        env_prefix=env_prefix,
+                        excluded_user_schemas=excluded_user_schemas,
+                        excluded_user_relations=excluded_user_relations,
+                        dry_run=dry_run,
+                        renamed_at=renamed_at,
+                        cutoff=cutoff,
+                        include_unknown=include_unknown,
+                    )
                 )
-            )
+            except DependentObjectsError as exc:
+                # The engine's transaction is already rolled back, so the drops
+                # it had made are (correctly) absent from all_drops. Record the
+                # refused attempt so the audit log shows why this target did
+                # nothing, then re-raise with the [<engine>] prefix every other
+                # error from this command carries.
+                blocked.append(
+                    BlockedEntry(
+                        database=label,
+                        schema=exc.schema,
+                        name=exc.name,
+                        kind=exc.kind,
+                        dependents=exc.dependents,
+                    )
+                )
+                raise ServiceError(f"[{label}] {exc}") from exc
     except ServiceError as exc:
-        _write_purge_log(log, all_drops, dry_run=dry_run)
+        _write_purge_log(log, all_drops, dry_run=dry_run, blocked=blocked)
         console.print(f"[red]{esc(exc)}[/red]")
+        if blocked:
+            console.print(
+                "[yellow]Nothing was dropped for that target: the purge is one "
+                "transaction, so a refused drop rolls the whole batch "
+                "back.[/yellow]"
+            )
         console.print(
             f"[yellow]Partial purge log written to {esc(log)} "
             f"({len(all_drops)} entries).[/yellow]"
@@ -839,12 +877,22 @@ def _drop_one(
     return DropEntry(database=label, schema=schema, name=name, kind=kind)
 
 
-def _write_purge_log(log_path: str, entries: list[DropEntry], *, dry_run: bool) -> None:
+def _write_purge_log(
+    log_path: str,
+    entries: list[DropEntry],
+    *,
+    dry_run: bool,
+    blocked: list[BlockedEntry] | None = None,
+) -> None:
     payload = {
         "generated_at": datetime.now(UTC).isoformat(),
         "dry_run": dry_run,
         "source": "dbt-orphans-purge",
         "drops": entries,
+        # A refused drop rolls its target's transaction back, so "drops" cannot
+        # hold the attempt; recorded separately or the log would show a purge
+        # that raised as having done nothing at all.
+        "blocked": blocked or [],
     }
     with open(log_path, "w") as f:
         json.dump(payload, f, indent=4)

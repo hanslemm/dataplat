@@ -17,7 +17,7 @@ from typing import Any, Literal, TypedDict
 import psycopg
 from psycopg import sql
 
-from dataplat.core.errors import ConfigError
+from dataplat.core.errors import ConfigError, ServiceError
 from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE, like_escape
 from dataplat.services.db.connection import (
     DbConnectionParams,
@@ -103,6 +103,45 @@ class DropEntry(TypedDict):
     schema: str
     name: str
     kind: ObjectKind
+
+
+class BlockedEntry(TypedDict):
+    """Serialized record of a drop the warehouse refused, written to the purge log.
+
+    A refused drop rolls its whole purge transaction back, so the attempt
+    leaves no trace in ``drops``. Without this the audit log would show the
+    purge as a silent no-op for that warehouse.
+    """
+
+    database: str
+    schema: str
+    name: str
+    kind: ObjectKind
+    dependents: str
+
+
+class DependentObjectsError(ServiceError):
+    """A ``DROP`` was refused because other objects still depend on the relation.
+
+    Carries the blocked relation and the server's own dependency listing so the
+    caller can name both in its error output and its audit log, instead of
+    surfacing a bare ``psycopg.errors.DependentObjectsStillExist`` that says
+    nothing the user can act on.
+    """
+
+    def __init__(
+        self, schema: str, name: str, kind: ObjectKind, dependents: str
+    ) -> None:
+        self.schema = schema
+        self.name = name
+        self.kind = kind
+        self.dependents = dependents
+        blockers = f" ({dependents})" if dependents else ""
+        super().__init__(
+            f"Cannot drop {kind} {schema}.{name}: other objects still depend "
+            f"on it{blockers}. Drop or repoint the dependent object(s), then "
+            f"re-run the purge."
+        )
 
 
 def resolve_orphans_connection_params(
@@ -238,15 +277,22 @@ def rename_object(
     )
 
 
+# ``IF EXISTS`` is dialect-safe: PostgreSQL and Redshift both accept it on all
+# three kinds this drops, so the keyword can be shared. It is load-bearing
+# because the purge runs every drop of one warehouse inside a single
+# transaction — without it, a relation that vanished between the scan and its
+# DROP raised UndefinedTable and rolled back the drops that had already
+# succeeded. ``IF EXISTS`` only suppresses "does not exist"; a wrong-kind
+# keyword still errors, so each kind keeps its own DROP.
 _DROP_KEYWORDS: dict[ObjectKind, str] = {
-    "table": "DROP TABLE",
-    "view": "DROP VIEW",
-    "matview": "DROP MATERIALIZED VIEW",
+    "table": "DROP TABLE IF EXISTS",
+    "view": "DROP VIEW IF EXISTS",
+    "matview": "DROP MATERIALIZED VIEW IF EXISTS",
 }
 
 
 def build_drop_statement(schema: str, name: str, kind: ObjectKind) -> sql.Composed:
-    """Build a ``DROP …`` statement for the given object kind."""
+    """Build a ``DROP … IF EXISTS`` statement for the given object kind."""
     return sql.SQL("{keyword} {schema}.{name}").format(
         keyword=sql.SQL(_DROP_KEYWORDS[kind]),
         schema=sql.Identifier(schema),
@@ -254,8 +300,31 @@ def build_drop_statement(schema: str, name: str, kind: ObjectKind) -> sql.Compos
     )
 
 
+def _dependents_detail(exc: psycopg.Error) -> str:
+    """Flatten the server's dependency ``DETAIL`` onto one line.
+
+    The server already names every dependent object, so no extra catalog query
+    (which would have to be written twice for Redshift) is needed. The DETAIL
+    is one line per dependent, and the CLI prints errors as single Rich lines.
+    """
+    detail = (exc.diag.message_detail or "").strip()
+    return "; ".join(line.strip() for line in detail.splitlines() if line.strip())
+
+
 def drop_object(cur: Any, schema: str, name: str, kind: ObjectKind) -> None:
-    cur.execute(build_drop_statement(schema, name, kind))
+    """Drop ``schema.name``, reporting a dependency refusal in actionable terms.
+
+    No ``CASCADE`` is issued, so a live view or foreign key still pointing at
+    the relation is a legitimate blocker rather than something to bulldoze —
+    but the raw ``DependentObjectsStillExist`` names neither the relation nor
+    the blockers once it has bubbled up through the purge, so translate it.
+    """
+    try:
+        cur.execute(build_drop_statement(schema, name, kind))
+    except psycopg.errors.DependentObjectsStillExist as exc:
+        raise DependentObjectsError(
+            schema, name, kind, _dependents_detail(exc)
+        ) from exc
 
 
 def fetch_deprecated_objects(

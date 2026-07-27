@@ -23,6 +23,7 @@ from tests.integration.conftest import SAMPLE_RELATIONS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from psycopg import Cursor
     from psycopg.rows import TupleRow
@@ -599,39 +600,77 @@ def test_dropping_a_matview_needs_the_matview_keyword(
     assert _catalog(pg_cursor, sample_schema)["customers_per_org"] == "m"
 
 
-def test_drop_object_of_a_vanished_relation_aborts_the_purge(
+def test_a_vanished_relation_no_longer_discards_the_rest_of_the_purge(
     pg_cursor: Cursor[TupleRow], sample_schema: str
 ) -> None:
-    """No ``IF EXISTS``: a relation dropped between scan and purge errors.
+    """A relation gone between scan and purge is a no-op, not an abort.
 
-    The CLI runs every drop of a purge inside one transaction, so this failure
-    discards the drops that already succeeded. Pinned rather than papered
-    over — the statement builder is shared with Redshift.
+    This is the whole point of ``IF EXISTS``: the CLI runs every drop of one
+    warehouse inside a single transaction, so the vanished relation used to
+    raise ``UndefinedTable`` and roll back the drops that had already
+    succeeded. The ghost is dropped *between* two real ones so the assertion
+    is that the batch completed, not merely that one statement survived.
     """
-    import psycopg
+    from dataplat.services.db import orphans
 
+    orphans.drop_object(pg_cursor, sample_schema, "active_customers", "view")
+    orphans.drop_object(pg_cursor, sample_schema, "ghost_deprecated", "table")
+    orphans.drop_object(pg_cursor, sample_schema, "customers_per_org", "matview")
+
+    catalog = _catalog(pg_cursor, sample_schema)
+    assert "active_customers" not in catalog
+    assert "customers_per_org" not in catalog
+    # The relation the purge could not find is, by every account, already gone.
+    assert "ghost_deprecated" not in catalog
+
+
+@pytest.mark.parametrize("kind", ["table", "view", "matview"])
+def test_dropping_an_absent_relation_is_a_no_op_for_every_kind(
+    pg_cursor: Cursor[TupleRow], sample_schema: str, kind: ObjectKind
+) -> None:
+    """``IF EXISTS`` is covered per kind because the DROP keyword differs.
+
+    ``DROP MATERIALIZED VIEW IF EXISTS`` is a different statement from ``DROP
+    TABLE IF EXISTS``, so a missing ``IF EXISTS`` on one kind would abort the
+    purge for that kind only.
+    """
+    from dataplat.services.db import orphans
+
+    orphans.drop_object(pg_cursor, sample_schema, f"ghost_{kind}_deprecated", kind)
+
+    # Still usable: an aborted transaction would fail this catalog read.
+    assert "customers" in _catalog(pg_cursor, sample_schema)
+
+
+def test_dropping_a_table_a_view_still_depends_on_names_the_blocker(
+    pg_cursor: Cursor[TupleRow], sample_schema: str
+) -> None:
+    """A dependency refusal arrives as an actionable, named error.
+
+    The refusal itself is deliberate — no ``CASCADE`` is issued, and a live
+    dependent is a real signal — so the drop still fails and the whole purge
+    still rolls back. What changed is the diagnosis: instead of a bare psycopg
+    ``DependentObjectsStillExist``, the caller gets the blocked relation and
+    the server's list of what holds it, which is what the user has to act on.
+    """
     from dataplat.services.db import orphans
 
     conn = pg_cursor.connection
-    with pytest.raises(psycopg.errors.UndefinedTable), conn.transaction():
-        orphans.drop_object(pg_cursor, sample_schema, "ghost_deprecated", "table")
-
-
-def test_dropping_a_table_a_view_still_depends_on_is_refused(
-    pg_cursor: Cursor[TupleRow], sample_schema: str
-) -> None:
-    """A deprecated table with a live dependent view cannot be purged.
-
-    Same single-transaction consequence as the vanished case, which is why the
-    real behaviour is worth pinning: purge order is not arbitrary.
-    """
-    import psycopg
-
-    from dataplat.services.db import orphans
-
-    conn = pg_cursor.connection
-    with pytest.raises(psycopg.errors.DependentObjectsStillExist), conn.transaction():
+    with (
+        pytest.raises(orphans.DependentObjectsError) as excinfo,
+        conn.transaction(),
+    ):
         orphans.drop_object(pg_cursor, sample_schema, "customers", "table")
+
+    exc = excinfo.value
+    assert (exc.schema, exc.name, exc.kind) == (sample_schema, "customers", "table")
+    assert f"{sample_schema}.customers" in str(exc)
+    # The server's DETAIL names every dependent; both of the sample schema's
+    # must survive the flattening onto one line.
+    assert f"{sample_schema}.active_customers" in exc.dependents
+    assert f"{sample_schema}.customers_per_org" in exc.dependents
+    assert exc.dependents in str(exc)
+    assert "\n" not in exc.dependents
 
     assert "customers" in _catalog(pg_cursor, sample_schema)
 
@@ -709,3 +748,94 @@ def test_open_transactional_connection_rolls_back_on_failure(pg_dsn: str) -> Non
     with open_transactional_connection(params, dry_run=True) as conn:
         row = conn.execute("SELECT to_regnamespace(%s)", (schema,)).fetchone()
     assert row == (None,)
+
+
+# --- purge, end to end through the CLI -------------------------------------
+
+
+def test_purge_names_the_blocking_relation_and_logs_the_refused_attempt(
+    pg_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One blocked drop fails the whole purge, informatively and on the record.
+
+    The all-or-nothing rollback is deliberate (see ``purge_cmd``), so the only
+    thing the user can act on is the diagnosis. This drives the real command
+    against the real server because that is the only place the three parts meet:
+    the psycopg error, its translation into a named failure, and the purge log
+    that has to show the attempt even though the transaction rolled back.
+
+    The fixtures cannot help here — ``sample_schema`` lives inside
+    ``pg_cursor``'s transaction, and ``purge`` opens its own connection — so
+    this test commits its own schema and owns the cleanup.
+    """
+    import json
+    import os
+
+    from typer.testing import CliRunner
+
+    from dataplat.cli.db import dbt_orphans as cli
+    from dataplat.services.db.connection import SqlEngine
+    from dataplat.services.db.orphans import open_transactional_connection
+
+    params = _connection_params(pg_dsn)
+    schema = f"dp_it_purge_{os.getpid()}"
+
+    def run(*statements: str) -> None:
+        with open_transactional_connection(params, dry_run=False) as conn:
+            for statement in statements:
+                conn.execute(statement)
+
+    label = "postgres"
+    monkeypatch.setattr(
+        cli,
+        "_engines_for_target",
+        lambda name: [(label, SqlEngine.postgresql, "DP_IT_PG")],
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: params,
+    )
+    log = tmp_path / "purge.log.json"
+
+    try:
+        run(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        run(
+            f'CREATE SCHEMA "{schema}"',
+            f'CREATE TABLE "{schema}".orders_deprecated (id integer)',
+            # Deliberately *not* suffixed, so the purge will not drop it: it is
+            # the live dependent that must refuse the drop above.
+            f'CREATE VIEW "{schema}".orders_live AS '
+            f'SELECT * FROM "{schema}".orders_deprecated',
+        )
+
+        result = CliRunner().invoke(
+            cli.app, ["purge", "--no-dry-run", "--yes", "--log", str(log)]
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "still depend" in result.output
+        assert "Nothing was dropped" in result.output
+
+        payload = json.loads(log.read_text())
+        assert payload["drops"] == []
+        assert payload["blocked"] == [
+            {
+                "database": label,
+                "schema": schema,
+                "name": "orders_deprecated",
+                "kind": "table",
+                "dependents": (
+                    f"view {schema}.orders_live depends on "
+                    f"table {schema}.orders_deprecated"
+                ),
+            }
+        ]
+
+        with open_transactional_connection(params, dry_run=True) as conn:
+            row = conn.execute(
+                f"SELECT to_regclass('\"{schema}\".orders_deprecated') IS NOT NULL"
+            ).fetchone()
+        assert row == (True,), "the refused purge must have rolled its drop back"
+    finally:
+        run(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

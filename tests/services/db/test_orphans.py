@@ -501,21 +501,67 @@ def test_build_drop_statement_table() -> None:
     from dataplat.services.db.orphans import build_drop_statement
 
     stmt = build_drop_statement("public", "foo_deprecated", "table")
-    assert stmt.as_string(None) == 'DROP TABLE "public"."foo_deprecated"'
+    assert stmt.as_string(None) == 'DROP TABLE IF EXISTS "public"."foo_deprecated"'
 
 
 def test_build_drop_statement_view() -> None:
     from dataplat.services.db.orphans import build_drop_statement
 
     stmt = build_drop_statement("public", "foo_deprecated", "view")
-    assert stmt.as_string(None) == 'DROP VIEW "public"."foo_deprecated"'
+    assert stmt.as_string(None) == 'DROP VIEW IF EXISTS "public"."foo_deprecated"'
 
 
 def test_build_drop_statement_matview() -> None:
     from dataplat.services.db.orphans import build_drop_statement
 
     stmt = build_drop_statement("public", "foo_deprecated", "matview")
-    assert stmt.as_string(None) == 'DROP MATERIALIZED VIEW "public"."foo_deprecated"'
+    assert (
+        stmt.as_string(None)
+        == 'DROP MATERIALIZED VIEW IF EXISTS "public"."foo_deprecated"'
+    )
+
+
+@pytest.mark.parametrize("kind", ["table", "view", "matview"])
+def test_build_drop_statement_carries_if_exists_for_every_kind(kind: str) -> None:
+    """The DROP keyword differs per kind, so ``IF EXISTS`` is asserted per kind.
+
+    Losing it on one kind would silently restore the old failure mode for that
+    kind only: the purge runs in a single transaction, so a relation that
+    vanished between scan and DROP would abort the batch.
+    """
+    from dataplat.services.db.orphans import build_drop_statement
+
+    stmt = build_drop_statement("public", "foo_deprecated", kind)  # type: ignore[arg-type]
+    assert " IF EXISTS " in stmt.as_string(None)
+
+
+def test_drop_object_names_the_relation_when_dependents_block_it() -> None:
+    """A dependency refusal becomes an actionable ``DependentObjectsError``.
+
+    The server's DETAIL (which names the dependents) needs a live connection,
+    so it is asserted in the integration suite; what matters here is that the
+    raw psycopg error never reaches the caller and the blocked relation is
+    carried on the exception for the purge log.
+    """
+    import psycopg
+
+    from dataplat.services.db.orphans import DependentObjectsError, drop_object
+
+    class RefusingCursor:
+        def execute(self, query, params=None) -> None:
+            raise psycopg.errors.DependentObjectsStillExist(
+                "cannot drop table public.orders because other objects depend on it"
+            )
+
+    with pytest.raises(DependentObjectsError) as excinfo:
+        drop_object(RefusingCursor(), "public", "orders_deprecated", "table")
+
+    exc = excinfo.value
+    assert (exc.schema, exc.name, exc.kind) == ("public", "orders_deprecated", "table")
+    assert "public.orders_deprecated" in str(exc)
+    # Nothing to list when the server gave no DETAIL, but the advice stays.
+    assert exc.dependents == ""
+    assert "re-run the purge" in str(exc)
 
 
 def test_fetch_deprecated_objects_postgres_merges_tables_and_matviews() -> None:
