@@ -142,6 +142,9 @@ def test_db_role_cli_smoke() -> None:
     cursor.fetchone.side_effect = [
         # resolve_role
         (16384, True, False),
+        # pg_authid readable? password_set is only knowable to a superuser, so
+        # fetch_attributes probes for the privilege before choosing its query.
+        (True,),
         # attributes
         (True, False, True, True, True, False, False, -1, False, None),
     ]
@@ -250,6 +253,8 @@ def test_db_role_cli_json_flag() -> None:
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         (16384, True, False),
+        # pg_authid privilege probe (see the smoke test above).
+        (True,),
         (True, False, True, True, True, False, False, -1, False, None),
     ]
     cursor.fetchall.side_effect = [

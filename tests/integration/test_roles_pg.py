@@ -287,17 +287,6 @@ def test_fetch_attributes_raises_for_a_missing_role(
         fetch_attributes(pg_cursor, f"dp_it_absent_{os.getpid()}", PG)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: _ATTRS_SQL_POSTGRES reads rolpassword from pg_roles, where the "
-        "column is the literal '********' and can never be NULL, so "
-        "password_set is unconditionally True. `dp db role show` therefore "
-        "prints 'Password set: yes' for every passwordless group role. Only "
-        "pg_authid holds the real hash and it is superuser-only, so the honest "
-        "fix makes the field tri-state -- an API change reaching the CLI."
-    ),
-)
 def test_fetch_attributes_password_set_distinguishes_a_passwordless_role(
     pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
 ) -> None:
@@ -305,7 +294,7 @@ def test_fetch_attributes_password_set_distinguishes_a_passwordless_role(
     without_password = temp_role("nopw")
 
     # pg_authid is the only place the truth lives; the connecting user is
-    # superuser here, so the test can see it even though the service cannot.
+    # superuser here, so both the test and the service can read it.
     pg_cursor.execute(
         "SELECT rolname, rolpassword IS NOT NULL FROM pg_authid "
         "WHERE rolname = ANY(%s)",
@@ -316,6 +305,45 @@ def test_fetch_attributes_password_set_distinguishes_a_passwordless_role(
 
     assert fetch_attributes(pg_cursor, with_password, PG).password_set is True
     assert fetch_attributes(pg_cursor, without_password, PG).password_set is False
+
+
+def test_fetch_attributes_password_set_is_none_without_pg_authid_access(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """A session that may not read pg_authid gets None, not a fabricated bool.
+
+    ``SET LOCAL ROLE`` to an ordinary role is how the probe is made to answer
+    "no" for real -- revoking superuser from the connecting user would break
+    every later test on this session. It also proves the promise that matters
+    most: reading the attributes of a role must not poison the transaction, and
+    a permission error on pg_authid would do exactly that.
+    """
+    from psycopg.pq import TransactionStatus
+
+    from dataplat.services.db.role import _pg_authid_readable
+
+    subject = temp_role("subject", login=True, password="pw-is-set")
+    unprivileged = temp_role("unprivileged")
+    assert _pg_authid_readable(pg_cursor) is True
+
+    _exec(pg_cursor, "SET LOCAL ROLE {r}", r=unprivileged)
+    try:
+        assert _pg_authid_readable(pg_cursor) is False
+        attrs = fetch_attributes(pg_cursor, subject, PG)
+    finally:
+        # Before the assertions below: temp_role's teardown needs superuser
+        # back, and a failure here must not cascade into a teardown ERROR.
+        pg_cursor.execute("RESET ROLE")
+
+    # The password really is set; the point is that the service refuses to
+    # claim either answer when it could not look.
+    assert attrs.password_set is None
+    # Everything pg_roles can answer is still answered.
+    assert attrs.can_login is True
+    assert attrs.connection_limit == -1
+    assert pg_cursor.connection.info.transaction_status is TransactionStatus.INTRANS, (
+        "reading attributes without pg_authid access aborted the transaction"
+    )
 
 
 # --- membership walks and the privilege closure ----------------------------
@@ -747,16 +775,6 @@ def test_owned_objects_lists_schemas_and_relation_kinds(
     assert summary.total_relations == 5
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: _KIND_LABEL maps both relkind 'r' and 'p' to 'table', and "
-        "fetch_owned_objects assigns instead of accumulating, so the 'r' group "
-        "overwrites the 'p' group. A role owning partitioned tables gets a "
-        "per-schema breakdown that under-counts its tables and no longer sums "
-        "to total_relations. Shared with the Redshift path, so not fixed here."
-    ),
-)
 def test_owned_objects_counts_partitioned_tables_in_the_table_total(
     pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory, sample_schema: str
 ) -> None:
@@ -783,8 +801,17 @@ def test_owned_objects_counts_partitioned_tables_in_the_table_total(
     )
 
     summary = fetch_owned_objects(pg_cursor, ref.oid, PG)
-    assert summary.total_relations == 3
-    assert summary.relations_by_schema[sample_schema] == {"table": 3}
+    breakdown = summary.relations_by_schema[sample_schema]
+    # relkind 'r' and 'p' are two GROUP BY rows sharing the "table" label, so
+    # both have to land in one tally: orgs + customers + the partitioned events.
+    # Accumulating is the whole fix; assigning reported 2 here.
+    assert breakdown["table"] == 3
+    # Three identity sequences changed hands with their owning tables (as the
+    # sibling ownership test spells out), so they belong in the total too.
+    assert breakdown == {"table": 3, "sequence": 3}
+    # The invariant the CLI depends on: the per-schema breakdown it prints must
+    # add up to the total printed underneath it.
+    assert sum(breakdown.values()) == summary.total_relations == 6
 
 
 # --- describe_role ---------------------------------------------------------

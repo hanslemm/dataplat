@@ -72,6 +72,19 @@ def _more_line(hidden: int) -> str:
     return f"  [dim italic]… and {hidden} more (raise --limit to see all).[/dim italic]"
 
 
+def _password_set_value(password_set: bool | None) -> str:
+    """Render the tri-state ``password_set`` as markup.
+
+    ``None`` means the server refused to say (pg_authid is superuser-only), and
+    the reason travels with the word: a bare "unknown" in a security report
+    reads as a tool defect, and rendering it as "no" would be a false negative
+    on exactly the field an auditor came for.
+    """
+    if password_set is None:
+        return "unknown [dim](needs superuser to read pg_authid)[/dim]"
+    return "yes" if password_set else "no"
+
+
 def _attributes_metadata(attrs: RoleAttributes) -> list[tuple[str, str]]:
     flags: list[str] = []
     if attrs.superuser:
@@ -97,7 +110,11 @@ def _attributes_metadata(attrs: RoleAttributes) -> list[tuple[str, str]]:
         # The title card renders metadata values as markup, and this one is
         # warehouse data (rolvaliduntil rendered by the driver).
         metadata.append(("Valid until", esc(attrs.valid_until)))
-    if attrs.password_set:
+    # `is True` on purpose: password_set is tri-state, and the card has room
+    # only for a bare word. An unexplained "unknown" chip is worse than no
+    # chip, so the unknown case is left to the Attributes table, which has
+    # room to say why.
+    if attrs.password_set is True:
         metadata.append(("Password", "set"))
     return metadata
 
@@ -122,7 +139,7 @@ def _render_attributes(
         "Connection limit",
         "unlimited" if attrs.connection_limit < 0 else str(attrs.connection_limit),
     )
-    table.add_row("Password set", "yes" if attrs.password_set else "no")
+    table.add_row("Password set", _password_set_value(attrs.password_set))
     table.add_row("Valid until", cell(attrs.valid_until or "—"))
     console.print(_indent(table))
 
