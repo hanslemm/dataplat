@@ -292,12 +292,64 @@ uv run mypy dataplat
 CI runs those four across Python 3.12 and 3.13 — the floor the wheel
 advertises as well as the pinned dev version.
 
+### Integration tests against a real PostgreSQL
+
+Most of the suite drives a fake database cursor. That proves a code path
+*called* `execute`, never that the SQL it built is valid. The tests in
+`tests/integration/` close that gap: they run the real statements against a
+live PostgreSQL and check the results, so an invalid column reference or a
+broken `GRANT` fails here instead of on your warehouse.
+
+`uv run pytest` stays green **without Docker** — the suite skips itself when
+no server is reachable. You only need the container to actually exercise it:
+
+```bash
+docker run -d --name dp-pg-test -p 55432:5432 \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=dataplat_test \
+    postgres:16 -c shared_preload_libraries=pg_stat_statements
+
+# Once per database: pg_stat_statements is a per-database extension.
+docker exec dp-pg-test psql -U postgres -d dataplat_test \
+    -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+
+DP_TEST_PG_REQUIRED=1 uv run pytest -m integration
+```
+
+The `-c shared_preload_libraries=pg_stat_statements` is not optional for full
+coverage: without it the extension installs but every *read* of the view fails
+with `pg_stat_statements must be loaded via shared_preload_libraries`, so
+`dp db long-queries --history` stays untested.
+
+| Variable | Purpose |
+| --- | --- |
+| `DP_TEST_PG_DSN` | Connection string for the test server. Default: `postgresql://postgres:postgres@127.0.0.1:55432/dataplat_test`. |
+| `DP_TEST_PG_REQUIRED` | Truthy ⇒ an unreachable server is a hard **error**. Unset ⇒ the tests skip. |
+
+Set `DP_TEST_PG_REQUIRED=1` whenever a skip would be a lie — that is, always
+in CI. Without it a broken container makes the tests vanish and the run goes
+green having validated no SQL at all. CI runs the integration job with it set,
+against a pinned PostgreSQL major, and the release workflow runs the same job
+as a gate before publishing.
+
+Each test runs in a transaction that is rolled back afterwards, so tests never
+see each other's objects and nothing survives a failed run. To select the
+fast, database-free subset explicitly, use `-m "not integration"`.
+
+**Known gap: Redshift.** Redshift cannot be containerized, so every
+Redshift-specific code path remains fake-tested only — its SQL is generated and
+asserted against a fake cursor, never executed. Treat changes to Redshift
+paths as unverified by CI and test them against a real cluster.
+
 ## Releasing
 
 Bump `[project].version`, then tag `X.Y.Z` (bare semver, no `v` prefix) on
 `main`. The release workflow refuses to publish unless the tag matches that
-version, and runs the full check matrix first; only then does GitHub Actions
-build and publish to PyPI via Trusted Publishing. Commits follow
+version, and runs the full check matrix *plus* the integration suite against a
+real PostgreSQL first; only then does GitHub Actions build and publish to PyPI
+via Trusted Publishing. A published version can be yanked but never replaced,
+so the extra minutes buy a guarantee that the shipped SQL has at least been
+parsed by a server. Commits follow
 [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## License
