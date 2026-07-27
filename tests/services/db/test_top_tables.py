@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from dataplat.services.db._like import like_escape
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.top_tables import (
     TopTableRow,
     TopTablesResult,
     _build_schema_where,
-    _like_escape,
     drop_statement,
     fetch_top_tables,
 )
@@ -32,10 +32,10 @@ class FakeCursor:
 
 
 def test_like_escape_preserves_literal_metacharacters() -> None:
-    assert _like_escape("dev_") == "dev\\_"
-    assert _like_escape("a%b") == "a\\%b"
-    assert _like_escape("a\\b") == "a\\\\b"
-    assert _like_escape("plain") == "plain"
+    assert like_escape("dev_") == "dev\\_"
+    assert like_escape("a%b") == "a\\%b"
+    assert like_escape("a\\b") == "a\\\\b"
+    assert like_escape("plain") == "plain"
 
 
 def test_build_schema_where_joins_with_or_and_adds_percent() -> None:

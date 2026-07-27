@@ -18,6 +18,7 @@ import psycopg
 from psycopg import sql
 
 from dataplat.core.errors import ConfigError
+from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE, like_escape
 from dataplat.services.db.connection import (
     DbConnectionParams,
     SqlEngine,
@@ -269,7 +270,12 @@ def fetch_deprecated_objects(
     Filters out ``information_schema``/``pg_*`` system schemas and any schema
     in ``excluded_schemas``.
     """
-    suffix_pattern = f"%{DEPRECATED_SUFFIX}"
+    # Escaped, not f"%{DEPRECATED_SUFFIX}": the suffix leads with an underscore,
+    # which LIKE reads as "any single character", so the raw pattern matched any
+    # name ending in <anychar>deprecated. A table called "legacydeprecated" came
+    # back as a purge candidate, and with --include-unknown the purge would have
+    # dropped it.
+    suffix_pattern = f"%{like_escape(DEPRECATED_SUFFIX)}"
     results: list[tuple[str, str, ObjectKind]] = []
 
     partition_child_filter = "" if is_redshift else _PARTITION_CHILD_FILTER
@@ -277,7 +283,7 @@ def fetch_deprecated_objects(
         f"""
         SELECT table_schema, table_name, table_type
         FROM information_schema.tables t
-        WHERE table_name LIKE %s
+        WHERE table_name LIKE %s {LIKE_ESCAPE_CLAUSE}
           AND table_schema NOT LIKE 'pg_%%'
           AND table_schema <> 'information_schema'
           {partition_child_filter}
@@ -292,10 +298,10 @@ def fetch_deprecated_objects(
 
     if not is_redshift:
         cur.execute(
-            """
+            f"""
             SELECT schemaname, matviewname
             FROM pg_matviews
-            WHERE matviewname LIKE %s
+            WHERE matviewname LIKE %s {LIKE_ESCAPE_CLAUSE}
               AND schemaname NOT LIKE 'pg_%%'
             """,
             (suffix_pattern,),

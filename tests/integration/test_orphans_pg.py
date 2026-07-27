@@ -533,22 +533,31 @@ def test_fetch_deprecated_objects_ignores_partition_children(
     assert _deprecated_in(pg_cursor, sample_schema) == {}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: the scan pattern is LIKE '%_deprecated', where the underscore is "
-        "a LIKE wildcard, so any name ending in <anychar>deprecated matches. "
-        "Shared with the Redshift path, so not fixed here."
-    ),
-)
 def test_fetch_deprecated_objects_requires_a_literal_underscore(
     pg_cursor: Cursor[TupleRow], sample_schema: str
 ) -> None:
-    """Only names carrying the real ``_deprecated`` suffix are candidates."""
+    """Only names carrying the real ``_deprecated`` suffix are candidates.
+
+    The scan pattern used to be ``LIKE '%_deprecated'`` with no ESCAPE, and an
+    unescaped underscore matches any single character — so ``legacydeprecated``
+    was reported as a purge candidate, and ``purge --include-unknown`` would
+    have dropped it.
+    """
     pg_cursor.execute(f'CREATE TABLE "{sample_schema}".legacydeprecated (id int)')
     pg_cursor.execute(f'CREATE TABLE "{sample_schema}".orgs_deprecated (id int)')
 
     assert _deprecated_in(pg_cursor, sample_schema) == {"orgs_deprecated": "table"}
+
+
+def test_deprecated_scan_ignores_percent_and_underscore_tricks(
+    pg_cursor: Cursor[TupleRow], sample_schema: str
+) -> None:
+    """Neither LIKE metacharacter in a relation name can widen the scan."""
+    for relname in ("a%deprecated", "b_deprecatedx", "xdeprecated"):
+        pg_cursor.execute(f'CREATE TABLE "{sample_schema}"."{relname}" (id int)')
+    pg_cursor.execute(f'CREATE TABLE "{sample_schema}".real_deprecated (id int)')
+
+    assert _deprecated_in(pg_cursor, sample_schema) == {"real_deprecated": "table"}
 
 
 # --- purge -----------------------------------------------------------------
