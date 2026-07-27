@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- `dp db dbt-orphans` could report — and with `purge --include-unknown`, drop —
+  a relation it had never renamed. The scan matched `LIKE '%_deprecated'` with
+  no `ESCAPE`, and an unescaped `_` matches any single character, so a table
+  named `legacydeprecated` came back as a purge candidate. Found by running the
+  scan against a real PostgreSQL; `top_tables.py` had carried the escaping fix
+  for this since the beginning, one module over, which is exactly why the
+  helper now lives in one place both modules share.
+
+- `dp db describe` reported `Size 0 B` and no row estimate for every ordinary
+  table, matview and view. All five header size aggregates read from
+  `pg_partition_tree()`, which returns no rows for a relation that is neither
+  partitioned nor a partition; `SUM` over no rows is `NULL`, and a
+  `COALESCE(..., 0)` inside each subquery presented that as a confident zero.
+  Partitioned tables had the mirror-image bug and double-counted rows, because
+  `reltuples` on an analyzed parent already aggregates its partitions.
+
+- `dp db role show` under-reported a role's privileges. The recursive
+  membership walk collapsed duplicate paths with `DISTINCT ON`, and when an
+  ancestor was reachable by several equal-depth paths the surviving row — and
+  therefore whether `INHERIT` was honoured — was decided by scan order.
+  PostgreSQL reported the privilege as held while dataplat showed it missing.
+
+- `dp db long-queries` could return an empty snapshot. The scan measured age
+  with `now()`, which is `transaction_timestamp()`, so any query that started
+  after the scanning transaction began had a negative age and failed the
+  threshold filter silently.
+
+### Added
+
+- An integration suite that executes the database service layer against a real
+  PostgreSQL, in CI and locally (`tests/integration/`, see the README). It
+  found all four fixes above, plus seven further defects now pinned as strict
+  expected failures. Releases are gated on it: `build` will not run until the
+  suite passes.
+
 ## 0.2.0
 
 ### Fixed
