@@ -295,6 +295,13 @@ uv run mypy dataplat
 CI runs those four across Python 3.12 and 3.13 — the floor the wheel
 advertises as well as the pinned dev version.
 
+Redshift cannot be containerized, so CI cannot cover it. If you run dataplat
+against a Redshift cluster, you can verify your own deployment: point
+`DP_TEST_RS_TARGET` at one of your targets and run the read-only tier
+(`uv run pytest -m redshift`). It only issues `SELECT`s — a guard refuses
+anything else before it reaches the server — and prints what your cluster
+answered. See [CONTRIBUTING.md](CONTRIBUTING.md#testing-against-a-real-redshift-cluster).
+
 ### Integration tests against a real PostgreSQL
 
 Most of the suite drives a fake database cursor. That proves a code path
