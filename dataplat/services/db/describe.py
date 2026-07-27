@@ -665,6 +665,12 @@ def fetch_view_definition(cursor: Any, oid: int, engine: SqlEngine) -> ViewDefin
     if row is None:
         raise TargetNotFoundError(f"view with oid {oid} not found")
     sql, is_updatable, check_option = row
+    # pg_get_viewdef() does not error on a non-view oid, it returns NULL, so a
+    # table's oid produces a row whose definition is missing. Reject it the way
+    # the Redshift branch above does: returning ViewDefinition(sql=None) would
+    # break this dataclass's own `sql: str` contract for every caller.
+    if sql is None:
+        raise TargetNotFoundError(f"view with oid {oid} not found")
     updatable = isinstance(is_updatable, str) and is_updatable.upper() == "YES"
     if check_option is None or check_option == "NONE":
         check_option_value: str | None = None
@@ -752,7 +758,40 @@ ORDER BY c.relkind, c.relname
 """
 
 
-_SCHEMA_PRIVILEGES_SQL = """
+# PostgreSQL exposes schema ACLs only through pg_namespace.nspacl; there is no
+# information_schema view for them. usage_privileges reports DOMAIN, COLLATION,
+# FDW, foreign server and sequence object types and never 'SCHEMA', so the
+# USAGE half of the old shared query silently matched zero rows and every
+# GRANT USAGE ON SCHEMA was missing from the report.
+#
+# The COALESCE is load-bearing: nspacl stays NULL until the first GRANT or
+# REVOKE touches the schema, and NULL means "the built-in default" -- the owner
+# holding USAGE + CREATE -- not "nobody holds anything". acldefault('n', owner)
+# materialises that default so a freshly created schema still reports its
+# owner's privileges.
+#
+# Reading the ACL also makes grantor and WITH GRANT OPTION truthful: the CREATE
+# half of the old query derived grantees from has_schema_privilege() and had to
+# hardcode grantor='' and with_grant_option=false.
+_SCHEMA_PRIVILEGES_SQL_POSTGRES = """
+SELECT
+    CASE WHEN (acl).grantee = 0 THEN 'PUBLIC'
+         ELSE pg_get_userbyid((acl).grantee) END AS grantee,
+    (acl).privilege_type AS privilege_type,
+    (acl).is_grantable AS with_grant_option,
+    pg_get_userbyid((acl).grantor) AS grantor
+FROM pg_namespace n
+CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) AS acl
+WHERE n.nspname = %s
+ORDER BY grantee, privilege_type
+"""
+
+
+# Unchanged from when this query was shared by both engines, and deliberately
+# NOT switched to the aclexplode form above: Redshift has no aclexplode() and
+# no cluster is available to test a replacement against. Its USAGE reporting is
+# therefore still unverified and probably as empty as PostgreSQL's was.
+_SCHEMA_PRIVILEGES_SQL_REDSHIFT = """
 SELECT grantee, privilege_type, is_grantable = 'YES', grantor
 FROM information_schema.usage_privileges
 WHERE object_schema = %s AND object_type = 'SCHEMA'
@@ -820,9 +859,19 @@ def fetch_schema_contents(
     ]
 
 
-def fetch_schema_privileges(cursor: Any, schema: str) -> list[PrivilegeGrant]:
-    """Return USAGE + CREATE grants for the schema."""
-    cursor.execute(_SCHEMA_PRIVILEGES_SQL, (schema, schema))
+def fetch_schema_privileges(
+    cursor: Any, schema: str, engine: SqlEngine
+) -> list[PrivilegeGrant]:
+    """Return USAGE + CREATE grants for the schema.
+
+    On PostgreSQL these come from ``pg_namespace.nspacl``, which lists explicit
+    ACL entries plus the owner's implicit default; a role that only holds the
+    privilege through membership in a granted role is not a separate row.
+    """
+    if engine == SqlEngine.redshift:
+        cursor.execute(_SCHEMA_PRIVILEGES_SQL_REDSHIFT, (schema, schema))
+    else:
+        cursor.execute(_SCHEMA_PRIVILEGES_SQL_POSTGRES, (schema,))
     return [PrivilegeGrant(*row) for row in cursor.fetchall()]
 
 
@@ -1044,7 +1093,7 @@ def describe_schema(
 ) -> SchemaDescription:
     """Compose a full schema description by invoking each fetcher."""
     header = fetch_schema_header(cursor, ref.schema)
-    privileges = fetch_schema_privileges(cursor, ref.schema)
+    privileges = fetch_schema_privileges(cursor, ref.schema, engine)
     default_privileges = fetch_schema_default_privileges(cursor, ref.schema, engine)
     contents = fetch_schema_contents(cursor, ref.schema, engine)
     return SchemaDescription(

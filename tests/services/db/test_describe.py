@@ -491,6 +491,15 @@ def test_fetch_view_definition_missing_raises() -> None:
         fetch_view_definition(cursor, 42, SqlEngine.postgresql)
 
 
+def test_fetch_view_definition_null_definition_raises() -> None:
+    # pg_get_viewdef() returns NULL rather than erroring for an oid that is not
+    # a view, so the row is present and only the definition is missing. Passing
+    # that through would produce ViewDefinition(sql=None).
+    cursor = FakeCursor([(None, None, None)])
+    with pytest.raises(TargetNotFoundError, match="view with oid 42 not found"):
+        fetch_view_definition(cursor, 42, SqlEngine.postgresql)
+
+
 def test_fetch_view_definition_check_option_none_str() -> None:
     cursor = FakeCursor([("SELECT 1;", "NO", "NONE")])
     vd = fetch_view_definition(cursor, 42, SqlEngine.postgresql)
@@ -595,8 +604,27 @@ def test_fetch_schema_contents_redshift_uses_redshift_sql() -> None:
 def test_fetch_schema_privileges() -> None:
     rows = [("analyst", "USAGE", False, "dbadmin"), ("app", "CREATE", True, "dbadmin")]
     cursor = FakeCursor([rows])
-    grants = fetch_schema_privileges(cursor, "public")
+    grants = fetch_schema_privileges(cursor, "public", SqlEngine.postgresql)
     assert PrivilegeGrant("analyst", "USAGE", False, "dbadmin") in grants
+    assert len(cursor.queries) == 1
+    query_text, params = cursor.queries[0]
+    # information_schema.usage_privileges has no 'SCHEMA' rows on PostgreSQL, so
+    # the ACL in pg_namespace is the only place USAGE grants can be read from.
+    assert "aclexplode" in query_text
+    assert "usage_privileges" not in query_text
+    assert params == ("public",)
+
+
+def test_fetch_schema_privileges_redshift_uses_redshift_sql() -> None:
+    # Redshift has no aclexplode(), so that branch keeps the information_schema
+    # query untouched and takes the schema name twice.
+    cursor = FakeCursor([[]])
+    fetch_schema_privileges(cursor, "public", SqlEngine.redshift)
+    assert len(cursor.queries) == 1
+    query_text, params = cursor.queries[0]
+    assert "information_schema.usage_privileges" in query_text
+    assert "aclexplode" not in query_text
+    assert params == ("public", "public")
 
 
 def test_fetch_schema_default_privileges_postgres() -> None:
