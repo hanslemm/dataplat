@@ -44,5 +44,128 @@ jobs:
       - name: MyPy
         run: uv run mypy dataplat
 
-      - name: Pytest
-        run: uv run pytest
+      # Deselected rather than left to skip. With no server reachable the
+      # integration tests would skip on their own, but naming the marker keeps
+      # this leg an honest database-free signal instead of a growing pile of
+      # skips reported twice per push. Marker deselection happens after
+      # collection, so an import error under tests/integration/ still fails
+      # here and does not have to wait for the integration job.
+      - name: Pytest (unit)
+        run: uv run pytest -m "not integration"
+
+  # A separate job, not extra steps in the matrix above, for two reasons: the
+  # unit legs are the fast signal and must not queue behind a container boot,
+  # and a database per Python version would buy nothing -- the SQL these tests
+  # validate is identical on every interpreter.
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # An explicit major, never "latest": a silent server upgrade must not be
+        # able to change what this job proves. Adding a second major is a
+        # one-token edit here if catalog drift across majors ever earns the
+        # minutes.
+        postgres-version: ["16"]
+    env:
+      # The dev pin only -- see the job comment. The 3.12 floor is imported,
+      # linted and type-checked by `checks` above.
+      UV_PYTHON: "3.13"
+      # Matches the default in tests/integration/conftest.py, set explicitly so
+      # the published port below and the DSN cannot drift apart unnoticed.
+      DP_TEST_PG_DSN: postgresql://postgres:postgres@127.0.0.1:55432/dataplat_test
+      # The single most important line in this file. Without it an unreachable
+      # server turns every integration test into a skip: the job goes green, the
+      # badge stays green, and CI reports success while executing none of the
+      # SQL this suite exists to validate. Truthy here means the harness raises
+      # instead of skipping.
+      DP_TEST_PG_REQUIRED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # `docker run`, not a `services:` block. A service container is started
+      # with the image's default command and Actions gives no way to append
+      # arguments to it, so `-c shared_preload_libraries=pg_stat_statements`
+      # cannot be passed. Without that preload the extension still installs and
+      # its columns are still describable, but every read of the view raises
+      # "pg_stat_statements must be loaded via shared_preload_libraries" -- that
+      # errors the harness's own pg_stat_statements test and leaves the
+      # version-branching second half of fetch_query_history_postgres
+      # unexecuted, which is precisely the coverage this job exists for.
+      #
+      # Detached and placed before `uv sync` so initdb runs while dependencies
+      # install; by the time the wait step runs the server is normally up.
+      - name: Start PostgreSQL ${{ matrix.postgres-version }}
+        run: |
+          docker run --detach --name dp-pg-ci \
+            --publish 55432:5432 \
+            --env POSTGRES_PASSWORD=postgres \
+            --env POSTGRES_DB=dataplat_test \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d dataplat_test" \
+            --health-interval 2s \
+            --health-timeout 5s \
+            --health-retries 30 \
+            postgres:${{ matrix.postgres-version }} \
+            -c shared_preload_libraries=pg_stat_statements
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Setup Python
+        run: uv python install 3.13
+
+      # --all-extras is what installs psycopg (the optional "db" extra). The
+      # harness routes a missing psycopg through the same gate as an unreachable
+      # server, so under DP_TEST_PG_REQUIRED=1 dropping it is a hard error
+      # rather than a quiet skip.
+      - name: Install dependencies
+        run: uv sync --group dev --all-extras
+
+      # `-h 127.0.0.1` in the health command above is deliberate: the official
+      # entrypoint runs a temporary socket-only server while it initialises the
+      # data directory, so a Unix-socket probe reports "ready" before the real
+      # server is listening on TCP -- which is how the tests connect.
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 60); do
+            state="$(
+              docker inspect \
+                --format '{{.State.Running}}/{{.State.Health.Status}}' dp-pg-ci
+            )"
+            case "$state" in
+              true/healthy)
+                echo "PostgreSQL is accepting TCP connections."
+                exit 0
+                ;;
+              # An exited or unhealthy container (bad flag, image change, OOM)
+              # will never turn healthy: fail now with its log instead of
+              # stalling for the full two minutes.
+              false/* | */unhealthy)
+                break
+                ;;
+            esac
+            sleep 2
+          done
+          echo "::error::PostgreSQL never became healthy (state: $state)."
+          docker logs dp-pg-ci
+          exit 1
+
+      # Preloading the library only makes the view available server-wide; the
+      # extension itself is per-database and has to be created once. Nothing in
+      # the suite can do it -- the fixtures roll back every transaction.
+      - name: Enable pg_stat_statements
+        run: |
+          docker exec dp-pg-ci psql \
+            --username postgres --dbname dataplat_test \
+            --set ON_ERROR_STOP=1 \
+            --command 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+
+      - name: Pytest (integration)
+        run: uv run pytest -m integration
+
+      # For the failures that are about the database rather than the SQL:
+      # refused connections, a crashed backend, the OOM killer.
+      - name: PostgreSQL server log
+        if: failure()
+        run: docker logs dp-pg-ci

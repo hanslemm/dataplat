@@ -5,9 +5,9 @@ on:
     tags: ["[0-9]*.[0-9]*.[0-9]*"]
 
 jobs:
-  # Nothing downstream re-checks the tree, so this job is the only thing
-  # standing between an untested commit and PyPI. Publishing is irreversible:
-  # a version can be yanked but never replaced.
+  # Nothing downstream re-checks the tree, so this job and `integration` are the
+  # only things standing between an untested commit and PyPI. Publishing is
+  # irreversible: a version can be yanked but never replaced.
   verify:
     runs-on: ubuntu-latest
     strategy:
@@ -62,11 +62,119 @@ jobs:
       - name: MyPy
         run: uv run mypy dataplat
 
-      - name: Pytest
-        run: uv run pytest
+      # Mirrors ci.yml: the database-backed half of the suite is the
+      # `integration` job below, which gates `build` alongside this one.
+      - name: Pytest (unit)
+        run: uv run pytest -m "not integration"
+
+  # This gate exists because the alternative is shipping SQL no server has ever
+  # parsed. dataplat's db services are thousands of lines of generated SQL, and
+  # the fake-cursor tests in `verify` prove only that execute() was called -- an
+  # invalid column, a Redshift-only construct on the PostgreSQL path, or a broken
+  # GRANT passes them all and fails on a user's warehouse. Since a bad version
+  # can only be yanked, never replaced, the few minutes this adds to tagging are
+  # cheap next to a release that has to be withdrawn.
+  #
+  # Deliberately NOT `needs: verify`: it runs concurrently with the verify
+  # matrix, so the added wall-clock is the amount by which it outlasts verify,
+  # not its full runtime. Every executable line is identical to ci.yml's
+  # integration job -- only the surrounding prose differs -- so the tag gate
+  # cannot quietly become weaker than the per-push one. (A reusable workflow
+  # would remove the duplication; two copies this size do not yet justify the
+  # extra indirection.)
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: ["16"]
+    env:
+      UV_PYTHON: "3.13"
+      DP_TEST_PG_DSN: postgresql://postgres:postgres@127.0.0.1:55432/dataplat_test
+      # Load-bearing: without it an unreachable server makes every integration
+      # test skip, and this gate would wave through exactly the unexecuted SQL it
+      # was added to catch.
+      DP_TEST_PG_REQUIRED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # `docker run` rather than a `services:` block: a service container runs
+      # the image's default command with no way to append arguments, so
+      # shared_preload_libraries cannot be set -- and without it every read of
+      # pg_stat_statements raises "must be loaded via shared_preload_libraries".
+      # Detached and before `uv sync` so initdb overlaps the install.
+      - name: Start PostgreSQL ${{ matrix.postgres-version }}
+        run: |
+          docker run --detach --name dp-pg-ci \
+            --publish 55432:5432 \
+            --env POSTGRES_PASSWORD=postgres \
+            --env POSTGRES_DB=dataplat_test \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d dataplat_test" \
+            --health-interval 2s \
+            --health-timeout 5s \
+            --health-retries 30 \
+            postgres:${{ matrix.postgres-version }} \
+            -c shared_preload_libraries=pg_stat_statements
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Setup Python
+        run: uv python install 3.13
+
+      # --all-extras installs psycopg; the harness treats it as missing
+      # infrastructure, so under DP_TEST_PG_REQUIRED=1 omitting it errors.
+      - name: Install dependencies
+        run: uv sync --group dev --all-extras
+
+      # `-h 127.0.0.1` in the health command matters: the entrypoint runs a
+      # socket-only server during initdb, so a socket probe says "ready" before
+      # TCP -- the transport the tests actually use -- is listening.
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 60); do
+            state="$(
+              docker inspect \
+                --format '{{.State.Running}}/{{.State.Health.Status}}' dp-pg-ci
+            )"
+            case "$state" in
+              true/healthy)
+                echo "PostgreSQL is accepting TCP connections."
+                exit 0
+                ;;
+              # An exited or unhealthy container (bad flag, image change, OOM)
+              # will never turn healthy: fail now with its log instead of
+              # stalling for the full two minutes.
+              false/* | */unhealthy)
+                break
+                ;;
+            esac
+            sleep 2
+          done
+          echo "::error::PostgreSQL never became healthy (state: $state)."
+          docker logs dp-pg-ci
+          exit 1
+
+      # Server-wide preload only exposes the view; the extension is per-database.
+      - name: Enable pg_stat_statements
+        run: |
+          docker exec dp-pg-ci psql \
+            --username postgres --dbname dataplat_test \
+            --set ON_ERROR_STOP=1 \
+            --command 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+
+      - name: Pytest (integration)
+        run: uv run pytest -m integration
+
+      - name: PostgreSQL server log
+        if: failure()
+        run: docker logs dp-pg-ci
 
   build:
-    needs: verify
+    # Both gates, so neither a lint/type/unit regression nor SQL that no server
+    # accepts can reach the publish job.
+    needs: [verify, integration]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
