@@ -279,6 +279,9 @@ dp ingest airbyte connections set-cursor -c <connection-id> --xmin 0 --yes
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the integration suite and the rules
+for changing SQL that runs on Redshift.
+
 ```bash
 git clone https://github.com/hanslemm/dataplat
 cd dataplat
