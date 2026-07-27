@@ -843,22 +843,16 @@ def test_view_definition_of_a_matview(
     assert definition.check_option is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pg_get_viewdef() returns NULL for a non-view oid, and unlike the "
-        "Redshift branch the PostgreSQL branch has no None guard: it returns "
-        "ViewDefinition(sql=None), violating its own `sql: str` annotation. "
-        "Not fixed here -- see report."
-    ),
-)
 def test_view_definition_on_a_table_should_raise(
     pg_cursor: Cursor[TupleRow], sample_schema: str
 ) -> None:
-    with pytest.raises(TargetNotFoundError):
-        fetch_view_definition(
-            pg_cursor, _oid(pg_cursor, sample_schema, "customers"), PG
-        )
+    # pg_get_viewdef() returns NULL instead of erroring for a non-view oid, so
+    # the row exists and only its definition is missing. Silently returning
+    # ViewDefinition(sql=None) would break the `sql: str` annotation.
+    oid = _oid(pg_cursor, sample_schema, "customers")
+    assert _scalar(pg_cursor, "SELECT pg_get_viewdef(%s::oid, true)", oid) is None
+    with pytest.raises(TargetNotFoundError, match=f"view with oid {oid} not found"):
+        fetch_view_definition(pg_cursor, oid, PG)
 
 
 def test_dependencies_upstream_of_a_view(
@@ -1268,7 +1262,7 @@ def test_schema_privileges_report_a_create_grant(
     pg_cursor: Cursor[TupleRow], sample_schema: str, temp_role: TempRoleFactory
 ) -> None:
     role = temp_role("creator")
-    before = fetch_schema_privileges(pg_cursor, sample_schema)
+    before = fetch_schema_privileges(pg_cursor, sample_schema, PG)
     assert role not in {g.grantee for g in before}
     # The owner always has CREATE, so the fetcher must already return a row.
     assert any(
@@ -1278,21 +1272,10 @@ def test_schema_privileges_report_a_create_grant(
     )
 
     _ddl(pg_cursor, "GRANT CREATE ON SCHEMA {s} TO {r}", s=sample_schema, r=role)
-    after = fetch_schema_privileges(pg_cursor, sample_schema)
+    after = fetch_schema_privileges(pg_cursor, sample_schema, PG)
     assert ("CREATE", role) in {(g.privilege, g.grantee) for g in after}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "information_schema.usage_privileges never contains object_type "
-        "'SCHEMA' on PostgreSQL (only DOMAIN/COLLATION/FDW/server/sequence), "
-        "so the USAGE half of the UNION always returns zero rows and a "
-        "GRANT USAGE ON SCHEMA is invisible in the report. The fetcher takes no "
-        "engine argument, so the SQL is shared with Redshift and is not fixed "
-        "here -- see report."
-    ),
-)
 def test_schema_privileges_should_report_a_usage_grant(
     pg_cursor: Cursor[TupleRow], sample_schema: str, temp_role: TempRoleFactory
 ) -> None:
@@ -1302,8 +1285,82 @@ def test_schema_privileges_should_report_a_usage_grant(
     assert _scalar(
         pg_cursor, "SELECT has_schema_privilege(%s, %s, 'USAGE')", role, sample_schema
     )
-    grants = fetch_schema_privileges(pg_cursor, sample_schema)
+    grants = fetch_schema_privileges(pg_cursor, sample_schema, PG)
     assert ("USAGE", role) in {(g.privilege, g.grantee) for g in grants}
+
+    # ...and it disappears again once revoked, which rules out a query that
+    # reports every role rather than the schema's actual ACL entries.
+    _ddl(pg_cursor, "REVOKE USAGE ON SCHEMA {s} FROM {r}", s=sample_schema, r=role)
+    after = fetch_schema_privileges(pg_cursor, sample_schema, PG)
+    assert role not in {g.grantee for g in after}
+
+
+def test_schema_privileges_of_an_untouched_schema_are_the_owner_defaults(
+    pg_cursor: Cursor[TupleRow], sample_schema: str
+) -> None:
+    # pg_namespace.nspacl is NULL until the first GRANT/REVOKE, and NULL means
+    # "the built-in default" -- owner holds USAGE + CREATE -- not "no
+    # privileges". Without the acldefault() fallback in the query, a schema
+    # nobody has granted on would report nothing at all.
+    assert _scalar(
+        pg_cursor,
+        "SELECT nspacl IS NULL FROM pg_namespace WHERE nspname = %s",
+        sample_schema,
+    )
+    owner = _scalar(pg_cursor, "SELECT current_user")
+    grants = fetch_schema_privileges(pg_cursor, sample_schema, PG)
+    assert {(g.grantee, g.privilege) for g in grants} == {
+        (owner, "USAGE"),
+        (owner, "CREATE"),
+    }
+
+
+def test_schema_privileges_report_public_grantor_and_grant_option(
+    pg_cursor: Cursor[TupleRow], sample_schema: str, temp_role: TempRoleFactory
+) -> None:
+    delegate = temp_role("delegate")
+    onward = temp_role("onward")
+    _ddl(
+        pg_cursor,
+        "GRANT USAGE ON SCHEMA {s} TO {d} WITH GRANT OPTION",
+        "GRANT USAGE ON SCHEMA {s} TO PUBLIC",
+        s=sample_schema,
+        d=delegate,
+    )
+    # Re-granted by the delegate rather than the owner, so grantor has to come
+    # from the ACL entry instead of being assumed to be the schema owner.
+    _ddl(pg_cursor, "SET ROLE {d}", d=delegate)
+    _ddl(pg_cursor, "GRANT USAGE ON SCHEMA {s} TO {o}", s=sample_schema, o=onward)
+    # Reset before the fixtures tear down: their DROP ROLE cannot run while
+    # this session still *is* one of the roles being dropped.
+    pg_cursor.execute("RESET ROLE")
+
+    owner = _scalar(pg_cursor, "SELECT current_user")
+    grants = {
+        (g.grantee, g.privilege): g
+        for g in fetch_schema_privileges(pg_cursor, sample_schema, PG)
+    }
+    # Undone before the assertions, not after: DROP OWNED BY cannot remove an
+    # ACL entry whose grantor is a different role, so leaving the onward grant
+    # in place would make the temp_role teardown fail and hide the real result.
+    _ddl(
+        pg_cursor,
+        "REVOKE USAGE ON SCHEMA {s} FROM {d} CASCADE",
+        s=sample_schema,
+        d=delegate,
+    )
+
+    assert grants[(delegate, "USAGE")].with_grant_option is True
+    assert grants[(delegate, "USAGE")].grantor == owner
+    assert grants[(onward, "USAGE")].with_grant_option is False
+    assert grants[(onward, "USAGE")].grantor == delegate
+    # PUBLIC has no pg_roles row -- aclexplode reports grantee oid 0 -- so the
+    # query must spell it out, the way the relation-level report does.
+    assert ("PUBLIC", "USAGE") in grants
+    assert grants[("PUBLIC", "USAGE")].with_grant_option is False
+    # Explicit grants materialise nspacl; the owner's defaults must survive it.
+    assert (owner, "USAGE") in grants
+    assert (owner, "CREATE") in grants
 
 
 def test_schema_default_privileges_from_the_fixture(
