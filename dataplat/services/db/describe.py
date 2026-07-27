@@ -787,14 +787,29 @@ ORDER BY grantee, privilege_type
 """
 
 
-# Unchanged from when this query was shared by both engines, and deliberately
-# NOT switched to the aclexplode form above: Redshift has no aclexplode() and
-# no cluster is available to test a replacement against. Its USAGE reporting is
-# therefore still unverified and probably as empty as PostgreSQL's was.
+# Not the aclexplode form above: Redshift has no aclexplode(), and no cluster is
+# available to test a replacement against.
+#
+# The USAGE half used to read information_schema.usage_privileges filtered to
+# object_type = 'SCHEMA', which the SQL standard defines over domains,
+# collations and sequences — never schemas. It returned zero rows on every
+# server, so a GRANT USAGE ON SCHEMA was invisible here exactly as it was on
+# PostgreSQL. It is replaced by a has_schema_privilege() scan mirroring the
+# CREATE half directly below, which this same query has always run against
+# Redshift: same function, same catalog, same shape, only the privilege string
+# differs (CONTRIBUTING, evidence 2 — internal precedent on this very path).
+#
+# Known limitation, shared with the CREATE half and unchanged: a privilege scan
+# cannot report a grantor or a grant option, so both are reported empty, and
+# roles holding the privilege only through membership appear as their own rows.
+# The PostgreSQL path reads the ACL and does better on both counts.
 _SCHEMA_PRIVILEGES_SQL_REDSHIFT = """
-SELECT grantee, privilege_type, is_grantable = 'YES', grantor
-FROM information_schema.usage_privileges
-WHERE object_schema = %s AND object_type = 'SCHEMA'
+SELECT grantee, 'USAGE', false, ''
+FROM (
+    SELECT r.rolname AS grantee
+    FROM pg_roles r
+    WHERE has_schema_privilege(r.rolname, %s, 'USAGE')
+) u
 UNION ALL
 SELECT grantee, 'CREATE', false, ''
 FROM (
