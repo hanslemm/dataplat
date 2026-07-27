@@ -616,13 +616,12 @@ def test_fetch_schema_privileges() -> None:
 
 
 def test_fetch_schema_privileges_redshift_uses_redshift_sql() -> None:
-    # Redshift has no aclexplode(), so that branch keeps the information_schema
-    # query untouched and takes the schema name twice.
+    # Redshift has no aclexplode(), so that branch must never receive the
+    # PostgreSQL query. It takes the schema name twice, once per privilege scan.
     cursor = FakeCursor([[]])
     fetch_schema_privileges(cursor, "public", SqlEngine.redshift)
     assert len(cursor.queries) == 1
     query_text, params = cursor.queries[0]
-    assert "information_schema.usage_privileges" in query_text
     assert "aclexplode" not in query_text
     assert params == ("public", "public")
 
@@ -851,3 +850,37 @@ def test_describe_schema_composes_postgres() -> None:
     assert desc.header.name == "public"
     assert desc.contents == []
     assert desc.default_privileges == []
+
+
+def test_fetch_schema_privileges_redshift_scans_usage_and_create() -> None:
+    """The Redshift branch reports USAGE, and does it the way it already reported
+    CREATE.
+
+    information_schema.usage_privileges never covers schemas, so the old USAGE
+    half returned nothing on every server. It is now a has_schema_privilege()
+    scan mirroring the CREATE half that this query has always run against
+    Redshift. No cluster is reachable from CI, so asserting the emitted SQL is
+    the only coverage this path can have.
+    """
+    cursor = FakeCursor([[]])
+
+    fetch_schema_privileges(cursor, "analytics", SqlEngine.redshift)
+
+    sql, params = cursor.queries[0]
+    assert "usage_privileges" not in sql, "the dead information_schema half is back"
+    assert sql.count("has_schema_privilege") == 2
+    assert "'USAGE'" in sql and "'CREATE'" in sql
+    # One placeholder per scan, so the call site's (schema, schema) still fits.
+    assert params == ("analytics", "analytics")
+
+
+def test_fetch_schema_privileges_postgres_is_untouched_by_the_redshift_fix() -> None:
+    """Guard against fixing both branches when only one was meant."""
+    cursor = FakeCursor([[]])
+
+    fetch_schema_privileges(cursor, "analytics", SqlEngine.postgresql)
+
+    sql, params = cursor.queries[0]
+    assert "aclexplode" in sql
+    assert "has_schema_privilege" not in sql
+    assert params == ("analytics",)
