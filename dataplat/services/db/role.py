@@ -93,15 +93,51 @@ class RoleAttributes:
     replication: bool
     bypass_rls: bool
     connection_limit: int
-    password_set: bool
+    # Tri-state on PostgreSQL: True / False when the real password store was
+    # readable, None for "cannot determine" when it was not. Only pg_authid
+    # knows, and it is superuser-only, so a plain bool would have to guess --
+    # and for a field an auditor reads, "unknown" beats a confident guess.
+    password_set: bool | None
     valid_until: str | None
 
 
+# pg_roles.rolpassword is the literal '********' for every row -- the view
+# definition hard-codes it -- so `rolpassword IS NOT NULL` asked there is
+# always true and says nothing about whether a password exists. pg_authid
+# holds the real verifier and is superuser-only by default.
+#
+# Naming pg_authid at all is what fails: the executor checks privileges for
+# every range table before it runs anything, so no CASE branch or unexecuted
+# subquery can hide the reference. The resulting error aborts the transaction,
+# which would also kill the membership / ownership / privilege queries
+# describe_role issues after this one. Asking first avoids the error entirely:
+# has_table_privilege() is an ordinary function call needing no privileges. It
+# also answers the real question rather than "am I superuser" -- a role that
+# was explicitly GRANTed SELECT on pg_authid gets the true answer.
+_PG_AUTHID_READABLE_SQL = """
+SELECT has_table_privilege('pg_authid', 'SELECT')
+"""
+
 _ATTRS_SQL_POSTGRES = """
+SELECT r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole,
+       r.rolinherit, r.rolreplication, r.rolbypassrls,
+       r.rolconnlimit,
+       (a.rolpassword IS NOT NULL) AS password_set,
+       r.rolvaliduntil::text
+FROM pg_roles r
+JOIN pg_authid a ON a.oid = r.oid
+WHERE r.rolname = %s
+"""
+
+# Same columns in the same order as _ATTRS_SQL_POSTGRES so one unpack serves
+# both, with password_set pinned to NULL. pg_roles is a view over pg_authid
+# and exposes every row of it, so dropping the join loses nothing but the one
+# column this session may not read.
+_ATTRS_SQL_POSTGRES_NO_AUTHID = """
 SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole,
        rolinherit, rolreplication, rolbypassrls,
        rolconnlimit,
-       (rolpassword IS NOT NULL) AS password_set,
+       NULL::boolean AS password_set,
        rolvaliduntil::text
 FROM pg_roles
 WHERE rolname = %s
@@ -112,6 +148,17 @@ SELECT true AS can_login, usesuper, usecreatedb, valuntil
 FROM pg_user
 WHERE usename = %s
 """
+
+
+def _pg_authid_readable(cursor: Any) -> bool:
+    """True when this session may ``SELECT`` from ``pg_authid``.
+
+    Split out so the "cannot determine" branch of ``fetch_attributes`` is
+    reachable in a test without giving up superuser on the connection.
+    """
+    cursor.execute(_PG_AUTHID_READABLE_SQL)
+    row = cursor.fetchone()
+    return bool(row and row[0])
 
 
 def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttributes:
@@ -145,7 +192,11 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
             password_set=False,
             valid_until=str(valid_until) if valid_until is not None else None,
         )
-    cursor.execute(_ATTRS_SQL_POSTGRES, (name,))
+    authid_readable = _pg_authid_readable(cursor)
+    cursor.execute(
+        _ATTRS_SQL_POSTGRES if authid_readable else _ATTRS_SQL_POSTGRES_NO_AUTHID,
+        (name,),
+    )
     row = cursor.fetchone()
     if row is None:
         raise RoleNotFoundError(f'role "{name}" not found')
@@ -170,7 +221,9 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
         replication=bool(replication),
         bypass_rls=bool(bypass_rls),
         connection_limit=int(conn_limit),
-        password_set=bool(password_set),
+        # Keyed off the probe, not off the value: only the probe distinguishes
+        # "the store says no password" from "we were not allowed to look".
+        password_set=bool(password_set) if authid_readable else None,
         valid_until=valid_until,
     )
 
@@ -355,7 +408,13 @@ def fetch_owned_objects(
     total = 0
     for schema, relkind, count in cursor.fetchall():
         kind_label = _KIND_LABEL.get(relkind, relkind)
-        by_schema.setdefault(schema, {})[kind_label] = int(count)
+        kinds = by_schema.setdefault(schema, {})
+        # Accumulate, never assign: the query groups by relkind while
+        # _KIND_LABEL folds several relkinds onto one label ('r' and 'p' are
+        # both "table"), so one schema can produce two rows for the same label.
+        # Assigning let the second row overwrite the first, which under-counted
+        # the breakdown and made it disagree with total_relations below.
+        kinds[kind_label] = kinds.get(kind_label, 0) + int(count)
         total += int(count)
     return OwnedObjectsSummary(
         schemas=schemas,

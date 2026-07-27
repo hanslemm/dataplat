@@ -74,21 +74,23 @@ def test_resolve_role_redshift_group() -> None:
 
 
 def test_fetch_attributes_postgres() -> None:
-    rows = [
-        (
-            True,
-            False,
-            True,
-            True,
-            True,
-            False,
-            False,
-            -1,
-            None,
-            "2030-01-01 00:00:00+00",
-        )
-    ]
-    cursor = FakeCursor([rows[0]])
+    cursor = FakeCursor(
+        [
+            (True,),  # has_table_privilege('pg_authid', 'SELECT')
+            (
+                True,
+                False,
+                True,
+                True,
+                True,
+                False,
+                False,
+                -1,
+                False,
+                "2030-01-01 00:00:00+00",
+            ),
+        ]
+    )
     attrs = fetch_attributes(cursor, "alice", SqlEngine.postgresql)
     assert attrs == RoleAttributes(
         can_login=True,
@@ -106,13 +108,44 @@ def test_fetch_attributes_postgres() -> None:
 
 def test_fetch_attributes_postgres_dispatches_pg_roles() -> None:
     cursor = FakeCursor(
-        [(False, False, False, False, True, False, False, -1, None, None)]
+        [(True,), (False, False, False, False, True, False, False, -1, False, None)]
     )
     fetch_attributes(cursor, "svc", SqlEngine.postgresql)
-    query_text, params = cursor.queries[0]
+    # queries[0] is the pg_authid privilege probe; the attributes come next.
+    query_text, params = cursor.queries[1]
     assert "pg_roles" in query_text
     assert "rolbypassrls" in query_text
     assert params == ("svc",)
+
+
+def test_fetch_attributes_postgres_reads_pg_authid_when_permitted() -> None:
+    """Probe says yes => join pg_authid, the only place the verifier lives."""
+    cursor = FakeCursor(
+        [(True,), (True, False, False, False, True, False, False, -1, True, None)]
+    )
+    assert fetch_attributes(cursor, "alice", SqlEngine.postgresql).password_set is True
+    probe, attributes = (query for query, _ in cursor.queries)
+    assert "has_table_privilege('pg_authid', 'SELECT')" in probe
+    assert "pg_authid" in attributes
+
+
+def test_fetch_attributes_postgres_password_set_is_none_when_pg_authid_is_denied() -> (
+    None
+):
+    """Probe says no => None ("cannot determine"), and pg_authid is not named.
+
+    Naming pg_authid without the privilege raises, and that error aborts the
+    whole transaction -- taking the rest of ``describe_role`` with it. The
+    statement actually issued therefore has to be free of it.
+    """
+    cursor = FakeCursor(
+        [(False,), (True, False, False, False, True, False, False, -1, None, None)]
+    )
+    attrs = fetch_attributes(cursor, "svc", SqlEngine.postgresql)
+    assert attrs.password_set is None
+    assert attrs.can_login is True  # everything pg_roles knows is still read
+    _, attributes = (query for query, _ in cursor.queries)
+    assert "pg_authid" not in attributes
 
 
 def test_fetch_attributes_redshift() -> None:
@@ -207,6 +240,25 @@ def test_fetch_owned_objects_postgres() -> None:
         "analytics": {"table": 47},
     }
     assert summary.total_relations == 62
+
+
+def test_fetch_owned_objects_folds_relkinds_sharing_one_label() -> None:
+    """Partitioned ('p') and ordinary ('r') tables both label as "table".
+
+    The query groups by relkind, so they arrive as two rows for one schema.
+    Assigning instead of accumulating dropped one of them, leaving a breakdown
+    that no longer summed to total_relations.
+    """
+    cursor = FakeCursor(
+        [
+            [],
+            [("analytics", "p", 2), ("analytics", "r", 5), ("analytics", "v", 1)],
+        ]
+    )
+    summary = fetch_owned_objects(cursor, 16384, SqlEngine.postgresql)
+    assert summary.relations_by_schema == {"analytics": {"table": 7, "view": 1}}
+    assert sum(summary.relations_by_schema["analytics"].values()) == 8
+    assert summary.total_relations == 8
 
 
 def test_fetch_effective_privileges_postgres_groups_by_scope() -> None:
@@ -429,7 +481,8 @@ def test_describe_role_postgres_composes_sections() -> None:
         [
             # resolve_role: pg_roles
             (16384, True, False),
-            # attributes
+            # fetch_attributes: pg_authid privilege probe, then the attributes
+            (True,),
             (True, False, True, True, True, False, False, -1, False, None),
             # memberships out (recursive)
             [("readers", True, 1, "alice")],
@@ -467,6 +520,7 @@ def test_describe_role_direct_only_excludes_ancestors() -> None:
     cursor = FakeCursor(
         [
             (16384, True, False),
+            (True,),  # pg_authid privilege probe
             (True, False, True, True, True, False, False, -1, False, None),
             [("readers", True, 1, "alice")],
             [],
