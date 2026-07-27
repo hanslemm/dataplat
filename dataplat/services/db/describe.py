@@ -280,8 +280,14 @@ SELECT
     i.indisunique AS unique,
     i.indisprimary AS primary,
     am.amname AS method,
-    (SELECT COALESCE(SUM(pg_relation_size(p.relid)), 0)
-     FROM pg_partition_tree(i.indexrelid) p) AS size_bytes,
+    -- Same pg_partition_tree() caveat as the relation header: the tree is
+    -- empty for an index that is neither partitioned nor a partition, so
+    -- without the fallback every ordinary index reported 0 bytes.
+    COALESCE(
+      (SELECT SUM(pg_relation_size(p.relid))
+       FROM pg_partition_tree(i.indexrelid) p),
+      pg_relation_size(i.indexrelid)
+    )::bigint AS size_bytes,
     CASE WHEN i.indpred IS NOT NULL
          THEN pg_get_expr(i.indpred, i.indrelid, true)
     END AS predicate
@@ -340,22 +346,45 @@ SELECT
     pg_get_userbyid(c.relowner) AS owner,
     COALESCE(t.spcname, 'pg_default') AS tablespace,
     obj_description(c.oid, 'pg_class') AS comment,
-    (SELECT SUM(pc.reltuples)::bigint
-       FROM pg_partition_tree(c.oid) p
-       JOIN pg_class pc ON pc.oid = p.relid
-      WHERE pc.reltuples >= 0) AS row_estimate,
-    (SELECT COALESCE(SUM(pg_total_relation_size(p.relid)), 0)
-       FROM pg_partition_tree(c.oid) p) AS total_size,
-    (SELECT COALESCE(SUM(pg_relation_size(p.relid)), 0)
-       FROM pg_partition_tree(c.oid) p) AS table_size,
-    (SELECT COALESCE(SUM(pg_indexes_size(p.relid)), 0)
-       FROM pg_partition_tree(c.oid) p) AS index_size,
-    (SELECT COALESCE(SUM(
+    -- pg_partition_tree() returns NO rows for a relation that is neither a
+    -- partition nor partitioned, so each aggregate below needs the fallback
+    -- arm of its COALESCE: without one an ordinary table reported 0 bytes and
+    -- an unknown row count. Partitioned parents are excluded from the row sum
+    -- because pg_class.reltuples on a parent already aggregates its
+    -- partitions -- adding both counts every row twice.
+    COALESCE(
+      (SELECT SUM(pc.reltuples)::bigint
+         FROM pg_partition_tree(c.oid) p
+         JOIN pg_class pc ON pc.oid = p.relid
+        WHERE pc.reltuples >= 0 AND pc.relkind <> 'p'),
+      CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END
+    ) AS row_estimate,
+    COALESCE(
+      (SELECT SUM(pg_total_relation_size(p.relid))
+         FROM pg_partition_tree(c.oid) p),
+      pg_total_relation_size(c.oid)
+    )::bigint AS total_size,
+    COALESCE(
+      (SELECT SUM(pg_relation_size(p.relid))
+         FROM pg_partition_tree(c.oid) p),
+      pg_relation_size(c.oid)
+    )::bigint AS table_size,
+    COALESCE(
+      (SELECT SUM(pg_indexes_size(p.relid))
+         FROM pg_partition_tree(c.oid) p),
+      pg_indexes_size(c.oid)
+    )::bigint AS index_size,
+    COALESCE(
+      (SELECT SUM(
                 pg_total_relation_size(p.relid)
               - pg_relation_size(p.relid)
               - pg_indexes_size(p.relid)
-             ), 0)
-       FROM pg_partition_tree(c.oid) p) AS toast_size
+              )
+         FROM pg_partition_tree(c.oid) p),
+      pg_total_relation_size(c.oid)
+      - pg_relation_size(c.oid)
+      - pg_indexes_size(c.oid)
+    )::bigint AS toast_size
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
