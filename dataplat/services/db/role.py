@@ -166,7 +166,9 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
         cursor.execute(_ATTRS_SQL_REDSHIFT, (name,))
         row = cursor.fetchone()
         if row is None:
-            # Group — no login, no attributes table.
+            # Group — no login, no attributes table. password_set=False is a
+            # real answer here rather than a guess: a Redshift group has no
+            # password to hold.
             return RoleAttributes(
                 can_login=False,
                 superuser=False,
@@ -189,7 +191,13 @@ def fetch_attributes(cursor: Any, name: str, engine: SqlEngine) -> RoleAttribute
             replication=False,
             bypass_rls=False,
             connection_limit=-1,
-            password_set=False,
+            # Unknown, not False. This is a Redshift *user*, and pg_user.passwd
+            # is masked to '********' exactly as pg_roles.rolpassword is on
+            # PostgreSQL — so False asserted "this login has no password" for
+            # every user, which is the same falsehood that bug fixed there.
+            # Reporting unknown withdraws the claim without inventing Redshift
+            # SQL nobody here can execute (see CONTRIBUTING, evidence 1 and 3).
+            password_set=None,
             valid_until=str(valid_until) if valid_until is not None else None,
         )
     authid_readable = _pg_authid_readable(cursor)

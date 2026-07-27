@@ -160,7 +160,9 @@ def test_fetch_attributes_redshift() -> None:
         replication=False,
         bypass_rls=False,
         connection_limit=-1,
-        password_set=False,
+        # None, not False: Redshift masks pg_user.passwd, so this is unknowable
+        # from here rather than known to be absent.
+        password_set=None,
         valid_until="infinity",
     )
 
@@ -558,3 +560,38 @@ def test_fetch_effective_privileges_redshift_probe_cap_raises() -> None:
             cursor, closure={"etl", "public"}, engine=SqlEngine.redshift
         )
     assert _REDSHIFT_MAX_PROBES == 20_000
+
+
+def test_redshift_user_password_state_is_unknown_not_false() -> None:
+    """Redshift masks pg_user.passwd exactly as PostgreSQL masks rolpassword.
+
+    Reporting False claimed "this login has no password" for every Redshift
+    user, which is the same falsehood that was fixed on the PostgreSQL path.
+    Reporting None withdraws the claim without inventing Redshift SQL that
+    cannot be executed from CI.
+    """
+    cursor = FakeCursor([(True, False, False, None)])
+
+    attrs = fetch_attributes(cursor, "analyst", SqlEngine.redshift)
+
+    assert attrs.password_set is None
+    assert attrs.can_login is True
+
+
+def test_redshift_group_password_state_is_false_not_unknown() -> None:
+    """A Redshift group has no password to hold, so False is a real answer."""
+    cursor = FakeCursor([])
+
+    attrs = fetch_attributes(cursor, "readers", SqlEngine.redshift)
+
+    assert attrs.password_set is False
+    assert attrs.can_login is False
+
+
+def test_redshift_attributes_run_no_authid_probe() -> None:
+    """pg_authid does not exist on Redshift; probing for it would error."""
+    cursor = FakeCursor([(True, False, False, None)])
+
+    fetch_attributes(cursor, "analyst", SqlEngine.redshift)
+
+    assert all("pg_authid" not in q for q, _ in cursor.queries), cursor.queries
