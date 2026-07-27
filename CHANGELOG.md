@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.2.2
+
+Closes the six defects 0.2.1's integration suite found and pinned as expected
+failures. No expected failures remain.
+
+### Fixed
+
+- `dp db role show` claimed `Password set: yes` for every role, including a
+  passwordless `NOLOGIN` group. The attribute query read `rolpassword` from
+  `pg_roles`, whose view definition returns the literal `'********'` and can
+  never be NULL. Only `pg_authid` holds the real verifier and it is
+  superuser-only, so the field is now tri-state and reports `unknown` — with a
+  hint saying why — when the connecting role cannot read it. The privilege is
+  probed before the query rather than discovered by catching an error, since a
+  permission failure would abort the surrounding transaction.
+
+- `dp db describe <schema>` never reported `USAGE` grants. The query read
+  `information_schema.usage_privileges`, which on PostgreSQL does not cover
+  schemas at all, so the USAGE half of the union always returned nothing. The
+  PostgreSQL path now reads the schema ACL directly.
+
+- `dp db role show` under-counted a role's tables when it owned a partitioned
+  table. Both `relkind` `'r'` and `'p'` map to the label "table" and the
+  aggregation assigned rather than accumulated, so one group overwrote the
+  other while the total was summed separately and stayed right — the per-schema
+  breakdown contradicted its own total.
+
+- `dp db dbt-orphans purge` aborted the whole batch when a single relation had
+  vanished between scan and purge. The generated statement now uses
+  `IF EXISTS`, matching `top-tables`, so a missing relation is a no-op. When a
+  dependent object genuinely blocks a drop the purge still stops — that
+  all-or-nothing property is deliberate for a destructive batch — but it now
+  names the relation and everything depending on it instead of surfacing a raw
+  driver error, and records the blockage in the audit log.
+
+- `dp db describe <relation>` raised nothing but returned an invalid result for
+  a non-view relation: `pg_get_viewdef()` yields NULL rather than erroring, and
+  the PostgreSQL branch returned a view definition whose `sql` was `None`,
+  violating its own annotation. It now raises, as the Redshift branch already
+  did.
+
+- `dp db long-queries --history` died with a driver traceback on any server
+  where `pg_stat_statements` is installed but not preloaded — the most common
+  misconfiguration. The guard that was meant to catch this probed the view's
+  columns, which PostgreSQL answers from the view definition without invoking
+  the extension, so the probe always succeeded. The failure is now reported as
+  an actionable error naming `shared_preload_libraries` and the required
+  restart.
+
+### Changed
+
+- `RoleAttributes.password_set` widened from `bool` to `bool | None`, where
+  `None` means "not determinable by this connection". Relevant only if you
+  import the dataclass; the CLI renders the third state as `unknown`.
+
+- On PostgreSQL, `dp db describe <schema>` privileges now come from the schema
+  ACL rather than a `has_schema_privilege` scan. A role holding `CREATE` only
+  through membership in a granted role is no longer listed as its own row, and
+  `grantor` and `WITH GRANT OPTION` are now real values where the previous
+  CREATE half hardcoded them.
+
 ## 0.2.1
 
 ### Fixed

@@ -1,6 +1,6 @@
 [project]
 name = "dataplat"
-version = "0.2.1"
+version = "0.2.2"
 description = "One command to manage any shape of data platform: databases, ingestion, BI, cloud, and CI."
 readme = "README.md"
 license = "MIT"
