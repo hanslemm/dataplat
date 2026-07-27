@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE, like_escape
 from dataplat.services.db.connection import SqlEngine
 
 
@@ -106,18 +107,13 @@ WHERE ({schema_where})
 """
 
 
-def _like_escape(prefix: str) -> str:
-    """Escape SQL LIKE metacharacters so the prefix matches literally."""
-    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _build_schema_where(column: str, prefixes: list[str]) -> tuple[str, list[str]]:
     """Return a ``<col> LIKE %s ESCAPE '\\' OR ...`` clause and its params."""
     clauses: list[str] = []
     params: list[str] = []
     for p in prefixes:
-        clauses.append(f"{column} LIKE %s ESCAPE '\\'")
-        params.append(f"{_like_escape(p)}%")
+        clauses.append(f"{column} LIKE %s {LIKE_ESCAPE_CLAUSE}")
+        params.append(f"{like_escape(p)}%")
     return " OR ".join(clauses), params
 
 

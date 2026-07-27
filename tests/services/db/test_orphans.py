@@ -580,3 +580,38 @@ def test_fetch_deprecated_objects_filters_excluded_schemas() -> None:
         excluded_schemas=frozenset({"dbt_artifacts"}),
     )
     assert result == [("public", "a_deprecated", "table")]
+
+
+class _RecordingCursor:
+    """Captures every statement and its params; returns no rows."""
+
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        self.statements.append((sql, params))
+
+    def fetchall(self) -> list:
+        return []
+
+
+def test_deprecated_scan_escapes_the_suffix_for_both_dialects() -> None:
+    """The ESCAPE clause must reach Redshift too, which cannot be tested live.
+
+    ``_deprecated`` leads with a LIKE wildcard, so the pattern has to be escaped
+    and the statement has to declare the escape character. Redshift accepts
+    ``ESCAPE`` (``dp db top-tables`` has always sent it), but only a fake cursor
+    can prove the Redshift branch emits it.
+    """
+    from dataplat.services.db.orphans import fetch_deprecated_objects
+
+    for is_redshift in (False, True):
+        cur = _RecordingCursor()
+        fetch_deprecated_objects(
+            cur, is_redshift=is_redshift, excluded_schemas=frozenset()
+        )
+        assert cur.statements, "no statement was executed"
+        for sql, params in cur.statements:
+            assert "ESCAPE '\\'" in sql, (is_redshift, sql)
+            # The pattern itself carries the escape, not just the clause.
+            assert params == (r"%\_deprecated",), (is_redshift, params)
