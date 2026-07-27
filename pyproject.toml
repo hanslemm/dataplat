@@ -75,6 +75,13 @@ markers = [
     # PostgreSQL (DP_TEST_PG_DSN). Registered so `-m 'not integration'`
     # selects against a known marker instead of warning about an unknown one.
     "integration: requires a live PostgreSQL server",
+    # Redshift cannot be containerized, so these two run only when someone
+    # points them at a cluster. Read-only and mutating are separate markers
+    # because they need different permission to run: `redshift` is safe against
+    # a warehouse in use, `redshift_ddl` is not, and keeping them selectable
+    # apart is what lets a production cluster be used for the first tier only.
+    "redshift: requires a live Redshift cluster; read-only",
+    "redshift_ddl: requires a DISPOSABLE Redshift cluster; mutates it",
 ]
 
 [tool.ruff]
