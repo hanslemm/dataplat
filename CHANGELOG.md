@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.3
+
+Redshift-only fixes. Nothing changes for PostgreSQL targets.
+
+### Fixed
+
+- `dp db role show` no longer claims every Redshift user has no password. The
+  attribute query reported `password_set=False` unconditionally, but
+  `pg_user.passwd` is masked to `'********'` there just as `pg_roles.rolpassword`
+  is on PostgreSQL — so it asserted "this login has no password" for every user,
+  the same falsehood 0.2.2 fixed on the PostgreSQL side. It now reports
+  `unknown`, with the reason. A Redshift *group* still reports `no`, because a
+  group has no password to hold.
+
+- `dp db describe <schema>` now reports `USAGE` grants on Redshift. The query
+  read `information_schema.usage_privileges` filtered to `object_type = 'SCHEMA'`,
+  which the SQL standard defines over domains, collations and sequences — never
+  schemas — so it returned nothing on every server. It now scans
+  `has_schema_privilege`, mirroring how the same query has always reported
+  `CREATE` on that path. As with `CREATE`, a privilege scan cannot report a
+  grantor or a grant option, so both stay empty; the PostgreSQL path reads the
+  ACL and does better on both counts.
+
+  Both fixes rest on documented behaviour and internal precedent rather than a
+  live cluster — Redshift cannot be containerized, so CI cannot cover it. See
+  below.
+
+### Added
+
+- A Redshift conformance harness (`tests/integration/redshift/`) for anyone who
+  runs dataplat against a real cluster. The read-only tier is safe to point at a
+  warehouse in use — a guard refuses anything that is not plainly a read before
+  it reaches the server — and it interrogates the assumptions the two fixes above
+  depend on, printing what your cluster answered. `CONTRIBUTING.md` documents
+  both tiers and the evidence rules for changing SQL that runs on a dialect CI
+  cannot reach.
+
 ## 0.2.2
 
 Closes the six defects 0.2.1's integration suite found and pinned as expected
