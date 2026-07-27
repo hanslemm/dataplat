@@ -40,6 +40,72 @@ and still report success.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Testing against a real Redshift cluster
+
+Redshift is a managed service, so there is no container and CI cannot cover it.
+If you have a cluster, you can. The suite is in `tests/integration/redshift/` and
+is split into two tiers, because they need different permission to run:
+
+| Marker | Mutates? | Needs |
+| --- | --- | --- |
+| `redshift` | no — read-only, safe against a warehouse in use | a reachable cluster |
+| `redshift_ddl` | **yes** | a cluster you can throw away |
+
+Credentials come from an ordinary dataplat target, so they stay in your own
+`.envrc` and never reach the repo:
+
+```bash
+export DP_TARGETS=warehouse WAREHOUSE_ENGINE=redshift \
+    WAREHOUSE_HOST=... WAREHOUSE_USER=... WAREHOUSE_DATABASE=... \
+    WAREHOUSE_PASSWORD=...
+export DP_TEST_RS_TARGET=warehouse      # or DP_TEST_RS_DSN=... as an escape hatch
+
+DP_TEST_RS_REQUIRED=1 uv run pytest -m redshift        # read-only tier
+```
+
+| Variable | Effect |
+| --- | --- |
+| `DP_TEST_RS_TARGET` | a dataplat target name, resolved by the tool's own config |
+| `DP_TEST_RS_DSN` | a raw libpq URL, if you would rather not declare a target |
+| `DP_TEST_RS_REQUIRED` | an unreachable cluster becomes an error instead of a skip |
+| `DP_TEST_RS_DISPOSABLE` | **required** before any `redshift_ddl` test will run |
+| `DP_TEST_RS_SCHEMA` | a schema the read-only tier may inspect (otherwise discovered) |
+
+A plain `uv run pytest` is unaffected: with nothing configured, both tiers skip.
+
+### Why there is a client-side read-only guard
+
+`rs_cursor` refuses anything that is not plainly a read *before it is sent*, on
+top of the server-side `READ ONLY` transaction. Two layers, because the cluster
+may be production: Redshift roles are cluster-wide, and its transactional-DDL
+semantics differ from PostgreSQL's, so the rollback-per-test isolation the
+PostgreSQL harness relies on cannot be assumed to clean up a mistake. A
+server-side check would refuse the statement too — but only after it crossed the
+network to a warehouse someone depends on.
+
+It denies by default: only `SELECT`, `WITH … SELECT`, `EXPLAIN` and `SHOW` pass.
+It is not fooled by a leading comment, case, a stray semicolon, a second
+statement smuggled after a `SELECT`, a data-modifying CTE, `SELECT … INTO`, or a
+side-effecting builtin such as `pg_terminate_backend`. The statement splitter is
+hand-written rather than regex-based because a regex that ignores quoting can
+*hide* a statement — naive comment stripping turns `SELECT '--' ; DROP TABLE t`
+into a harmless-looking fragment plus a `DROP` the server will happily run. The
+one hole it cannot close is an unlisted side-effecting UDF; that is what the
+server-side layer is for, and `assert_read_only`'s docstring says so.
+
+### What a run does and does not prove
+
+A green read-only run proves dataplat's `SELECT`s are **valid Redshift SQL
+against a real server, returning results that unpack** — which is precisely the
+class of defect the PostgreSQL suite found repeatedly in these same functions
+(an empty `pg_partition_tree`, a masked column, a view that does not cover
+schemas). It cannot tell you anything about `GRANT`, `DROP`, `RENAME` or session
+termination; those need the DDL tier and a disposable cluster.
+
+The run also prints a conformance table of what the cluster answered, because
+the point is learning what the engine does — a green run that recorded nothing
+has taught nobody anything.
+
 ## Dialect changes: what counts as evidence
 
 `dataplat/services/db` targets PostgreSQL and Redshift. PostgreSQL has a real
@@ -56,6 +122,12 @@ codebase was already shipping to Redshift elsewhere.
 So the question is not "can I test this?" but **"what evidence do I have?"** A
 change affecting the Redshift path needs at least one of the following, in
 descending order of strength:
+
+0. **A conformance run confirmed it against a real cluster.** Strongest, and the
+   only one that is evidence rather than inference — see the section above. A fix
+   currently resting on class 2 should be upgraded to class 0 when someone runs
+   the suite, and revisited if the run *refutes* it. `test_conformance.py` names
+   the assumptions each shipped fix depends on for exactly this reason.
 
 1. **It changes no Redshift SQL.** The fix is pure Python, or touches only a
    `_*_SQL_POSTGRES` constant. Dialect risk is zero by construction — verify
