@@ -227,6 +227,12 @@ def fetch_long_queries(
 
 # --- Postgres (pg_stat_activity) -------------------------------------------
 
+# clock_timestamp(), not now(): now() is the *transaction* start time, so a
+# scan issued on a cursor whose transaction is already open measures elapsed
+# time from that moment. Anything that started after the transaction began
+# gets a negative age and is filtered out entirely — the snapshot silently
+# returns nothing. clock_timestamp() reads the real clock per row, which is
+# what a "what is running right now" view has to do.
 _PG_ACTIVITY_SQL = """
     SELECT
         CAST(pid AS VARCHAR) AS query_id,
@@ -234,7 +240,9 @@ _PG_ACTIVITY_SQL = """
         COALESCE(datname, '') AS db_name,
         COALESCE(state, '') AS status,
         query_start AS start_time,
-        CAST(EXTRACT(EPOCH FROM (now() - query_start)) AS INT) AS elapsed_s,
+        CAST(
+            EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) AS INT
+        ) AS elapsed_s,
         LEFT(REGEXP_REPLACE(query, '\\s+', ' ', 'g'), 180) AS query_text,
         CAST(pid AS VARCHAR) AS session_id
     FROM pg_stat_activity
@@ -242,7 +250,7 @@ _PG_ACTIVITY_SQL = """
       AND state <> 'idle'
       AND pid <> pg_backend_pid()
       AND query_start IS NOT NULL
-      AND now() - query_start >= make_interval(secs => %s)
+      AND clock_timestamp() - query_start >= make_interval(secs => %s)
     ORDER BY elapsed_s DESC
     LIMIT %s
 """
