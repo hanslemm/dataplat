@@ -70,6 +70,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    # Tests under tests/integration/ execute real SQL against a live
+    # PostgreSQL (DP_TEST_PG_DSN). Registered so `-m 'not integration'`
+    # selects against a known marker instead of warning about an unknown one.
+    "integration: requires a live PostgreSQL server",
+]
 
 [tool.ruff]
 # Track requires-python, not .python-version: the linters must judge the oldest
