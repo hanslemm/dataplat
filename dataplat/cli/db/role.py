@@ -72,16 +72,23 @@ def _more_line(hidden: int) -> str:
     return f"  [dim italic]… and {hidden} more (raise --limit to see all).[/dim italic]"
 
 
-def _password_set_value(password_set: bool | None) -> str:
+def _password_set_value(password_set: bool | None, engine: SqlEngine) -> str:
     """Render the tri-state ``password_set`` as markup.
 
-    ``None`` means the server refused to say (pg_authid is superuser-only), and
-    the reason travels with the word: a bare "unknown" in a security report
-    reads as a tool defect, and rendering it as "no" would be a false negative
-    on exactly the field an auditor came for.
+    ``None`` means the server would not say, and the reason travels with the
+    word: a bare "unknown" in a security report reads as a tool defect, and
+    rendering it as "no" would be a false negative on exactly the field an
+    auditor came for. The reason differs by engine, and naming pg_authid on
+    Redshift — which has no such relation — would send the reader somewhere
+    that does not exist.
     """
     if password_set is None:
-        return "unknown [dim](needs superuser to read pg_authid)[/dim]"
+        reason = (
+            "no readable password catalog on Redshift"
+            if engine == SqlEngine.redshift
+            else "needs superuser to read pg_authid"
+        )
+        return f"unknown [dim]({reason})[/dim]"
     return "yes" if password_set else "no"
 
 
@@ -120,7 +127,10 @@ def _attributes_metadata(attrs: RoleAttributes) -> list[tuple[str, str]]:
 
 
 def _render_attributes(
-    console: Console, counter: _SectionCounter, attrs: RoleAttributes
+    console: Console,
+    counter: _SectionCounter,
+    attrs: RoleAttributes,
+    engine: SqlEngine,
 ) -> None:
     _print_section_heading(
         console, counter, "Attributes", "Role flags, login, and limits."
@@ -139,7 +149,7 @@ def _render_attributes(
         "Connection limit",
         "unlimited" if attrs.connection_limit < 0 else str(attrs.connection_limit),
     )
-    table.add_row("Password set", _password_set_value(attrs.password_set))
+    table.add_row("Password set", _password_set_value(attrs.password_set, engine))
     table.add_row("Valid until", cell(attrs.valid_until or "—"))
     console.print(_indent(table))
 
@@ -345,7 +355,7 @@ def render_role_description(
     console.print()
 
     counter = _SectionCounter()
-    _render_attributes(console, counter, desc.attributes)
+    _render_attributes(console, counter, desc.attributes, engine)
     parent_caption = (
         "Roles this role is a member of (single-level; Redshift groups)."
         if engine == SqlEngine.redshift
