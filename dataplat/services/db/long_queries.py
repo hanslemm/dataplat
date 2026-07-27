@@ -294,6 +294,21 @@ class QueryHistoryRow:
     query_text: str
 
 
+# SQLSTATE 55000 (object_not_in_prerequisite_state). pg_stat_statements' C
+# function raises it — "must be loaded via shared_preload_libraries" — when the
+# extension exists in the catalog but was never preloaded. Matched by code
+# rather than by message text or by exception class: the message is not part of
+# any contract, and this module deliberately never imports psycopg so it stays
+# drivable by the fake cursors the unit suite uses.
+_NOT_LOADED_SQLSTATE = "55000"
+
+_PGSS_NOT_LOADED = (
+    "pg_stat_statements is installed but not loaded. Add it to "
+    "shared_preload_libraries in postgresql.conf and RESTART the server "
+    "(a config reload is not enough — it is a preloaded library)."
+)
+
+
 def fetch_query_history_postgres(
     cursor: Any,
     *,
@@ -305,7 +320,8 @@ def fetch_query_history_postgres(
     Column names changed across pg_stat_statements versions
     (``total_time`` -> ``total_exec_time``), so they are discovered from the
     result-set description. Raises :class:`ValidationError` when the
-    extension's columns are missing/incompatible.
+    extension's columns are missing/incompatible, and when the extension is
+    present but was never preloaded.
     """
     cursor.execute("SELECT * FROM pg_stat_statements LIMIT 0")
     column_names = {desc.name.lower() for desc in (cursor.description or [])}
@@ -335,7 +351,18 @@ def fetch_query_history_postgres(
         ORDER BY {_quote(max_col)} DESC
         LIMIT %s
     """
-    cursor.execute(sql, (min_seconds, limit))
+    # The column probe above cannot detect a non-preloaded extension: Postgres
+    # answers `SELECT * FROM pg_stat_statements LIMIT 0` from the view
+    # definition alone, never invoking the extension's C function, so discovery
+    # returns the full and correct column list and only this read fails. Left
+    # unhandled it reaches the user as a traceback instead of the actionable
+    # error the probe was meant to produce.
+    try:
+        cursor.execute(sql, (min_seconds, limit))
+    except Exception as exc:  # narrowed to SQLSTATE 55000 immediately below
+        if getattr(exc, "sqlstate", None) != _NOT_LOADED_SQLSTATE:
+            raise
+        raise ValidationError(_PGSS_NOT_LOADED) from exc
     return [
         QueryHistoryRow(
             calls=int(row[0]),
