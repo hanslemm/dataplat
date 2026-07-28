@@ -32,6 +32,10 @@ jobs:
       - name: Setup Python
         run: uv python install ${{ matrix.python-version }}
 
+      # --all-extras is what installs psycopg (the "db" extra) and duckdb (the
+      # "duckdb" extra). The DuckDB step below needs the latter and has no skip
+      # path, so dropping this flag turns into a hard failure rather than a
+      # quietly shrinking test run.
       - name: Install dependencies
         run: uv sync --group dev --all-extras
 
@@ -52,6 +56,23 @@ jobs:
       # here and does not have to wait for the integration job.
       - name: Pytest (unit)
         run: uv run pytest -m "not integration"
+
+      # The third engine's real-SQL tier, and the only one that belongs in this
+      # job: DuckDB is a library, so it needs no container, no credentials and no
+      # wait loop -- just the extra `uv sync` already installed. Running it in
+      # both matrix legs is the point, since an embedded engine is the one place
+      # an interpreter difference could plausibly show up in a database.
+      #
+      # Selected by path rather than by marker. tests/integration/duckdb/ sits
+      # under tests/integration/, so its conftest chain stamps every test with
+      # the `integration` marker the step above deselects; a `duckdb` marker
+      # would have to be registered in pyproject.toml, and one line here is
+      # cheaper than a marker that then has to be kept in sync with a directory.
+      # These tests are consequently also collected by the `integration` job
+      # below -- harmless, since they run in under two seconds and touch no
+      # server, but *this* is where DuckDB is proved, on both interpreters.
+      - name: Pytest (DuckDB integration)
+        run: uv run pytest tests/integration/duckdb
 
   # A separate job, not extra steps in the matrix above, for two reasons: the
   # unit legs are the fast signal and must not queue behind a container boot,
