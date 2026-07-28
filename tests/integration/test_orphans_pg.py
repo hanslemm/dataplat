@@ -331,6 +331,92 @@ def test_fetch_live_model_relations_filters_on_the_invocation_command(
     assert live == {"analytics": {"dim_customers"}}
 
 
+def test_a_sibling_projects_models_are_not_live(
+    pg_cursor: Cursor[TupleRow], dbt_artifacts: None
+) -> None:
+    """An underscore in the project name used to make this over-match.
+
+    ``node_prefix`` is ``model.<project>.``, and dbt project names are
+    snake_case, so the pattern for ``my_project`` carried a LIKE "any single
+    character" wildcard exactly where the underscore is. Every node_id from a
+    project called ``my2project`` — equally valid, and sharing this warehouse's
+    ``dbt_artifacts`` schema — matched it, so its models were reported live.
+
+    The consequence ran the other way from what "over-match" suggests: a live
+    set that is too big makes *fewer* relations look orphaned, so the sibling
+    project's tables were silently protected from the rename, and so was
+    anything of ours that happened to share a name with one of theirs. Escaping
+    makes the scan see only this project — and therefore rename and drop more.
+    """
+    from dataplat.services.db import orphans
+
+    now = datetime.now(UTC)
+    _record_invocation(pg_cursor, "nightly", started=now - timedelta(hours=1))
+    _record_model(
+        pg_cursor,
+        "nightly",
+        schema="analytics",
+        name="dim_ours",
+        node_prefix="model.my_project.",
+    )
+    _record_model(
+        pg_cursor,
+        "nightly",
+        schema="analytics",
+        name="dim_theirs",
+        node_prefix="model.my2project.",
+    )
+
+    live = orphans.fetch_live_model_relations(
+        pg_cursor,
+        invocation_command=None,
+        node_prefix="model.my_project.",
+        statuses=orphans.LIVE_STATUSES,
+        since=now - timedelta(days=7),
+    )
+
+    assert live == {"analytics": {"dim_ours"}}
+
+
+def test_a_lookalike_invocation_command_is_not_a_match(
+    pg_cursor: Cursor[TupleRow], dbt_artifacts: None
+) -> None:
+    """``DP_DBT_INVOCATION_COMMAND`` is a command line, so it carries ``_`` too.
+
+    ``--exclude tag:no_ci`` and ``--exclude tag:no-ci`` are both real dbt
+    commands (a tag may use either separator, and one is often renamed to the
+    other), and the unescaped filter could not tell them apart. So a build the
+    operator had deliberately narrowed the scan to *one* of still contributed
+    the other's models to the live set.
+    """
+    from dataplat.services.db import orphans
+
+    now = datetime.now(UTC)
+    wanted = "dbt build --exclude tag:no_ci"
+    lookalike = "dbt build --exclude tag:no-ci"
+    _record_invocation(
+        pg_cursor, "wanted", started=now - timedelta(hours=1), invocation_command=wanted
+    )
+    _record_invocation(
+        pg_cursor,
+        "lookalike",
+        started=now - timedelta(minutes=5),
+        invocation_command=lookalike,
+    )
+    _record_model(pg_cursor, "wanted", schema="analytics", name="dim_ours")
+    _record_model(pg_cursor, "lookalike", schema="analytics", name="dim_theirs")
+
+    live = orphans.fetch_live_model_relations(
+        pg_cursor,
+        invocation_command=wanted,
+        node_prefix=_NODE_PREFIX,
+        statuses=orphans.LIVE_STATUSES,
+        since=now - timedelta(days=7),
+    )
+
+    assert live == {"analytics": {"dim_ours"}}
+
+
 def test_scan_flags_only_relations_no_build_produced(
     pg_cursor: Cursor[TupleRow], sample_schema: str, dbt_artifacts: None
 ) -> None:
@@ -774,6 +860,7 @@ def test_purge_names_the_blocking_relation_and_logs_the_refused_attempt(
     from typer.testing import CliRunner
 
     from dataplat.cli.db import dbt_orphans as cli
+    from dataplat.core.errors import ExitCode
     from dataplat.services.db.connection import SqlEngine
     from dataplat.services.db.orphans import open_transactional_connection
 
@@ -813,9 +900,17 @@ def test_purge_names_the_blocking_relation_and_logs_the_refused_attempt(
             cli.app, ["purge", "--no-dry-run", "--yes", "--log", str(log)]
         )
 
-        assert result.exit_code == 1, result.output
+        # DependentObjectsError is a ServiceError: the warehouse refused the
+        # statement, so the exit code says "external service said no" (5) rather
+        # than the old undifferentiated 1.
+        assert result.exit_code == ExitCode.SERVICE, result.output
         assert "still depend" in result.output
         assert "Nothing was dropped" in result.output
+        # The diagnosis is printed before the log path, and the log path is the
+        # actionable half -- so both must survive the exit.
+        assert result.output.index("still depend") < result.output.index(
+            "Partial purge log written"
+        )
 
         payload = json.loads(log.read_text())
         assert payload["drops"] == []

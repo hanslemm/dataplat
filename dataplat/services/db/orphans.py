@@ -399,12 +399,28 @@ def fetch_live_model_relations(
     may only touch a handful of models, which would flag everything else as
     orphaned. Aggregating over a window captures both the latest full nightly
     and any touch-ups since.
+
+    Both ``LIKE`` patterns are escaped, and that makes this function *less*
+    permissive than it used to be — which means the caller renames and drops
+    more. ``node_prefix`` is ``model.<project>.``, so an underscore in the
+    project name (``my_project``) was a "any single character" wildcard: a
+    second project whose name differed only there (``my2project``) had its
+    models counted as live here, and every warehouse relation they explain was
+    therefore never reported as an orphan. Escaping shrinks the live set to this
+    project, which is what "live" was always supposed to mean. Same for
+    ``invocation_command``, where ``_`` and ``%`` are ordinary characters in a
+    dbt command line (``--select tag:hourly_refresh``).
+
+    Dialect note: ``ESCAPE '\\'`` reaches Redshift from here. It is already in
+    production on that path — ``top_tables._build_schema_where`` sends it to
+    both engines, and ``fetch_deprecated_objects`` above sends it on its
+    ``is_redshift`` branch — so this is the same construct, not a new one.
     """
     invocation_filter = ""
     params: list[Any] = []
     if invocation_command:
-        invocation_filter = "AND i.invocation_args LIKE %s"
-        params.append(f'%"invocation_command": "{invocation_command}"%')
+        invocation_filter = f"AND i.invocation_args LIKE %s {LIKE_ESCAPE_CLAUSE}"
+        params.append(f'%"invocation_command": "{like_escape(invocation_command)}"%')
     cur.execute(
         f"""
         SELECT DISTINCT m.schema, m.name
@@ -414,13 +430,13 @@ def fetch_live_model_relations(
         WHERE i.dbt_command = 'build'
           {invocation_filter}
           AND i.run_started_at >= %s
-          AND m.node_id LIKE %s
+          AND m.node_id LIKE %s {LIKE_ESCAPE_CLAUSE}
           AND m.status = ANY(%s)
         """,
         (
             *params,
             since,
-            f"{node_prefix}%",
+            f"{like_escape(node_prefix)}%",
             sorted(statuses),
         ),
     )

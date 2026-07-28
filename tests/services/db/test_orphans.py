@@ -352,6 +352,64 @@ def test_fetch_live_model_relations_empty() -> None:
     assert result == {}
 
 
+def test_live_model_scan_escapes_both_patterns_for_both_dialects() -> None:
+    """Pins the escaped patterns, which is the only Redshift coverage there is.
+
+    ``fetch_live_model_relations`` has no engine branch: ``dbt_artifacts`` is a
+    dbt package with the same shape on both warehouses, so one statement serves
+    them and a fake cursor is the only way to see what Redshift gets. ``ESCAPE
+    '\\'`` is already in production on that path — ``top_tables``'
+    ``_build_schema_where`` sends it to both engines, and
+    ``fetch_deprecated_objects`` sends it on its ``is_redshift`` branch — so the
+    clause here is precedent, not a new construct.
+
+    Both patterns need it. ``model.my_project.`` carries an underscore because
+    dbt project names are snake_case, and ``tag:no_ci`` because dbt selectors
+    are written by hand.
+    """
+    from datetime import datetime
+
+    from dataplat.services.db.orphans import fetch_live_model_relations
+
+    cur = FakeCursorWithAll([])
+    fetch_live_model_relations(
+        cur,
+        invocation_command="dbt build --exclude tag:no_ci",
+        node_prefix="model.my_project.",
+        statuses=frozenset({"success"}),
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    statement, params = cur.queries[0]
+    # One for invocation_args, one for node_id: the escape character is only
+    # special where the statement says so.
+    assert statement.count("ESCAPE '\\'") == 2
+    assert params[0] == r'%"invocation_command": "dbt build --exclude tag:no\_ci"%'
+    # The bracketing %% stay wildcards -- only the interpolated value is escaped.
+    assert params[2] == r"model.my\_project.%"
+
+
+def test_live_model_scan_leaves_a_wildcard_free_prefix_untouched() -> None:
+    """Escaping must not change the pattern for a project name with no ``_``."""
+    from datetime import datetime
+
+    from dataplat.services.db.orphans import fetch_live_model_relations
+
+    cur = FakeCursorWithAll([])
+    fetch_live_model_relations(
+        cur,
+        invocation_command=None,
+        node_prefix="model.acme.",
+        statuses=frozenset({"success"}),
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    statement, params = cur.queries[0]
+    assert params[1] == "model.acme.%"
+    # No invocation filter was requested, so only node_id declares an escape.
+    assert statement.count("ESCAPE '\\'") == 1
+
+
 def test_fetch_existing_relations_postgres_merges_tables_and_matviews() -> None:
     from dataplat.services.db.orphans import fetch_existing_relations
 
