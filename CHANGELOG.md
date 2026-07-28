@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **DuckDB is a supported engine.** Set `<NAME>_ENGINE=duckdb` and
+  `<NAME>_PATH=/path/to.duckdb` (or `:memory:`), and install
+  `dataplat[duckdb]`. `<NAME>_DATABASE` works as a fallback for the path, and
+  `<NAME>_READ_ONLY=1` opens the file read-only.
+
+  DuckDB is not a smaller PostgreSQL — it runs inside the `dp` process, backed by
+  a file, with a single implicit user — so only the commands that mean something
+  there are available:
+
+  | command | DuckDB | why |
+  | --- | --- | --- |
+  | `db query` | works | |
+  | `db describe` | works | sizes and view definitions come from DuckDB's own catalog |
+  | `db top-tables` | works | sizes are DuckDB estimates, not comparable to PostgreSQL's |
+  | `db role *` | refused | there are no users or roles to describe |
+  | `db long-queries`, `db kill` | refused | in-process: there are no other sessions |
+  | `db dbt-orphans` | refused | it works by renaming, and DuckDB refuses to rename a relation a view depends on |
+
+  A refused command exits 2 and says which engine and why. These are properties
+  of the database, not gaps — the messages say so, because a user deserves to
+  know a thing can never work rather than assume it is coming.
+
+  `db describe` reports what DuckDB has no concept of — materialized views,
+  partitions, triggers, row-level security, privileges — as not applicable, with
+  the reason, rather than as empty sections that would read as "you have none".
+
+  Unlike PostgreSQL (needs a container) and Redshift (needs a cluster), the
+  DuckDB test tier needs nothing at all, so it never skips: this is the first
+  dialect with unconditional executing coverage in CI, and the second real-SQL
+  target the shared queries have ever been checked against.
+
+### Fixed
+
+- `dp config doctor` reported failures for a valid DuckDB target: it demanded
+  `<NAME>_HOST`, `<NAME>_USER` and `<NAME>_PASSWORD`, then failed the connection
+  check by dialing a server that does not exist. It now asks for the variables
+  the engine actually uses, and probes a DuckDB target by opening its file —
+  which is the health check.
+
 ## 0.3.0
 
 ### Changed
