@@ -394,3 +394,48 @@ def test_render_checks_counts_failures_but_not_warnings(capsys) -> None:
     assert "! advisory" in out
     assert "Do this." in out  # warnings show their hint too
     assert "ERROR: [/x] [bold]" in out  # driver text renders verbatim
+
+
+def test_duckdb_target_specs_do_not_demand_a_server(monkeypatch) -> None:
+    """A DuckDB target has a file, not a host/user/password.
+
+    Asking for the libpq variables reported four missing ones and a failed check
+    for a configuration that works, which makes doctor's verdict worthless.
+    """
+    from dataplat.cli.config import _target_specs
+    from dataplat.services.db.connection import SqlEngine
+
+    duck = {s.name for s in _target_specs("LAKE", SqlEngine.duckdb)}
+    assert "LAKE_PATH" in duck
+    assert not {"LAKE_HOST", "LAKE_USER", "LAKE_PASSWORD", "LAKE_PORT"} & duck
+    # Nothing is required, because _PATH and _DATABASE substitute for each other.
+    assert all(not s.required for s in _target_specs("LAKE", SqlEngine.duckdb))
+
+    libpq = {s.name for s in _target_specs("WH", SqlEngine.postgresql)}
+    assert {"WH_HOST", "WH_USER", "WH_DATABASE"} <= libpq
+    assert "WH_PATH" not in libpq
+
+
+def test_doctor_passes_for_a_valid_duckdb_target(monkeypatch, tmp_path) -> None:
+    """doctor --connect must open the file, not dial a nonexistent server."""
+    import duckdb
+
+    path = tmp_path / "wh.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE t (id INTEGER)")
+    con.close()
+
+    monkeypatch.setenv("DP_TARGETS", "lake")
+    monkeypatch.setenv("LAKE_ENGINE", "duckdb")
+    monkeypatch.setenv("LAKE_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+
+    result = runner.invoke(config_cli.app, ["doctor", "--connect"])
+
+    # Deliberately not asserting the overall exit code: doctor also reports on
+    # the .envrc, which the suite clears, so the run legitimately fails for a
+    # reason that has nothing to do with DuckDB. What matters is that both
+    # DuckDB checks pass and neither demands a server.
+    assert "✓ target lake" in result.output, result.output
+    assert "✓ lake connection — SELECT 1 ok" in result.output, result.output
+    assert "LAKE_HOST" not in result.output
