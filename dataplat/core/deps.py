@@ -6,12 +6,15 @@ without importing any optional package:
 - which areas the user's configuration *enables*,
 - which of their dependencies are *missing*,
 - what install command fixes that in the environment ``dp`` runs from.
+
+One dependency is not an area's: see :data:`ENGINE_DEPS`.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sys
 from collections.abc import Iterable
@@ -62,6 +65,57 @@ AREAS: dict[str, AreaDeps] = {
 }
 
 
+@dataclass(frozen=True)
+class EngineDeps:
+    """Dependency contract for one *engine* inside an area.
+
+    Not an :class:`AreaDeps`, and deliberately not reachable by the area
+    machinery. ``duckdb`` is one ``SqlEngine`` inside the db area, so nothing
+    about the area level fits it: the db area is enabled by ``DP_TARGETS`` and
+    mounted once, while whether the duckdb driver is needed depends on the
+    ``<NAME>_ENGINE`` of the *target* a command was pointed at. Folding it into
+    ``AREAS["db"].modules`` would make every psycopg user install an embedded
+    database engine to run ``dp db describe``, and mounting it as its own area
+    would invent a ``dp duckdb`` command that does not exist.
+
+    So there is no auto-install for it. A DuckDB target with the package
+    missing raises a ConfigError naming ``dataplat[duckdb]`` (see
+    :func:`dataplat.services.db.connection.load_duckdb`), which is one
+    copy-pasteable command away from fixed.
+    """
+
+    engine: str
+    extra: str
+    # Import name of the driver; the dist name matches on PyPI.
+    module: str
+
+
+ENGINE_DEPS: dict[str, EngineDeps] = {
+    "duckdb": EngineDeps(engine="duckdb", extra="duckdb", module="duckdb"),
+}
+
+
+def engine_deps_ready(spec: EngineDeps) -> bool:
+    """True when ``spec``'s driver is importable."""
+    return find_spec(spec.module) is not None
+
+
+def engine_install_hint(spec: EngineDeps) -> str:
+    """One sentence telling the user how to install this engine's driver.
+
+    The same command the area stub would have offered to run
+    (:mod:`dataplat.cli._missing`), printed rather than offered: this is
+    reached in the middle of a command that is already talking to a database,
+    where stopping to prompt — and then re-execing — would be a surprise.
+    """
+    cmd = install_command([spec.extra])
+    if cmd is None:
+        return manual_hint([spec.extra])
+    # shlex.join: the spec contains brackets (and a pin) a shell would glob,
+    # and the whole point is that this line can be pasted as printed.
+    return f"Run: {shlex.join(cmd)}"
+
+
 def missing_for(spec: AreaDeps) -> list[str]:
     """Import names of ``spec``'s dependencies that are not installed."""
     return [m for m in spec.modules if find_spec(m) is None]
@@ -93,8 +147,16 @@ def satisfied_extras() -> list[str]:
     harmless direction — see :func:`install_command`, where over-including an
     extra only reinstalls packages that are already there, while dropping one
     uninstalls a working area.
+
+    Engine extras are included for that same reason and it matters more for
+    them: ``uv tool install --force`` rebuilds the environment from the spec it
+    is handed, so an extra missing from this list is *uninstalled* the next
+    time any area self-installs — and ``dataplat[duckdb]`` belongs to no area,
+    so nothing would ever put it back.
     """
-    return [spec.extra for spec in AREAS.values() if ready(spec)]
+    extras = [spec.extra for spec in AREAS.values() if ready(spec)]
+    extras += [spec.extra for spec in ENGINE_DEPS.values() if engine_deps_ready(spec)]
+    return extras
 
 
 def enabled_areas() -> dict[str, str]:
