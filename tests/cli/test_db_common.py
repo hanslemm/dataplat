@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import duckdb
 import psycopg
 import pytest
 import typer
@@ -15,11 +19,14 @@ from dataplat.cli.db._common import (
     JsonOption,
     YesOption,
     db_session,
+    engine_or_exit,
+    resolve_any_params_or_exit,
     resolve_params_or_exit,
 )
 from dataplat.core import trace
-from dataplat.core.errors import ExitCode
-from dataplat.services.db.connection import SqlEngine
+from dataplat.core.errors import ExitCode, ValidationError
+from dataplat.services.db.capabilities import Capability, require_capability
+from dataplat.services.db.connection import DuckDbConnectionParams, SqlEngine
 
 
 def _set_target_env(monkeypatch, prefix: str) -> None:
@@ -412,3 +419,433 @@ def test_bad_sql_stays_unclassified(monkeypatch) -> None:
         pass
 
     assert excinfo.value.exit_code == ExitCode.FAILURE
+
+
+# =========================================================================
+# DuckDB: the same funnel, a second driver.
+#
+# Every test below runs against a real DuckDB database, because DuckDB is
+# in-process and file-backed — there is no reason to fake one, and a fake would
+# not have told us that duckdb.cursor() cannot see an open transaction, which
+# is the single fact that shaped DuckDbSession.
+# =========================================================================
+
+
+def _duckdb_target(monkeypatch, path: str, *, read_only: bool = False) -> None:
+    """Declare a third target, `demo_ddb`, alongside the suite's two."""
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DEMO_DDB_PATH", path)
+    if read_only:
+        monkeypatch.setenv("DEMO_DDB_READ_ONLY", "1")
+
+
+def _duckdb_params(path: str, *, read_only: bool = False) -> DuckDbConnectionParams:
+    return DuckDbConnectionParams(path=path, read_only=read_only)
+
+
+def _make_database(path: Path) -> None:
+    """Create a small DuckDB database at ``path`` and close it again."""
+    conn = duckdb.connect(database=str(path))
+    conn.execute("CREATE TABLE t(id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'ada'), (2, 'grace')")
+    conn.close()
+
+
+def test_resolve_any_returns_the_duckdb_shape(monkeypatch, tmp_path: Path) -> None:
+    _duckdb_target(monkeypatch, str(tmp_path / "w.duckdb"))
+
+    # Through a named target, so the engine comes from DEMO_DDB_ENGINE the way
+    # a user's configuration supplies it.
+    params = ConnCliParams(target="demo_ddb").resolve_any()
+
+    assert isinstance(params, DuckDbConnectionParams)
+    assert params.engine == SqlEngine.duckdb
+    assert params.path == str(tmp_path / "w.duckdb")
+
+
+def test_resolve_refuses_a_duckdb_target_at_invalid_input(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """The commands DuckDB cannot serve keep calling resolve(), and exit 2."""
+    _duckdb_target(monkeypatch, str(tmp_path / "w.duckdb"))
+
+    with pytest.raises(typer.Exit) as excinfo:
+        resolve_params_or_exit(ConnCliParams(env_prefix="DEMO_DDB"))
+
+    assert excinfo.value.exit_code == ExitCode.INVALID_INPUT
+    out = capsys.readouterr().out
+    assert "duckdb" in out
+    assert "not implemented" not in out.lower()
+
+
+def test_resolve_any_params_or_exit_reports_a_bad_duckdb_config(
+    monkeypatch, capsys
+) -> None:
+    """Same funnel, same exit-code contract: a missing path is a ConfigError."""
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.delenv("DEMO_DDB_PATH", raising=False)
+    monkeypatch.delenv("DEMO_DDB_DATABASE", raising=False)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        resolve_any_params_or_exit(ConnCliParams(env_prefix="DEMO_DDB"))
+
+    assert excinfo.value.exit_code == ExitCode.CONFIG
+    assert "DEMO_DDB_PATH" in capsys.readouterr().out
+
+
+def test_duckdb_session_runs_a_query_through_the_shared_shape(tmp_path: Path) -> None:
+    """`with db_session(...) as conn, conn.cursor() as cur` — unchanged."""
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with (
+        db_session(_duckdb_params(str(database))) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SELECT id, name FROM t ORDER BY id")
+        rows = cursor.fetchall()
+        columns = [desc.name for desc in cursor.description]
+
+    assert rows == [(1, "ada"), (2, "grace")]
+    # desc.name is what `dp db query` reads; DuckDB's own description is a
+    # plain tuple with no attributes at all.
+    assert columns == ["id", "name"]
+
+
+def test_duckdb_session_binds_question_mark_params(tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with db_session(_duckdb_params(str(database))) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT id FROM t WHERE name = ?", ("grace",))
+
+        assert cursor.fetchall() == [(2,)]
+
+
+def test_duckdb_session_supports_memory(tmp_path: Path) -> None:
+    with db_session(_duckdb_params(":memory:")) as conn, conn.cursor() as cursor:
+        cursor.execute("CREATE TABLE t(x INTEGER)")
+        cursor.execute("INSERT INTO t VALUES (7)")
+        cursor.execute("SELECT x FROM t")
+
+        assert cursor.fetchall() == [(7,)]
+
+
+def test_duckdb_cursor_sees_the_sessions_open_transaction(tmp_path: Path) -> None:
+    """Why DuckDbSession.cursor() never calls duckdb's own cursor().
+
+    DuckDB's cursor() opens a *second* connection, which cannot see uncommitted
+    work — so a harness that wraps each test in BEGIN/ROLLBACK (the way the
+    PostgreSQL suite does) would hand commands an empty database.
+    """
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with db_session(_duckdb_params(str(database))) as conn:
+        conn.execute("BEGIN")
+        conn.execute("CREATE TABLE staged(x INTEGER)")
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM staged")
+            assert cursor.fetchall() == [(0,)]
+        conn.execute("ROLLBACK")
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'staged'"
+            )
+            assert cursor.fetchall() == [(0,)]
+
+
+def test_duckdb_cursor_close_does_not_end_the_session(tmp_path: Path) -> None:
+    """Cursors share the connection, so closing one must not close it."""
+    with db_session(_duckdb_params(":memory:")) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        second = conn.cursor()
+        second.execute("SELECT 2")
+
+        assert second.fetchall() == [(2,)]
+
+
+def test_duckdb_session_closes_the_connection_on_exit(tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with db_session(_duckdb_params(str(database))) as conn:
+        raw = conn.raw
+
+    with pytest.raises(duckdb.Error):
+        raw.execute("SELECT 1")
+
+
+def test_duckdb_cursor_fetch_variants_and_rowcount(tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with db_session(_duckdb_params(str(database))) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT id FROM t ORDER BY id")
+        assert cursor.fetchone() == (1,)
+        cursor.execute("SELECT id FROM t ORDER BY id")
+        assert cursor.fetchmany(1) == [(1,)]
+        # -1 is DuckDB's answer for every statement: the DB-API's "unknown".
+        assert cursor.rowcount == -1
+
+
+def test_duckdb_cursor_executemany(tmp_path: Path) -> None:
+    with db_session(_duckdb_params(":memory:")) as conn, conn.cursor() as cursor:
+        cursor.execute("CREATE TABLE t(x INTEGER)")
+        cursor.executemany("INSERT INTO t VALUES (?)", [(1,), (2,), (3,)])
+        cursor.execute("SELECT count(*) FROM t")
+
+        assert cursor.fetchall() == [(3,)]
+
+
+def test_duckdb_cursor_renders_a_composed_statement(tmp_path: Path) -> None:
+    """psycopg's identifier quoting produces SQL DuckDB accepts, so it is used.
+
+    Rendering rather than rejecting keeps a shared helper that quotes an
+    identifier working on both engines. Placeholders are still not translated.
+    """
+    with db_session(_duckdb_params(":memory:")) as conn, conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("CREATE TABLE {name}(x INTEGER)").format(
+                name=sql.Identifier("Mixed Case")
+            )
+        )
+        cursor.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'Mixed Case'"
+        )
+
+        assert cursor.fetchall() == [(1,)]
+
+
+# --- the exit-code contract, on the DuckDB side ------------------------------
+
+
+def test_duckdb_bad_statement_stays_unclassified(tmp_path: Path) -> None:
+    """A CatalogException is duckdb.ProgrammingError: the statement's own fault."""
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with (
+        pytest.raises(typer.Exit) as excinfo,
+        db_session(_duckdb_params(str(database))) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("SELECT * FROM does_not_exist")
+
+    assert excinfo.value.exit_code == ExitCode.FAILURE
+
+
+def test_duckdb_read_only_write_is_not_reported_as_retryable(tmp_path: Path) -> None:
+    """Refused write → InvalidInputException → ProgrammingError → 1, not 5."""
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with (
+        pytest.raises(typer.Exit) as excinfo,
+        db_session(_duckdb_params(str(database), read_only=True)) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("CREATE TABLE nope(x INTEGER)")
+
+    assert excinfo.value.exit_code == ExitCode.FAILURE
+
+
+def test_duckdb_read_only_still_reads(tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with (
+        db_session(_duckdb_params(str(database), read_only=True)) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SELECT count(*) FROM t")
+
+        assert cursor.fetchall() == [(2,)]
+
+
+def test_duckdb_locked_database_exits_service(tmp_path: Path) -> None:
+    """Another process holding the file is the retryable case: exit 5.
+
+    A real second process, because that is the only thing that takes DuckDB's
+    file lock — two connections inside one process share the instance instead.
+    """
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            # The write is what takes the lock: an idle reader does not.
+            "import duckdb, sys, time;"
+            "c = duckdb.connect(database=sys.argv[1]);"
+            "c.execute('CREATE TABLE holder(x INTEGER)');"
+            "print('held', flush=True);"
+            "time.sleep(60)",
+            str(database),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "held"
+
+        with (
+            pytest.raises(typer.Exit) as excinfo,
+            db_session(_duckdb_params(str(database))),
+        ):
+            pass  # pragma: no cover - the connect raises first
+
+        assert excinfo.value.exit_code == ExitCode.SERVICE
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_duckdb_conflicting_configuration_exits_service(tmp_path: Path) -> None:
+    """ConnectionException is duckdb.OperationalError, so it is retryable too."""
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+    writer = duckdb.connect(database=str(database))
+    try:
+        with (
+            pytest.raises(typer.Exit) as excinfo,
+            db_session(_duckdb_params(str(database), read_only=True)),
+        ):
+            pass  # pragma: no cover - the connect raises first
+
+        assert excinfo.value.exit_code == ExitCode.SERVICE
+    finally:
+        writer.close()
+
+
+def test_duckdb_missing_file_is_a_config_error_not_a_new_database(
+    tmp_path: Path, capsys
+) -> None:
+    """duckdb.connect() would have created it; a wrong path must say so."""
+    absent = tmp_path / "absent.duckdb"
+
+    with pytest.raises(typer.Exit) as excinfo, db_session(_duckdb_params(str(absent))):
+        pass  # pragma: no cover - the check raises first
+
+    assert excinfo.value.exit_code == ExitCode.CONFIG
+    assert "absent.duckdb" in capsys.readouterr().out
+    assert not absent.exists()
+
+
+def test_duckdb_missing_package_names_the_extra(monkeypatch, capsys) -> None:
+    """A psycopg-only user who points a target at DuckDB gets a command to run."""
+    monkeypatch.setitem(sys.modules, "duckdb", None)
+
+    with pytest.raises(typer.Exit) as excinfo, db_session(_duckdb_params(":memory:")):
+        pass  # pragma: no cover - the import raises first
+
+    assert excinfo.value.exit_code == ExitCode.CONFIG
+    assert "dataplat[duckdb]" in capsys.readouterr().out
+
+
+# --- --verbose, on the DuckDB side ------------------------------------------
+
+
+def test_duckdb_session_is_untraced_by_default(tmp_path: Path, capsys) -> None:
+    with db_session(_duckdb_params(":memory:")) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT 1")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_duckdb_session_traces_the_connection_to_stderr(tmp_path: Path, capsys) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_database(database)
+
+    with (
+        trace.verbose(),
+        db_session(_duckdb_params(str(database), read_only=True)) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SELECT id FROM t WHERE name = ?", ("ada",))
+        cursor.fetchall()
+
+    captured = capsys.readouterr()
+    # stdout stays machine-clean under --json/--format csv, on every engine.
+    assert captured.out == ""
+    assert f"[dp:sql] connect {database} engine=duckdb read-only" in captured.err
+    assert "[dp:sql] SELECT id FROM t WHERE name = ? | 1 params bound" in captured.err
+    # The value is warehouse data: the count is the whole promise.
+    assert "ada" not in captured.err
+
+
+def test_duckdb_tracing_needs_no_call_site_opt_in(tmp_path: Path, capsys) -> None:
+    """The cursor is the mechanism, exactly as cursor_factory is for psycopg."""
+    with (
+        trace.verbose(),
+        db_session(_duckdb_params(":memory:")) as conn,
+    ):
+        conn.execute("SELECT 1")
+        conn.cursor().executemany("SELECT ?", [(1,), (2,)])
+
+    err = capsys.readouterr().err
+    assert "[dp:sql] SELECT 1 | no params" in err
+    assert "[dp:sql] SELECT ? | no params" in err
+
+
+# --- the seam a refusing command uses --------------------------------------
+
+
+def test_engine_or_exit_answers_before_anything_is_resolved(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """No connection setting is read, so it works for a target with none."""
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.delenv("DEMO_DDB_PATH", raising=False)
+    monkeypatch.delenv("DEMO_DDB_DATABASE", raising=False)
+
+    assert engine_or_exit(ConnCliParams(target="demo_ddb")) == SqlEngine.duckdb
+    assert engine_or_exit(ConnCliParams(target="demo_rs")) == SqlEngine.redshift
+    assert engine_or_exit(ConnCliParams()) == SqlEngine.postgresql
+
+
+def test_engine_or_exit_prefers_the_flag(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+
+    engine = engine_or_exit(
+        ConnCliParams(target="demo_ddb", engine=SqlEngine.postgresql)
+    )
+
+    assert engine == SqlEngine.postgresql
+
+
+def test_engine_or_exit_reports_a_bad_engine_value(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("DEMO_PG_ENGINE", "sqlite")
+
+    with pytest.raises(typer.Exit) as excinfo:
+        engine_or_exit(ConnCliParams(env_prefix="DEMO_PG"))
+
+    assert excinfo.value.exit_code == ExitCode.CONFIG
+    assert "must be one of" in capsys.readouterr().out
+
+
+def test_the_refusal_a_command_gets_names_the_engines_own_reason(
+    monkeypatch, capsys
+) -> None:
+    """The pattern in engine_or_exit's docstring, end to end.
+
+    Asking the matrix first is what makes `dp db role list -t <duckdb>` say
+    "it has no users or roles at all" rather than "this command speaks libpq".
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    conn_cli = ConnCliParams(target="demo_ddb")
+
+    engine = engine_or_exit(conn_cli)
+    with pytest.raises(ValidationError) as excinfo:
+        require_capability(engine, Capability.roles, command="dp db role list")
+
+    assert "no users or roles" in str(excinfo.value)
+    assert excinfo.value.exit_code == ExitCode.INVALID_INPUT

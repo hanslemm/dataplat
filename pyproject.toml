@@ -11,6 +11,7 @@ keywords = [
     "cli",
     "postgres",
     "redshift",
+    "duckdb",
     "airbyte",
     "superset",
     "aws",
@@ -51,10 +52,21 @@ dependencies = [
 
 [project.optional-dependencies]
 db = ["psycopg[binary]>=3.2.9"]
+# An engine-level extra, not an area: `duckdb` is one SqlEngine inside the db
+# area, so it is not in `db`. Two reasons it is separate. A psycopg-only user
+# must not install an embedded database engine to run `dp db describe` against
+# PostgreSQL -- the extension module alone is 45 MB, three times psycopg's --
+# and a DuckDB file needs no server, so the two are never both required by the
+# same target. dataplat[db] stays the area's contract (see
+# dataplat/core/deps.py AREAS); dataplat[db,duckdb] is what a DuckDB target
+# needs. The floor is the version the dialect was probed against -- every
+# catalog dataplat reads on this engine (duckdb_tables, duckdb_constraints,
+# pragma_database_size, pg_catalog compatibility views) was verified on 1.5.5.
+duckdb = ["duckdb>=1.5.5"]
 cloud = ["boto3>=1.35.0", "plotext>=5.3.2"]
 ingest = ["httpx>=0.25.0", "textual>=0.64.0", "croniter>=2.0.0"]
 bi = ["httpx>=0.25.0"]
-all = ["dataplat[db,cloud,ingest,bi]"]
+all = ["dataplat[db,duckdb,cloud,ingest,bi]"]
 
 [project.scripts]
 dp = "dataplat.main:app"

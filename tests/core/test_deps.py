@@ -47,7 +47,7 @@ def test_satisfied_extras_lists_importable_areas(
     monkeypatch.setattr(
         deps, "find_spec", lambda name: None if name == "psycopg" else object()
     )
-    assert deps.satisfied_extras() == ["ingest", "bi", "cloud"]
+    assert deps.satisfied_extras() == ["ingest", "bi", "cloud", "duckdb"]
 
 
 def test_enabled_areas_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -297,3 +297,87 @@ def test_install_command_does_not_resolve_venv_symlink(
 
     assert cmd is not None
     assert cmd[0] == str(link)
+
+
+# =========================================================================
+# Engine-level extras.
+#
+# dataplat[duckdb] is not an area's dependency: duckdb is one SqlEngine inside
+# the db area, needed only when a target names it. The area machinery is
+# deliberately not extended to reach it (EngineDeps says why), so what is
+# tested here is the little that *is* shared — the install hint, and the one
+# place engine extras must appear or they get uninstalled.
+# =========================================================================
+
+
+def test_duckdb_is_an_engine_extra_not_an_area(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It must not be reachable by the area helpers, or `dp duckdb` would mount."""
+    spec = deps.ENGINE_DEPS["duckdb"]
+
+    assert (spec.extra, spec.module) == ("duckdb", "duckdb")
+    assert "duckdb" not in deps.AREAS
+    with pytest.raises(KeyError):
+        deps.missing_modules("duckdb")
+    # And the db area still means psycopg alone: a PostgreSQL user must not be
+    # made to install an embedded database engine.
+    assert deps.AREAS["db"].modules == ("psycopg",)
+
+
+def test_engine_deps_ready_follows_the_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = deps.ENGINE_DEPS["duckdb"]
+    monkeypatch.setattr(deps, "find_spec", lambda name: None)
+    assert not deps.engine_deps_ready(spec)
+    monkeypatch.setattr(deps, "find_spec", lambda name: object())
+    assert deps.engine_deps_ready(spec)
+
+
+def test_satisfied_extras_keeps_duckdb_from_being_uninstalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`uv tool install --force` rebuilds from the spec it is handed.
+
+    An extra missing from satisfied_extras() is dropped from that spec and
+    therefore uninstalled the next time any area self-installs — and no area
+    would ever put dataplat[duckdb] back.
+    """
+    _not_editable(monkeypatch)
+    monkeypatch.setattr(deps, "_installed_version", lambda: "0.3.0")
+    monkeypatch.setattr(deps, "find_spec", lambda name: object())
+    monkeypatch.setattr(deps.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+
+    cmd = deps.install_command(
+        ["ingest"],
+        executable="/Users/me/.local/share/uv/tools/dataplat/bin/python",
+    )
+
+    assert cmd is not None
+    assert "duckdb" in cmd[3]
+
+
+def test_engine_install_hint_is_a_runnable_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = deps.ENGINE_DEPS["duckdb"]
+    _env(monkeypatch)
+    monkeypatch.setattr(deps.shutil, "which", lambda name: None)
+    monkeypatch.setattr(deps, "_in_venv", lambda: True)
+    monkeypatch.setattr(deps, "_has_pip", lambda exe: True)
+
+    hint = deps.engine_install_hint(spec)
+
+    assert hint.startswith("Run: ")
+    # Quoted as printed: the brackets would otherwise be globbed by a shell.
+    assert "'dataplat[duckdb]==0.1.0'" in hint
+
+
+def test_engine_install_hint_falls_back_to_the_manual_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to run in an environment we do not manage — say what to do."""
+    spec = deps.ENGINE_DEPS["duckdb"]
+    monkeypatch.setattr(deps, "install_command", lambda extras: None)
+    monkeypatch.setattr(deps, "_is_editable_install", lambda: True)
+
+    assert deps.engine_install_hint(spec) == (
+        "Development checkout — run: uv sync --group dev --all-extras"
+    )
