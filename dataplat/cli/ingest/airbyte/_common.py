@@ -6,10 +6,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import httpx
-import typer
 from rich.console import Console
 
-from dataplat.cli._render import esc
+from dataplat.cli._exit import fail
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 
@@ -20,20 +19,21 @@ console = Console()
 def airbyte_client() -> Iterator[tuple[httpx.Client, str]]:
     """Authenticated client with unified error handling and cleanup.
 
-    Auth/config problems and ServiceErrors raised inside the block are
-    printed and converted to exit code 1; the client is always closed.
+    Auth/config problems and ServiceErrors raised inside the block are printed
+    and turned into the exit code the exception declares — 3, 4 and 5
+    respectively, where all three used to be 1 — and the client is always
+    closed. Being the funnel is the point: every command that opens it gets the
+    contract without knowing it exists.
     """
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     try:
         yield client, base_url
     except ServiceError as exc:
         # ServiceError carries the API's response body verbatim, so it can
         # contain anything a warehouse or connector chose to put there.
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()

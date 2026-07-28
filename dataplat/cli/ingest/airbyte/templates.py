@@ -7,6 +7,7 @@ import json
 import typer
 from rich.console import Console
 
+from dataplat.cli._exit import fail
 from dataplat.cli._render import esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
@@ -91,14 +92,12 @@ def source_template(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         definitions = list(list_source_definitions(client, base_url, workspace_id))
     except ServiceError as exc:
-        console.print(f"[red]Error fetching source definitions: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()
 
@@ -129,14 +128,12 @@ def destination_template(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         definitions = list(list_destination_definitions(client, base_url, workspace_id))
     except ServiceError as exc:
-        console.print(f"[red]Error fetching destination definitions: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()
 

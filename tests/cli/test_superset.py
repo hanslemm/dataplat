@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from dataplat.cli import _prompt
 from dataplat.cli.bi import superset as superset_cli
+from dataplat.core.errors import ExitCode
 
 runner = CliRunner()
 
@@ -158,12 +159,51 @@ def _tty(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["roles", "list"],
+        ["users", "create", "newbie", "--password", "pw", "--email", "n@example.com"],
+        ["users", "update", "--add-group", "analysts"],
+        ["users", "list"],
+        ["users", "delete", "7", "-y"],
+        ["groups", "list"],
+    ],
+    ids=lambda c: " ".join(c[:2]),
+)
+def test_every_command_opens_the_traced_client(
+    monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """No command may build its own ``httpx.Client``.
+
+    ``build_client`` is where the ``--verbose`` event hooks live, so a command
+    that calls ``httpx.Client()`` directly still works and silently traces
+    nothing — the one failure mode an opt-in diagnostic has. Every command is
+    listed because a single missed site is exactly what would slip through.
+    Deliberately does not patch ``httpx.Client``: with the factory bypassed the
+    spy is never called, and this fails instead of quietly passing.
+    """
+    transport = httpx.MockTransport(FakeSuperset().handler)
+    opened: list[bool] = []
+
+    def spy() -> httpx.Client:
+        opened.append(True)
+        return httpx.Client(transport=transport)
+
+    monkeypatch.setattr(superset_cli, "build_client", spy)
+
+    result = runner.invoke(superset_cli.app, command, env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert opened == [True]
+
+
 def test_missing_env_reports_the_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SUPERSET_BASE_URL", raising=False)
 
     result = runner.invoke(superset_cli.app, ["roles", "list"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.CONFIG
     assert "SUPERSET_BASE_URL" in result.output
 
 
@@ -254,7 +294,7 @@ def test_api_error_body_is_shown_literally(monkeypatch: pytest.MonkeyPatch) -> N
 
     result = runner.invoke(superset_cli.app, ["groups", "list"], env=WIDE)
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.SERVICE
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "Boom [/issue] [bold]" in result.output
 
@@ -361,7 +401,7 @@ def test_user_create_unknown_role_is_reported(api: FakeSuperset) -> None:
         env=WIDE,
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.CONFIG
     assert "Unknown role(s): Nope" in result.output
     assert api.created == []
 
@@ -468,6 +508,26 @@ def test_user_delete_reports_api_failure(monkeypatch: pytest.MonkeyPatch) -> Non
 
     result = runner.invoke(superset_cli.app, ["users", "delete", "7", "-y"], env=WIDE)
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.SERVICE
     assert "user 7:" in result.output
     assert "404" in result.output
+
+
+def test_user_delete_keeps_going_after_a_failed_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bad id must not abandon the rest.
+
+    The exit code is now read off the errors the loop collected, so this is what
+    keeps that from quietly becoming "stop at the first failure": every id is
+    still attempted, and the code still says SERVICE rather than 1.
+    """
+    _serve(monkeypatch, FakeSuperset(delete_status=404))
+
+    result = runner.invoke(
+        superset_cli.app, ["users", "delete", "7", "8", "-y"], env=WIDE
+    )
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "user 7:" in result.output
+    assert "user 8:" in result.output

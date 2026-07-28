@@ -7,7 +7,8 @@ import json
 import typer
 from rich.console import Console
 
-from dataplat.cli._render import cell, esc
+from dataplat.cli._exit import fail
+from dataplat.cli._render import cell
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.tags import create_tag, list_tags
@@ -22,15 +23,13 @@ def list_tags_cmd():
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         tags = list_tags(client, base_url)
         console.print(cell(json.dumps(tags, indent=2, ensure_ascii=False)))
     except ServiceError as exc:
-        console.print(f"[red]Error listing tags: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()
 
@@ -49,14 +48,12 @@ def create_tag_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         tag = create_tag(client, base_url, name, workspace_id, color)
         console.print(cell(json.dumps(tag, indent=2, ensure_ascii=False)))
     except ServiceError as exc:
-        console.print(f"[red]Error creating tag: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()

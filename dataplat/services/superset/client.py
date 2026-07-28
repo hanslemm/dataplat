@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import httpx
 
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
+from dataplat.core.trace import is_enabled, trace_http
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,53 @@ class SupersetAuthConfig:
     base_url: str
     username: str
     password: str
+
+
+# --- request tracing --------------------------------------------------------
+# A twin of `dataplat.services.airbyte.client`'s hooks; see that module for why
+# they are hooks and why there are two lines per request. Two copies is one too
+# many — they belong in a shared HTTP seam, which does not exist yet.
+_TRACE_STARTED = "_dp_trace_started"
+
+
+def _trace_hooks() -> dict[str, list[Callable[..., None]]]:
+    """Event hooks that trace method, URL, status and duration to stderr.
+
+    Headers are never read, so the ``Authorization: Bearer …`` every call below
+    sends cannot reach the trace.
+    """
+
+    def on_request(request: httpx.Request) -> None:
+        if not is_enabled():
+            return
+        setattr(request, _TRACE_STARTED, time.perf_counter())
+        trace_http(request.method, str(request.url))
+
+    def on_response(response: httpx.Response) -> None:
+        if not is_enabled():
+            return
+        started = getattr(response.request, _TRACE_STARTED, None)
+        trace_http(
+            response.request.method,
+            str(response.request.url),
+            status=response.status_code,
+            elapsed_ms=None
+            if started is None
+            else (time.perf_counter() - started) * 1000,
+        )
+
+    return {"request": [on_request], "response": [on_response]}
+
+
+def build_client() -> httpx.Client:
+    """The one way a Superset command gets an HTTP client.
+
+    It exists so tracing holds by construction. Six command bodies each called
+    ``httpx.Client()`` directly, and a seventh would have been written the same
+    way and silently traced nothing — the failure mode of an opt-in diagnostic
+    is that it is quietly absent exactly where it was needed.
+    """
+    return httpx.Client(event_hooks=_trace_hooks())
 
 
 def get_auth_config_from_env() -> SupersetAuthConfig:
