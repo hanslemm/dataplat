@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import duckdb
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -10,6 +13,7 @@ import dataplat.cli.db as db_cli
 import dataplat.main as main_module
 from dataplat.cli.db import _classify_sql, _render_rows, _write_preview
 from dataplat.core import trace
+from dataplat.core.errors import ExitCode
 
 runner = CliRunner()
 
@@ -49,6 +53,56 @@ class TestClassifySql:
 
     def test_ddl_is_write(self) -> None:
         assert _classify_sql("DROP TABLE t") == "write"
+
+
+class TestClassifyDuckDbStatements:
+    """The heads DuckDB has and PostgreSQL does not.
+
+    Each expectation below was checked against duckdb 1.5.5 rather than read in
+    a table of keywords — the read ones because they must not be stopped by a
+    write gate, the write ones because the gate is the only thing between them
+    and a file on disk.
+    """
+
+    def test_from_first_query_is_read(self) -> None:
+        # `FROM t` is DuckDB's spelling of `SELECT * FROM t`.
+        assert _classify_sql("FROM dev.events") == "read"
+        assert _classify_sql("from dev.events select id") == "read"
+
+    def test_from_first_query_mentioning_a_write_keyword_is_write(self) -> None:
+        """Conservative, exactly as the WITH branch is.
+
+        ``FROM t DELETE WHERE …`` parses DELETE as a table alias on 1.5.5 and
+        deletes nothing, so this is a false positive today — the trade is a
+        prompt on a query with 'delete' in a literal, against an unprompted
+        write if a FROM-first DELETE ever lands.
+        """
+        assert _classify_sql("FROM t WHERE note = 'delete me'") == "write"
+
+    def test_describe_and_summarize_are_reads(self) -> None:
+        assert _classify_sql("DESCRIBE dev.events") == "read"
+        assert _classify_sql("SUMMARIZE dev.events") == "read"
+
+    def test_pivot_statements_are_reads(self) -> None:
+        assert _classify_sql("PIVOT sales ON year USING sum(amount)") == "read"
+        assert _classify_sql("UNPIVOT sales ON q1, q2") == "read"
+
+    def test_side_effecting_duckdb_statements_are_writes(self) -> None:
+        # COPY writes a file or a table; EXPORT/IMPORT DATABASE a directory of
+        # them; ATTACH creates the database file when it is missing; INSTALL and
+        # LOAD fetch and execute an extension binary. None is a read, and the
+        # classifier's default is what covers them — so this test is really
+        # asserting that nobody added them to the read list.
+        for statement in (
+            "COPY events TO 'out.parquet'",
+            "COPY events FROM 'in.csv'",
+            "EXPORT DATABASE 'dump'",
+            "IMPORT DATABASE 'dump'",
+            "ATTACH 'other.duckdb' AS other",
+            "INSTALL httpfs",
+            "LOAD httpfs",
+        ):
+            assert _classify_sql(statement) == "write", statement
 
 
 def test_write_statement_requires_write_flag_when_not_tty(monkeypatch) -> None:
@@ -329,3 +383,258 @@ def test_spinner_follows_the_output_format_to_stderr(monkeypatch) -> None:
             f"--format {fmt}: spinner painted to "
             f"{'stderr' if consoles[0].stderr else 'stdout'}"
         )
+
+
+# =========================================================================
+# DuckDB, end to end, against a real database.
+#
+# `dp db query` sends the user's SQL unchanged, so the only statement under
+# test that dataplat wrote is the LIMIT/OFFSET wrapper — and whether DuckDB
+# accepts the subquery-with-alias form it builds is not something a fake
+# cursor can answer. DuckDB is in-process, so these open a real file.
+# =========================================================================
+
+
+def _duckdb_target(monkeypatch, path: str | Path, *, read_only: bool = False) -> None:
+    """Declare a third target, `demo_ddb`, alongside the suite's two."""
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DEMO_DDB_PATH", str(path))
+    if read_only:
+        monkeypatch.setenv("DEMO_DDB_READ_ONLY", "1")
+
+
+def _make_warehouse(path: Path, rows: int = 5) -> Path:
+    conn = duckdb.connect(database=str(path))
+    conn.execute("CREATE TABLE events(id BIGINT, note VARCHAR)")
+    conn.execute("INSERT INTO events SELECT i, 'note ' || i FROM range(?) t(i)", [rows])
+    conn.close()
+    return path
+
+
+def _ddb(monkeypatch, tmp_path, *, rows: int = 5, read_only: bool = False) -> Path:
+    _disable_envrc(monkeypatch)
+    database = _make_warehouse(tmp_path / "w.duckdb", rows=rows)
+    _duckdb_target(monkeypatch, database, read_only=read_only)
+    return database
+
+
+def _query(*args: str):
+    return runner.invoke(main_module.app, ["db", "query", *args, "-t", "demo_ddb"])
+
+
+def test_query_duckdb_accepts_the_pagination_wrapper(monkeypatch, tmp_path) -> None:
+    """The wrapper is the one statement dataplat composes. DuckDB must take it."""
+    _ddb(monkeypatch, tmp_path)
+
+    first = _query("select id from events order by id", "--limit", "2")
+
+    assert first.exit_code == 0, first.output
+    assert "More rows available" in first.stdout
+    assert "Rows: 2" in first.stdout
+
+    second = _query("select id from events order by id", "--limit", "2", "--page", "2")
+
+    assert second.exit_code == 0, second.output
+    # Row numbering continues from the offset, so page 2 starts at 3.
+    for expected in ("3", "4"):
+        assert expected in second.stdout
+
+
+def test_query_duckdb_paginates_a_from_first_query(monkeypatch, tmp_path) -> None:
+    """`FROM t` is a read and gets the row cap, or it streams the whole table."""
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query("from events", "--limit", "2")
+
+    assert result.exit_code == 0, result.output
+    assert "This statement can modify data" not in result.output
+    assert "More rows available" in result.stdout
+    assert "Rows: 2" in result.stdout
+
+
+def test_query_duckdb_wrapper_survives_a_trailing_comment(
+    monkeypatch, tmp_path
+) -> None:
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query("select id from events order by id -- mine", "--limit", "2")
+
+    assert result.exit_code == 0, result.output
+    assert "Rows: 2" in result.stdout
+
+
+def test_query_duckdb_limit_zero_sends_the_statement_unwrapped(
+    monkeypatch, tmp_path
+) -> None:
+    _ddb(monkeypatch, tmp_path)
+
+    with trace.verbose():
+        result = _query("select id from events order by id", "--limit", "0")
+
+    assert result.exit_code == 0, result.output
+    assert "dp_query" not in result.stderr
+    assert "[dp:sql] select id from events order by id" in result.stderr
+    assert "Rows: 5" in result.stdout
+
+
+def test_query_duckdb_column_names_come_from_the_cursor(monkeypatch, tmp_path) -> None:
+    """cursor.description on DuckDB is a plain tuple; .name has to work anyway."""
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query("""select id as event_id, note as "[/x]" from events limit 1""")
+
+    assert result.exit_code == 0, result.output
+    assert "event_id" in result.stdout
+    # A markup-shaped alias must render literally rather than raise MarkupError.
+    assert "[/x]" in result.stdout
+
+
+def test_query_duckdb_csv_and_json_carry_duckdb_values(monkeypatch, tmp_path) -> None:
+    _disable_envrc(monkeypatch)
+    database = tmp_path / "w.duckdb"
+    conn = duckdb.connect(database=str(database))
+    # A row of types psycopg never returns: DuckDB hands back date, Decimal,
+    # list and dict objects, and both formats have to survive them.
+    conn.execute(
+        "CREATE TABLE t AS SELECT 1 AS n, DATE '2024-01-02' AS d, "
+        "3.14::DECIMAL(10,4) AS dec, [1, 2] AS tags, {'k': 'v'} AS obj"
+    )
+    conn.close()
+    _duckdb_target(monkeypatch, database)
+
+    as_csv = _query("select * from t", "--format", "csv")
+    assert as_csv.exit_code == 0, as_csv.output
+    assert as_csv.stdout.splitlines()[0] == "n,d,dec,tags,obj"
+    assert "2024-01-02" in as_csv.stdout
+    # Decoration goes to stderr, so stdout is the CSV and nothing else.
+    assert "Execution time" not in as_csv.stdout
+
+    as_json = _query("select * from t", "--format", "json")
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.stdout)
+    assert payload == [
+        {"n": 1, "d": "2024-01-02", "dec": "3.1400", "tags": [1, 2], "obj": {"k": "v"}}
+    ]
+
+
+def test_query_duckdb_write_needs_the_flag_then_runs(monkeypatch, tmp_path) -> None:
+    database = _ddb(monkeypatch, tmp_path)
+
+    refused = _query("delete from events where id = 0")
+
+    assert refused.exit_code == 1
+    assert "--write" in refused.stdout
+
+    allowed = _query("delete from events where id = 0", "--write")
+
+    assert allowed.exit_code == 0, allowed.output
+    conn = duckdb.connect(database=str(database), read_only=True)
+    remaining = conn.execute("SELECT count(*) FROM events").fetchone()
+    conn.close()
+    assert remaining == (4,)
+
+
+def test_query_duckdb_ddl_reports_duckdbs_own_answer(monkeypatch, tmp_path) -> None:
+    """No invented row count.
+
+    DuckDB's rowcount is -1 for every statement, and it answers DDL with a
+    one-column result set of its own ('Count' or 'Success'). So the "N rows
+    affected" line never fires here — which is the honest outcome, because
+    "-1 rows affected" is what inventing one would print.
+    """
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query("create table staged(a integer)", "--write")
+
+    assert result.exit_code == 0, result.output
+    assert "rows affected" not in result.stdout
+
+
+def test_query_duckdb_read_only_target_refuses_a_write(monkeypatch, tmp_path) -> None:
+    _ddb(monkeypatch, tmp_path, read_only=True)
+
+    result = _query("delete from events", "--write")
+
+    # A write against a read-only database is the statement's own fault, so it
+    # stays at FAILURE rather than claiming a retryable service problem.
+    assert result.exit_code == ExitCode.FAILURE
+    assert "read-only" in result.output
+
+
+def test_query_duckdb_bad_sql_is_a_database_error(monkeypatch, tmp_path) -> None:
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query("select * from no_such_table")
+
+    assert result.exit_code == ExitCode.FAILURE
+    assert "Database error" in result.output
+
+
+def test_query_duckdb_trace_never_reaches_a_machine_readable_stdout(
+    monkeypatch, tmp_path
+) -> None:
+    _ddb(monkeypatch, tmp_path, rows=2)
+
+    with trace.verbose():
+        result = _query("select id from events order by id", "--format", "json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == [{"id": 0}, {"id": 1}]
+    assert "[dp:sql]" in result.stderr
+    assert "engine=duckdb" in result.stderr
+
+
+def test_query_reads_stdin_when_the_sql_is_a_bare_dash(monkeypatch, tmp_path) -> None:
+    """`dp db query -t <target> -` is what --drop-sql tells people to run.
+
+    Before the dash was recognized, that invocation sent the database a
+    statement consisting of one hyphen — so the script `dp db top-tables
+    --drop-sql` emits could not be run the way its own header said to run it.
+    """
+    _ddb(monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        main_module.app,
+        ["db", "query", "-", "-t", "demo_ddb"],
+        input="select count(*) as n from events\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Rows: 1" in result.stdout
+
+
+def test_query_runs_the_whole_drop_script_from_stdin(monkeypatch, tmp_path) -> None:
+    """The generated script is multi-statement, and DuckDB takes it in one go."""
+    database = _ddb(monkeypatch, tmp_path)
+
+    script = (
+        "-- header\nBEGIN;\nDROP TABLE IF EXISTS main.events;  -- ~5 rows\nCOMMIT;\n"
+    )
+    result = runner.invoke(
+        main_module.app,
+        ["db", "query", "-", "-t", "demo_ddb", "--write"],
+        input=script,
+    )
+
+    assert result.exit_code == 0, result.output
+    conn = duckdb.connect(database=str(database), read_only=True)
+    left = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'events'"
+    ).fetchone()
+    conn.close()
+    assert left == (0,)
+
+
+def test_query_duckdb_wraps_a_cte_query_too(monkeypatch, tmp_path) -> None:
+    """All three paginated heads go inside the wrapper, so all three are checked."""
+    _ddb(monkeypatch, tmp_path)
+
+    result = _query(
+        "with recent as (select id from events) select * from recent order by id",
+        "--limit",
+        "2",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "More rows available" in result.stdout
