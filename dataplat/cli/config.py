@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import cast
 
 import typer
 from rich import box
@@ -26,6 +27,7 @@ from dataplat.core.envrc import (
     locate_envrc,
     unexpanded_env_refs,
 )
+from dataplat.services.db.connection import SqlEngine
 
 app = typer.Typer(
     name="config",
@@ -81,7 +83,23 @@ class EnvVarSpec:
     required: bool = True
 
 
-def _target_specs(prefix: str) -> list[EnvVarSpec]:
+def _target_specs(prefix: str, engine: SqlEngine | None = None) -> list[EnvVarSpec]:
+    """The variables one target needs, which depend on what it connects to.
+
+    A DuckDB target has a file, not a server: asking it for ``_HOST``, ``_USER``
+    and ``_PASSWORD`` reported four missing variables and a failed check for a
+    configuration that works perfectly, which is worse than saying nothing —
+    ``dp config doctor`` exists to be believed.
+    """
+    if engine is SqlEngine.duckdb:
+        return [
+            # Either names the database file; connection.py resolves _PATH first
+            # and falls back to _DATABASE, so neither alone is missing.
+            EnvVarSpec(f"{prefix}_PATH", required=False),
+            EnvVarSpec(f"{prefix}_DATABASE", required=False),
+            EnvVarSpec(f"{prefix}_ENGINE", required=False),
+            EnvVarSpec(f"{prefix}_READ_ONLY", required=False),
+        ]
     return [
         EnvVarSpec(f"{prefix}_HOST"),
         EnvVarSpec(f"{prefix}_PORT", required=False),
@@ -109,7 +127,7 @@ def component_vars() -> dict[str, list[EnvVarSpec]]:
         ],
     }
     for name, target in load_targets().items():
-        components[f"target: {name}"] = _target_specs(target.env_prefix)
+        components[f"target: {name}"] = _target_specs(target.env_prefix, target.engine)
     components.update(
         {
             "Airbyte": [
@@ -400,7 +418,7 @@ def _offline_checks() -> list[CheckResult]:
     for name, target in targets.items():
         missing = [
             s.name
-            for s in _target_specs(target.env_prefix)
+            for s in _target_specs(target.env_prefix, target.engine)
             if s.required and not os.getenv(s.name)
         ]
         results.append(
@@ -502,7 +520,11 @@ def _connect_checks() -> list[CheckResult]:
     try:
         import psycopg
 
-        from dataplat.cli.db._common import ConnCliParams
+        from dataplat.cli.db._common import ConnCliParams, db_session
+        from dataplat.services.db.connection import (
+            LIBPQ_ENGINES,
+            DbConnectionParams,
+        )
     except ImportError:
         db_deps_ready = False
         results.append(
@@ -514,15 +536,36 @@ def _connect_checks() -> list[CheckResult]:
             )
         )
 
-    for name in load_targets() if db_deps_ready else []:
+    for name, target in (load_targets() if db_deps_ready else {}).items():
+        # Not psycopg.connect directly: a DuckDB target has no server to dial, and
+        # probing it over libpq reported a failed check for a configuration that
+        # works. db_session already knows which backend an engine needs, and for
+        # DuckDB opening the file IS the health check.
         try:
-            params = ConnCliParams(target=name).resolve()
-            kwargs: dict = {**params.as_psycopg_kwargs(), "connect_timeout": 10}
-            with psycopg.connect(**kwargs) as conn, conn.cursor() as cursor:
-                cursor.execute("SELECT 1")
+            params = ConnCliParams(target=name).resolve_any()
+            if target.engine in LIBPQ_ENGINES:
+                kwargs: dict = {
+                    **cast(DbConnectionParams, params).as_psycopg_kwargs(),
+                    "connect_timeout": 10,
+                }
+                with psycopg.connect(**kwargs) as conn, conn.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+            else:
+                with db_session(params) as session, session.cursor() as cursor:
+                    cursor.execute("SELECT 1")
             results.append(_check(f"{name} connection", True, detail="SELECT 1 ok"))
         except (DataplatError, psycopg.Error) as exc:
             results.append(_check(f"{name} connection", False, detail=str(exc)[:120]))
+        except typer.Exit as exc:
+            # db_session translates driver failures into an exit code; doctor
+            # reports every target rather than stopping at the first bad one.
+            results.append(
+                _check(
+                    f"{name} connection",
+                    False,
+                    detail=f"could not open the database (exit {exc.exit_code})",
+                )
+            )
 
     # Airbyte (only when configured)
     from dataplat.core.errors import AuthError, ConfigError
