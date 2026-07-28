@@ -12,14 +12,14 @@ dp
 ├── status                 # one-shot health overview (--json, --no-aws)
 ├── open                   # airbyte | superset | rds [id] | redshift | secrets [name]
 ├── config                 # init | show | doctor [--connect]
-├── db                     # warehouses & databases (Postgres, Redshift)
+├── db                     # warehouses & databases (Postgres, Redshift, DuckDB)
 │   ├── query              # ad-hoc SQL (--format table|csv|json, --write guard)
 │   ├── describe           # schema/table/view report (--json)
-│   ├── long-queries       # triage per target (--history, --json)
-│   ├── kill               # cancel/terminate queries by PID
-│   ├── role               # list | show | create | drop
+│   ├── long-queries       # triage per target (--history, --json)      [1]
+│   ├── kill               # cancel/terminate queries by PID            [1]
+│   ├── role               # list | show | create | drop                [1]
 │   ├── top-tables         # rank big tables (--drop-sql, --drop)
-│   └── dbt-orphans        # scan/rename | revert | purge (--older-than)
+│   └── dbt-orphans        # scan/rename | revert | purge (--older-than) [1]
 ├── ingest                 # data ingestion
 │   └── airbyte
 │       ├── connections    # list | get | create | update | set-cursor
@@ -47,6 +47,10 @@ dp
         └── runner         # start | stop | status
 ```
 
+[1] Cannot apply to a `duckdb` target: an in-process, single-user database has no
+roles, no other sessions, and no rename that survives a dependent view. See
+[Engines](#engines) for the matrix and the reason per command.
+
 ## Installation
 
 Requires Python 3.12 or newer, on Linux or macOS. Windows is untested and parts
@@ -67,15 +71,27 @@ only what your platform uses:
 | Extra | Enables | Pulls in |
 | --- | --- | --- |
 | `db` | `dp db` | psycopg |
+| `duckdb` | `duckdb` targets inside `dp db` | duckdb |
 | `ingest` | `dp ingest` | httpx, textual, croniter |
 | `bi` | `dp bi` | httpx |
 | `cloud` | `dp cloud` | boto3, plotext |
 | `all` | everything | all of the above |
 
+`duckdb` is the one extra that is an *engine* rather than an area, so it is
+deliberately **not** part of `db`: the extension module alone is three times
+psycopg's size, and someone whose warehouse is PostgreSQL should not carry an
+embedded database engine to run `dp db describe`. `dataplat[db,duckdb]` is what
+a DuckDB target needs; `dataplat[all]` includes both.
+
 A bare `pip install dataplat` gives you the core (`status`, `open`,
 `config`) with every other area stubbed. You don't have to plan this in
 advance: `dp` knows which areas your configuration enables and installs
 what's missing on demand — see below.
+
+If your warehouse *is* a DuckDB file, read [Engines](#engines) before you
+install: `dp db query`, `dp db describe` and `dp db top-tables` work against it,
+and the other four `dp db` commands cannot — DuckDB is in-process and
+single-user, so there is nothing for them to act on.
 
 ## Auto-installing dependencies
 
@@ -95,8 +111,24 @@ also reports per-area dependency status.
 
 Either path only ever *adds* to your install: the command is pinned to the
 `dataplat` version you already run, so installing an extra never upgrades the
-tool underneath you, and it carries your existing extras along, so adding
-`db` cannot drop an `ingest` you already had.
+tool underneath you, and it carries your existing extras along — `duckdb`
+included — so adding `db` cannot drop an `ingest` you had, and no self-install
+can drop the DuckDB driver.
+
+Carrying `duckdb` along matters more than the rest, because nothing would ever
+put it back. It is the one dependency outside this machinery: it belongs to an
+*engine*, and both paths above plan per *area*. So it is never installed for you
+and never offered mid-command — you are already talking to a database by then. A
+DuckDB target whose driver is missing stops at exit 3 with the extra named:
+
+```text
+Error: A duckdb target needs the duckdb package, which is not installed: it is
+the 'duckdb' extra (dataplat[duckdb]). Run: …
+```
+
+The `Run:` tail is the command for the environment `dp` runs from — uv tool,
+pipx, or the venv's pip — pinned to the version you already have, so it adds the
+driver without upgrading the tool underneath you.
 
 ## Shell completion
 
@@ -121,7 +153,7 @@ to install it mid-keystroke.
 
    ```bash
    # ~/.envrc (or any env mechanism you prefer)
-   export DP_TARGETS="warehouse,lake"
+   export DP_TARGETS="warehouse,lake,local"
    export DP_DEFAULT_TARGET="warehouse"
 
    export WAREHOUSE_ENGINE=postgresql
@@ -136,6 +168,9 @@ to install it mid-keystroke.
    export LAKE_USER=me
    export LAKE_PASSWORD=…
    export LAKE_REASSIGN_OWNER=admin      # role drop reassigns owned objects here
+
+   export LOCAL_ENGINE=duckdb
+   export LOCAL_PATH=~/data/warehouse.duckdb   # a file, not a server; or :memory:
    ```
 
 2. Optionally link that file globally and check your setup:
@@ -152,6 +187,7 @@ to install it mid-keystroke.
    dp status
    dp db query 'SELECT 1'
    dp db query -t lake 'SELECT 1'
+   dp db query -t local 'SELECT 1'
    ```
 
 ## Environment loading
@@ -171,6 +207,152 @@ exports. `dp config show` and `dp config doctor` always name the active file
 directory. Set `DP_ENVRC_ALLOW_CWD=0` to drop that candidate entirely and
 rely only on the global link you chose.
 
+## Engines
+
+`dp db` speaks three engines, and they are not three sizes of the same database.
+PostgreSQL and Redshift are servers reached over the PostgreSQL wire protocol,
+with users, sessions and an ACL system. DuckDB is a database **file**, opened
+inside the `dp` process: no host, no port, no password, no TLS, and no users at
+all — every connection is the same implicit user, `duckdb`.
+
+| Engine | `<NAME>_ENGINE` | Reached through | Needs |
+| --- | --- | --- | --- |
+| PostgreSQL | `postgresql` (the default) | host/port/user/password over libpq | `dataplat[db]` |
+| Redshift | `redshift` | the same, port 5439 by default | `dataplat[db]` |
+| DuckDB | `duckdb` | a database file, in this process | `dataplat[db,duckdb]` |
+
+### What each command can do
+
+| `dp db` command | PostgreSQL | Redshift | DuckDB | Why not, on DuckDB |
+| --- | :-: | :-: | :-: | --- |
+| `query` | ✓ | ✓ | ✓ | — |
+| `describe` | ✓ | ✓ | ✓ | — |
+| `top-tables` | ✓ | ✓ | ✓ | works, but ranks by estimated rows and shows no sizes — [see below](#duckdb-top-tables-sizes-are-estimates) |
+| `role list` / `show` / `create` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
+| `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
+| `kill` | ✓ | ✓ | ✗ | the same — there is no other session to cancel |
+| `dbt-orphans` | ✓ | ✓ ² | ✗ | it quarantines an orphan by renaming it, and `ALTER TABLE … RENAME TO` fails with a `DependencyException` whenever a view depends on the table, which in a dbt project is the normal case. DuckDB has no `CASCADE` |
+
+¹ `dp db role show` reports `Password set: unknown` on Redshift: there is no
+`pg_authid`, and `pg_user.passwd` is masked to `'********'` for every row, so
+the question cannot be answered rather than answered wrongly.
+² `dp db dbt-orphans` does not consider materialized views on Redshift: there is
+no `pg_matviews` catalog listing them.
+
+A refused command **exits 2** — "a combination of arguments that cannot work",
+the same code as an unknown flag or an unknown target — and says which engine
+and why:
+
+```console
+$ dp db role list -t local
+Error: dp db role list cannot run against DuckDB: it has no users or roles at
+all — pg_roles, pg_authid and pg_user do not exist, and every connection is the
+same implicit user, 'duckdb'. That is what DuckDB is, not a missing dataplat
+feature.
+```
+
+It never says "not implemented", because none of these is a gap waiting for a
+release. A single-user in-process database has no roles to grant, no concurrent
+sessions to triage and nobody else's query to cancel; `dbt-orphans` is refused
+because its one mechanism is a rename DuckDB rejects, and a destructive command
+that half works is worse than none. If you need role management or query
+triage, that is a reason to put a server behind the data, not to wait for a
+flag.
+
+A mixed configuration keeps working. `dp db long-queries` runs across every
+target by default, so there the refusal is *per target*: the servers still
+report, each DuckDB target says why it cannot on **stderr** — where it cannot
+corrupt `--json` — and the run is not counted as a failure, because nothing
+failed. Only when every target in scope is a DuckDB one is the refusal the whole
+answer, and then it exits 2.
+
+Where a command *does* run but cannot answer every part of its report, it names
+what it left out. `dp db describe` against a DuckDB target ends with a
+**Not applicable on DuckDB** section listing privileges, default privileges,
+size and materialized views, each with the reason — because a section that is
+simply missing reads as "nothing is configured" when what it means is "this
+engine has no such concept".
+
+### DuckDB configuration
+
+```bash
+export DP_TARGETS="warehouse,local"
+export LOCAL_ENGINE=duckdb
+export LOCAL_PATH=~/data/warehouse.duckdb   # or :memory:
+export LOCAL_READ_ONLY=1                    # optional
+```
+
+| Variable | Purpose |
+| --- | --- |
+| `<NAME>_ENGINE=duckdb` | Makes this target a database file instead of a server. |
+| `<NAME>_PATH` | The database file. `~` is expanded; a relative path is resolved against the directory you run `dp` in, exactly as DuckDB would. `:memory:` opens an ephemeral in-memory database instead. |
+| `<NAME>_DATABASE` | Accepted as a fallback for `_PATH`, because every other engine takes a database *name* from it and that is what you will reach for first. `_PATH` wins if both are set. |
+| `<NAME>_READ_ONLY` | Truthy ⇒ open the file read-only. DuckDB enforces it itself, so it is a guard and not a hint: a write fails with `Cannot execute statement of type "CREATE" on database … attached in read-only mode!`, and — like any statement the engine rejects — exits 1 rather than 5, because retrying it cannot help. |
+
+`--database`/`-d` is the flag spelling of the path and beats both variables;
+there is no `--path`, because every db command already has `-d`.
+
+Five behaviours worth knowing before you configure one:
+
+- **Server settings are refused, not ignored.** `<NAME>_HOST`, `_PORT`,
+  `_USER`, `_PASSWORD` and `_SSLMODE` — and the matching flags — stop a DuckDB
+  target at exit 3 naming the offender, because a target carrying both a host
+  and a path is a configuration that is wrong in one of two ways, and guessing
+  which half you meant is how a query ends up running against the wrong
+  database. The mirror is refused too: `<NAME>_PATH` on a `postgresql` target.
+  Only this target's own `<NAME>_*` variables count, so a stray `PGHOST` left
+  in your shell does not break a DuckDB target.
+- **dataplat never creates the database file.** `duckdb.connect()` would, and
+  for a read-mostly tool that is the wrong default: a mistyped path would become
+  an empty database, and `dp db describe` would then report — truthfully — that
+  your warehouse contains nothing. A missing path is exit 3, naming the path.
+- **`--verbose` names the file, and whether it was opened read-only:**
+  `[dp:sql] connect /data/warehouse.duckdb engine=duckdb read-only`.
+- **`dp status` includes DuckDB targets**, and says what it could not check
+  rather than leaving a blank: `✓ local — reachable; long-running queries not
+  applicable on DuckDB — it runs inside this process and has no
+  pg_stat_activity …`.
+- **`dp config show` and `dp config doctor` are not DuckDB-aware yet.** They
+  list and check the libpq variables for every target, so a correct DuckDB
+  target shows `_HOST`/`_USER`/`_PASSWORD` as `unset`, `doctor` reports them as
+  missing, and neither mentions `_PATH` or `_READ_ONLY`. Ignore that for DuckDB
+  targets — and do not set `_HOST` to silence it, since that is exactly what a
+  DuckDB target refuses.
+
+### DuckDB top-tables sizes are estimates
+
+`dp db top-tables` works against DuckDB, but its numbers do not mean what the
+same columns mean on a server. PostgreSQL ranks by bytes from
+`pg_total_relation_size()` (heap + indexes + toast); Redshift by
+`svv_table_info.size`. DuckDB has neither `pg_total_relation_size()` nor
+`pg_database_size()`, and no catalog column carrying per-table bytes at all. So
+on a DuckDB target the report is a different report:
+
+- rows are ranked by `duckdb_tables().estimated_size` — DuckDB's row-count
+  **estimate**, not bytes — and the section header says so: `ranked by estimated
+  rows`, with the column headed `Rows (est.)`;
+- the `Size` and `% of disk` columns are **not shown**, rather than shown full of
+  `—`: a Size column of dashes under a `0 B (0.0% of disk)` footer would read as
+  a dataplat defect instead of as the engine's answer. The keys stay in `--json`
+  with `size_bytes: null` and `matched_bytes: null`, so a script sees the gap
+  explicitly rather than a field that vanished;
+- the one real byte figure is the whole database file, from
+  `pragma_database_size()`. It is printed as `Database file:` and deliberately
+  not used as the denominator of a percentage: it covers every schema in the
+  file, including free blocks, so nothing above it divides into it;
+- the section prints, in one line, exactly where its numbers came from, and
+  `--json` carries the same thing per target as `ranked_by` and `size_basis` —
+  so two targets on different engines in one report cannot be misread as
+  comparable.
+
+Use it to find the big tables inside one DuckDB file. Do not compare a DuckDB
+ranking with a PostgreSQL one, and do not add the two engines' figures together.
+
+One thing to know before `--drop`/`--drop-sql` there, which the emitted script
+also says: DuckDB does **not** block `DROP TABLE` on a dependent view — it
+leaves the view broken — while a foreign-key child does block it, and there is no
+`CASCADE`.
+
 ## Configuration reference
 
 | Variable | Purpose |
@@ -180,8 +362,10 @@ rely only on the global link you chose.
 | `DP_VERBOSE` | Set to `1` to trace every statement and request to stderr, for a whole session — same switch as `--verbose`. |
 | `DP_TARGETS` | Comma-separated DB target names (e.g. `warehouse,lake`). |
 | `DP_DEFAULT_TARGET` | Target used when `--target` is omitted (default: first of `DP_TARGETS`). |
-| `<NAME>_ENGINE` | `postgresql` (default) or `redshift`, per target. |
-| `<NAME>_HOST/_PORT/_USER/_PASSWORD/_DATABASE/_SSLMODE` | Connection settings, per target. |
+| `<NAME>_ENGINE` | `postgresql` (default), `redshift` or `duckdb`, per target. |
+| `<NAME>_HOST/_PORT/_USER/_PASSWORD/_DATABASE/_SSLMODE` | Connection settings, per target. Server-only: all but `_DATABASE` are refused on a `duckdb` target — see [Engines](#engines). |
+| `<NAME>_PATH` | DuckDB only: the database file, or `:memory:`. `<NAME>_DATABASE` is accepted as a fallback. |
+| `<NAME>_READ_ONLY` | DuckDB only: truthy ⇒ open the database file read-only. |
 | `<NAME>_REASSIGN_OWNER` | Default owner for `dp db role drop` ownership transfer. |
 | `AIRBYTE_BASE_URL` + `AIRBYTE_CLIENT_ID`/`AIRBYTE_CLIENT_SECRET` (cloud) or `AIRBYTE_EMAIL`/`AIRBYTE_PASSWORD` (OSS) | Airbyte API access. |
 | `SUPERSET_BASE_URL`, `SUPERSET_ADMIN_USERNAME`, `SUPERSET_ADMIN_PASSWORD` | Superset API access. |
@@ -307,7 +491,13 @@ dp db query -t lake 'SELECT 1'                 # named target
 dp db query --format csv -n 0 'SELECT ...' > out.csv
 echo 'SELECT 1' | dp db query
 dp db query --write 'UPDATE t SET x = 1'       # writes need --write or a confirm
+dp db query -t local 'SELECT * FROM duckdb_tables()'   # DuckDB target
 ```
+
+Your SQL is sent as you wrote it, so write it in the target's own dialect —
+DuckDB's catalogs (`duckdb_tables()`, `pragma_database_size()`) on a `duckdb`
+target, `pg_*` on a server. DuckDB does provide `pg_catalog` compatibility
+views, so simple `pg_class` / `information_schema` queries work on all three.
 
 ### Long queries and kill
 
@@ -328,10 +518,12 @@ dp db role create readers --no-login --grant-to alice,bob
 dp db role drop old_user --all-databases --dry-run
 ```
 
-`list`, `create`, and `drop` work against both Postgres and Redshift targets.
-`create` makes login roles with generated passwords by default; `--no-login`
-creates a passwordless group-style role instead. `drop` transfers owned
-objects to the target's `<NAME>_REASSIGN_OWNER` before `DROP USER`.
+`list`, `create`, and `drop` work against both Postgres and Redshift targets —
+and against no DuckDB target, which has no users to manage at all (see
+[Engines](#engines)). `create` makes login roles with generated passwords by
+default; `--no-login` creates a passwordless group-style role instead. `drop`
+transfers owned objects to the target's `<NAME>_REASSIGN_OWNER` before
+`DROP USER`.
 
 ### Cleanup
 
@@ -398,6 +590,15 @@ uv run mypy dataplat
 CI runs those four across Python 3.12 and 3.13 — the floor the wheel
 advertises as well as the pinned dev version.
 
+The three engines are not equally covered, and the difference is worth knowing
+before you trust a number the tool printed:
+
+| Engine | Coverage in CI | Needs |
+| --- | --- | --- |
+| PostgreSQL | real SQL, really executed | a container (`-m integration`, `DP_TEST_PG_REQUIRED=1`) |
+| DuckDB | real SQL, really executed | nothing — it is in-process, so it runs in the default job |
+| Redshift | none: generated and asserted, never executed | a cluster you own (`-m redshift`) |
+
 Redshift cannot be containerized, so CI cannot cover it. If you run dataplat
 against a Redshift cluster, you can verify your own deployment: point
 `DP_TEST_RS_TARGET` at one of your targets and run the read-only tier
@@ -453,6 +654,12 @@ fast, database-free subset explicitly, use `-m "not integration"`.
 Redshift-specific code path remains fake-tested only — its SQL is generated and
 asserted against a fake cursor, never executed. Treat changes to Redshift
 paths as unverified by CI and test them against a real cluster.
+
+**Not a gap: DuckDB.** There is nothing to containerize — a DuckDB database is a
+file (or `:memory:`), and the driver is installed by `--all-extras` — so the
+DuckDB SQL is really executed, with no marker, no container, no env var and no
+skip path. A DuckDB change that "could not be tested" is a change that was not
+tested.
 
 ## Releasing
 
