@@ -15,9 +15,17 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from dataplat.cli._exit import fail
 from dataplat.cli._options import yes_option
 from dataplat.cli._render import cell, esc
-from dataplat.core.envrc import CONFIG_ENVRC, EnvrcSource, link_envrc, locate_envrc
+from dataplat.core.envrc import (
+    CONFIG_ENVRC,
+    EnvrcLocation,
+    EnvrcSource,
+    link_envrc,
+    locate_envrc,
+    unexpanded_env_refs,
+)
 
 app = typer.Typer(
     name="config",
@@ -34,6 +42,34 @@ CWD_ENVRC_HINT = (
     "Run `dp config init` to pin a trusted file, or set "
     "DP_ENVRC_ALLOW_CWD=0 to ignore ./.envrc."
 )
+
+# `export PGHOST=$DB_HOST` loads the literal "$DB_HOST": dataplat parses .envrc
+# itself and does not expand. The failure that follows is a connection error, so
+# it reads as a wrong host or a wrong password — which is why both commands say
+# so out loud instead of leaving it to core/envrc.py's docstring.
+UNEXPANDED_MARK = "! $VAR not expanded"
+UNEXPANDED_HINT = (
+    "dataplat reads .envrc itself and does not expand shell variables. "
+    "Write the value out, or export it from your shell before running dp."
+)
+
+
+def _unexpanded_refs(location: EnvrcLocation | None) -> dict[str, list[str]]:
+    """Which loaded vars still hold an unexpanded ``$VAR``, and which they name.
+
+    Re-reads the active file rather than remembering what ``load_envrc`` saw: the
+    load happens at import in :mod:`dataplat.main` and keeps nothing, and the
+    file is the thing the user is about to edit.
+    """
+    if location is None:
+        return {}
+    try:
+        content = location.path.read_text()
+    except OSError:
+        # The same silence as load_envrc, and for the same reason: a file it
+        # could not read contributed no values, so there is nothing to warn about.
+        return {}
+    return unexpanded_env_refs(content)
 
 
 @dataclass(frozen=True)
@@ -186,19 +222,30 @@ def sync(
     console.print("[green]Dependencies installed — the areas above are ready.[/green]")
 
 
-def _mask(value: str | None, secret: bool) -> Text:
+def _mask(value: str | None, secret: bool, *, unexpanded: bool = False) -> Text:
     """Render one variable's state as a cell.
 
     Both branches return :class:`~rich.text.Text` so the caller never has to
     know which is which: the unset/secret markers are markup we author, while
     the value itself is whatever the environment holds and must render
     verbatim — an ``[unclosed`` tag there used to crash the whole table.
+
+    ``unexpanded`` appends the ``$VAR`` marker. A reader who sees ``$DB_HOST``
+    in the value column has no reason to suspect it: in their shell that line
+    works, so the cell showing it faithfully is exactly what hides the problem.
+    The marker also covers a secret, whose value is not shown at all.
     """
     if not value:
+        # Nothing was loaded, so there is no literal to mark.
         return Text.from_markup("[dim]unset[/dim]")
-    if secret:
-        return Text.from_markup("[green]set[/green] [dim](hidden)[/dim]")
-    return cell(value, max_length=60)
+    rendered = (
+        Text.from_markup("[green]set[/green] [dim](hidden)[/dim]")
+        if secret
+        else cell(value, max_length=60)
+    )
+    if unexpanded:
+        rendered = rendered + Text.from_markup(f" [yellow]{UNEXPANDED_MARK}[/yellow]")
+    return rendered
 
 
 @app.command("show")
@@ -231,17 +278,39 @@ def show() -> None:
     table.add_column("Variable")
     table.add_column("Value")
 
-    for component, specs in component_vars().items():
+    from dataplat.core.errors import ConfigError
+
+    try:
+        components = component_vars()
+    except ConfigError as exc:
+        # `dp config show` is the command someone runs *because* their config is
+        # broken, and a bad DP_TARGETS used to answer with a traceback — hiding
+        # the ".envrc active here" header printed just above, which is the one
+        # thing already on screen that they need. Exits 3 (CONFIG), not 1.
+        fail(exc, console=console)
+
+    unexpanded = _unexpanded_refs(location)
+    marked = False
+    for component, specs in components.items():
         for i, spec in enumerate(specs):
             # Component and variable names are built from DP_TARGETS, so they
             # are user data too.
+            is_literal = spec.name in unexpanded
+            marked = marked or is_literal
             table.add_row(
                 cell(component if i == 0 else ""),
                 cell(spec.name),
-                _mask(os.getenv(spec.name), spec.secret),
+                _mask(os.getenv(spec.name), spec.secret, unexpanded=is_literal),
             )
 
     console.print(table)
+    if marked:
+        # The footnote exists to explain a marker, so it appears only with one.
+        # `unexpanded` can also name vars this table does not list — an arbitrary
+        # .envrc key is nobody's spec — which is what `doctor` is for.
+        console.print(
+            f"[yellow]{UNEXPANDED_MARK}[/yellow] [dim]{UNEXPANDED_HINT}[/dim]"
+        )
 
 
 class CheckStatus(str, Enum):
@@ -295,6 +364,25 @@ def _offline_checks() -> list[CheckResult]:
     )
     if location is not None and location.source is EnvrcSource.cwd:
         results.append(_warn("envrc trust", CWD_ENVRC_DETAIL, CWD_ENVRC_HINT))
+
+    unexpanded = _unexpanded_refs(location)
+    if unexpanded:
+        # A warning, never a failure: doctor's exit code is a contract, and a
+        # value that *might* be wrong must not flip a setup that used to exit 0.
+        #
+        # The affected keys are named; the variables their values reference are
+        # not. The reference is extracted from the value, and a value can be a
+        # credential — `PGPASSWORD="p$ssw0rd"` would otherwise print a fragment
+        # of the password into whatever log this run lands in. The key is enough
+        # to act on: it names the .envrc line to look at, and `dp config show`
+        # prints the literal for everything that is not a secret.
+        results.append(
+            _warn(
+                "shell expansion",
+                f"loaded literally: {', '.join(unexpanded)}",
+                UNEXPANDED_HINT,
+            )
+        )
 
     try:
         targets = load_targets()

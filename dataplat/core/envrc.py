@@ -14,12 +14,22 @@ optional:
   current-directory candidate entirely. It does not touch the dev repo root
   candidate, which is dataplat's own checkout rather than wherever the user
   happens to stand.
+
+The loader is a parser, not a shell: it reads ``export KEY=value`` lines and
+performs no expansion, so ``export PGHOST=$DB_HOST`` loads the seven characters
+``$DB_HOST``. That was documented on :func:`parse_envrc` and invisible at
+runtime — the connection then fails with an authentication or resolution error
+that looks like a bad credential. :func:`unexpanded_env_refs` makes it
+detectable so ``dp config doctor`` can name it. Expansion itself stays
+unimplemented on purpose: doing it properly is a shell, and doing it
+approximately is a second set of semantics for users to discover.
 """
 
 from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -29,6 +39,13 @@ CONFIG_ENVRC = CONFIG_DIR / ".envrc"
 
 # '#' starts a comment only when preceded by whitespace (shell semantics).
 _INLINE_COMMENT = re.compile(r"\s+#.*$")
+
+# A shell variable reference this loader will *not* expand: `$NAME` or
+# `${NAME}` (and `${NAME:-x}`, whose name is all we need). Three shapes are
+# excluded because the shell would not have expanded them either, so flagging
+# them would be a false alarm: `\$NAME` is escaped, `$$` is the PID, and `$1` is
+# a positional — neither of the last two can start an identifier.
+_SHELL_REF = re.compile(r"(?<!\\)\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 
 _ALLOW_CWD_VAR = "DP_ENVRC_ALLOW_CWD"
 _DISABLED_VALUES = {"0", "false", "no"}
@@ -114,15 +131,23 @@ def _close_quote(text: str, quote: str) -> tuple[str, bool]:
     return text[:idx], True
 
 
-def parse_envrc(content: str) -> dict[str, str]:
-    """Parse shell-style ``export KEY=value`` lines from .envrc content.
+@dataclass(frozen=True)
+class _Export:
+    """One ``export KEY=value`` line, with the quoting that produced it.
 
-    Supports single-/double-quoted values (including multiline blocks such
-    as PEM keys) and strips inline ``#`` comments outside quotes. Variable
-    expansion and escapes are not interpreted.
+    The quote character is what :func:`unexpanded_env_refs` needs and
+    :func:`parse_envrc` discards: in the shell, single quotes suppress expansion,
+    so a ``$NAME`` inside them is a literal both there and here.
     """
+
+    key: str
+    value: str
+    quote: str
+
+
+def _iter_exports(content: str) -> Iterator[_Export]:
+    """Yield every export in file order. The one parser both views share."""
     lines = content.splitlines()
-    env: dict[str, str] = {}
     i = 0
 
     while i < len(lines):
@@ -146,7 +171,7 @@ def parse_envrc(content: str) -> dict[str, str]:
             quote = value[0]
             chunk, closed = _close_quote(value[1:], quote)
             if closed:
-                env[key] = chunk
+                yield _Export(key, chunk, quote)
                 continue
             collected = [chunk]
             while i < len(lines):
@@ -155,12 +180,58 @@ def parse_envrc(content: str) -> dict[str, str]:
                 i += 1
                 if closed:
                     break
-            env[key] = "\n".join(collected)
+            yield _Export(key, "\n".join(collected), quote)
             continue
 
-        env[key] = _INLINE_COMMENT.sub("", value).strip()
+        yield _Export(key, _INLINE_COMMENT.sub("", value).strip(), "")
 
-    return env
+
+def parse_envrc(content: str) -> dict[str, str]:
+    """Parse shell-style ``export KEY=value`` lines from .envrc content.
+
+    Supports single-/double-quoted values (including multiline blocks such
+    as PEM keys) and strips inline ``#`` comments outside quotes. Variable
+    expansion and escapes are not interpreted — see
+    :func:`unexpanded_env_refs`, which reports where that matters.
+    """
+    return {export.key: export.value for export in _iter_exports(content)}
+
+
+def unexpanded_env_refs(
+    content: str, environ: Mapping[str, str] | None = None
+) -> dict[str, list[str]]:
+    """Loaded keys whose value still holds a ``$VAR`` the shell would have expanded.
+
+    Maps each affected key to the variable names its value references, in the
+    order they appear. Empty when there is nothing to report, which is the normal
+    case — the caller can treat a non-empty result as "warn".
+
+    Three filters keep it from crying wolf, because a warning nobody trusts is
+    worse than none:
+
+    - a single-quoted value is skipped: the shell would not expand it either, so
+      the literal we loaded is exactly what the shell would have exported (this
+      is also what keeps a password like ``'p$ss'`` out of the report);
+    - a key whose current environment value is *not* the literal from the file is
+      skipped: :func:`load_envrc` is ``setdefault``-based, so the shell already
+      had that variable and the file's line never took effect;
+    - escaped and non-identifier forms never match at all — see ``_SHELL_REF``.
+
+    ``environ`` exists to be substituted in tests; it defaults to the real one.
+    """
+    env = os.environ if environ is None else environ
+    affected: dict[str, list[str]] = {}
+    for export in _iter_exports(content):
+        if export.quote == "'" or env.get(export.key) != export.value:
+            continue
+        names: list[str] = []
+        for match in _SHELL_REF.finditer(export.value):
+            name = match.group("name")
+            if name not in names:
+                names.append(name)
+        if names:
+            affected[export.key] = names
+    return affected
 
 
 def link_envrc(source: Path) -> None:
