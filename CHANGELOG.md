@@ -1,5 +1,91 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Exit codes now say what went wrong.** Every failure used to be `1`, so a
+  wrapper script could not tell "your config is wrong" from "the warehouse is
+  down" — and only one of those is worth retrying. Typed failures now carry
+  their own code: `2` invalid input, `3` configuration, `4` authentication,
+  `5` external service. `0`, `1` and `2` keep their conventional meanings, and
+  `2` is deliberately shared with Click's own usage error, because
+  `--format nope` and `-t nosuchtarget` are one condition to the caller.
+
+  An unreachable warehouse exits `5`, since that is the retryable case. A bad
+  statement against a reachable server stays `1`: retrying a syntax error would
+  fail identically forever. Untyped failures and a declined confirmation also
+  stay `1`. The full table is in the README.
+
+  **Scripts that branch on a non-zero exit will see new numbers.** Anything
+  testing `== 1` for a config or auth problem needs updating.
+
+- **`dp db dbt-orphans` is more aggressive.** Its "which models are live" query
+  interpolated the dbt project name into a `LIKE` pattern without escaping it,
+  and dbt project names are snake_case — so the `_` in `my_project` matched any
+  character and a *sibling* project's models (`my2project`) sharing the
+  `dbt_artifacts` schema were counted as live. The same applied to
+  `DP_DBT_INVOCATION_COMMAND`, where `_` is ordinary in a dbt selector.
+
+  The direction is the point: an over-large live set makes **fewer** objects look
+  orphaned. Escaping it shrinks the live set, so dbt-orphans will now rename —
+  and after the grace period drop — objects it previously left alone. Run
+  `dp db dbt-orphans` (dry-run is the default) and read the plan before you
+  `--no-dry-run` the first time after upgrading.
+
+- **`dp status` runs its checks concurrently**: 40.7s to 10.4s with five
+  targets, one unreachable. Sections run in parallel and each database target is
+  probed in parallel within them, which is where the time actually went — a 10s
+  connect timeout per target was paid serially. Key order and section order are
+  unchanged, because both pools iterate the declared mapping rather than
+  completion order. The AWS section stays serial and last: it may hand the
+  terminal to an interactive `aws sso login`.
+
+### Added
+
+- **`--verbose` (or `DP_VERBOSE=1`) shows what dataplat actually sent** — SQL
+  statements, HTTP requests with status and duration, and AWS service calls.
+  It writes to stderr only, so `--json` and `--format csv` stay pipeable, and
+  everything passes through a redactor: passwords, secret values, bearer tokens
+  and API keys are never traced. Parameter values and response bodies are not
+  traced either — those are the data, not the request.
+
+- **Third-party command areas.** `dp` discovers areas declared in the
+  `dataplat.areas` entry-point group, so a package can add a command area
+  without a change here. Discovery reads only the entry-point metadata, never
+  imports the plugin, so `dp --version` and `dp --help` stay import-free and
+  fast. A plugin that fails to import warns on stderr and leaves the built-in
+  areas working; it cannot shadow a built-in area.
+
+- `dp config doctor` warns when a loaded `.envrc` value still contains an
+  unexpanded `$VAR`. dataplat does not run a shell, so
+  `export PGHOST=$DB_HOST` loads the literal text — which then surfaces as a
+  baffling connection failure rather than as the configuration mistake it is.
+
+- Shell completion is documented (`dp --install-completion`). It always worked;
+  the README never said so.
+
+### Fixed
+
+- `dp db query --format json|csv` could emit output that would not parse. The
+  progress spinner painted to stdout, which was invisible while Rich only did
+  that for a real terminal — the frames are erased — but `FORCE_COLOR` makes
+  Rich treat a pipe as a terminal too, and then the escape sequences ended up in
+  the redirected file. The spinner now follows the same sink as the notices.
+
+- `dp db describe` reported the owner's grant option two different ways
+  depending on whether you asked about a schema or a relation. PostgreSQL grants
+  an owner every grant option implicitly and never records it in the ACL, so
+  reading the ACL reported "cannot delegate" about a role that demonstrably can.
+  Schema privileges now agree with relation privileges.
+
+- The `Operating System :: OS Independent` classifier was an overclaim and has
+  been narrowed. Four things break on Windows: `dp config init` creates a
+  symlink, the dependency auto-install re-execs through `os.execvp`, the runner
+  commands shell out to `docker` with a POSIX default workdir, and the
+  credentials file is written with a `0o600` mode Windows ignores — after which
+  dataplat reports its own file as insecurely permissioned. CI tests Linux only.
+
 ## 0.2.3
 
 Redshift-only fixes. Nothing changes for PostgreSQL targets.
