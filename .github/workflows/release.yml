@@ -50,6 +50,9 @@ jobs:
           print(f"Tag '{tag}' matches [project].version.")
           PY
 
+      # --all-extras installs psycopg ("db") and duckdb ("duckdb"). The wheel
+      # advertises both as extras, so both are installed before the tag is
+      # allowed through.
       - name: Install dependencies
         run: uv sync --group dev --all-extras
 
@@ -66,6 +69,16 @@ jobs:
       # `integration` job below, which gates `build` alongside this one.
       - name: Pytest (unit)
         run: uv run pytest -m "not integration"
+
+      # Also mirrors ci.yml, and it belongs in the tag gate for the same reason
+      # the `integration` job does: a version can be yanked but never replaced,
+      # and `verify`'s fake cursors cannot tell whether a `duckdb_*()` query
+      # parses. This one costs no container and runs on both interpreters, so
+      # there is no argument for leaving the third engine's SQL unexecuted at
+      # publish time. Path-selected because the tier inherits the `integration`
+      # marker the step above deselects -- see the note in ci.yml.
+      - name: Pytest (DuckDB integration)
+        run: uv run pytest tests/integration/duckdb
 
   # This gate exists because the alternative is shipping SQL no server has ever
   # parsed. dataplat's db services are thousands of lines of generated SQL, and
