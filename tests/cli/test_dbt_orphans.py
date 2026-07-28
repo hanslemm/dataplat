@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 from dataplat.cli import _prompt
 from dataplat.cli.db import dbt_orphans as do
 from dataplat.cli.db.dbt_orphans import _parse_exclusions
-from dataplat.core.errors import ValidationError
+from dataplat.core.errors import ConfigError, ExitCode, ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import DEPRECATED_SUFFIX
 
@@ -327,7 +327,9 @@ def test_scan_echoes_hostile_exclusion_token_verbatim(
     warehouse: SimpleNamespace,
 ) -> None:
     result = _scan(["--exclude", "a.b[/x].c"])
-    assert result.exit_code == 1
+    # A malformed --exclude is a ValidationError, so it exits 2 like every other
+    # rejected argument -- Click's own usage errors included.
+    assert result.exit_code == ExitCode.INVALID_INPUT
     assert "a.b[/x].c" in result.output
 
 
@@ -335,6 +337,37 @@ def test_scan_rejects_zero_window(warehouse: SimpleNamespace) -> None:
     result = _scan(["--window-days", "0"])
     assert result.exit_code == 1
     assert "--window-days must be >= 1" in result.output
+
+
+def test_scan_unknown_target_exits_invalid_input(tmp_path: Path) -> None:
+    """No `warehouse` fixture: that one stubs out target resolution entirely."""
+    result = _scan(["--target", "nope", "--log", str(tmp_path / "s.json")])
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Unknown target" in result.output
+
+
+def test_scan_unset_dbt_project_exits_config(
+    warehouse: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unset DP_DBT_PROJECT is the operator's to fix, so it exits 3, not 5.
+
+    The per-engine step re-raises it with an ``[<engine>]`` label, which used to
+    widen it to ServiceError on the way. Under the new codes that would have
+    told a CI job the *warehouse* had failed — an error it would retry forever,
+    when nothing about retrying can set an environment variable.
+    """
+    monkeypatch.setattr(
+        do, "node_prefix", lambda: (_ for _ in ()).throw(ConfigError("DP_DBT_PROJECT"))
+    )
+    log = tmp_path / "s.json"
+
+    result = _scan(["--log", str(log)])
+
+    assert result.exit_code == ExitCode.CONFIG
+    assert f"[{LABEL}] DP_DBT_PROJECT" in result.output
+    # The partial log still lands, and still says so after the error.
+    assert json.loads(log.read_text())["renames"] == []
+    assert "Partial audit log written" in result.output
 
 
 # --- purge: the gate ----------------------------------------------------
