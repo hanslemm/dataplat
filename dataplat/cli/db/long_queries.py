@@ -28,6 +28,7 @@ from dataplat.cli.db._common import (
     resolve_params_or_exit,
 )
 from dataplat.core.errors import DataplatError, ValidationError
+from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.long_queries import (
     LongQueryRow,
@@ -46,11 +47,47 @@ from dataplat.services.db.targets import (
 )
 
 console = Console()
+# Notices about a target this command cannot answer for go to stderr, never to
+# stdout: `--json` has to stay a parseable document, and a target list holding
+# one in-process engine would otherwise put an explanation in the middle of it.
+# Same reason `dp status` keeps its own err_console.
+notice_console = Console(stderr=True)
 
+# Only the engines that reach a render: _partition_by_sessions has already
+# refused the ones with no session catalog, so a missing key here is impossible
+# rather than merely unlikely.
 _LABELS: dict[SqlEngine, str] = {
     SqlEngine.postgresql: "Postgres",
     SqlEngine.redshift: "Redshift",
 }
+
+
+def _partition_by_sessions(
+    targets: list[DbTarget], *, command: str
+) -> tuple[list[DbTarget], list[tuple[DbTarget, ValidationError]]]:
+    """Split ``targets`` into those with other sessions to report on, and the rest.
+
+    Both commands in this module are built on one premise — that other sessions
+    exist and a catalog lists them — so the engine either can be asked or cannot,
+    and asking :mod:`dataplat.services.db.capabilities` here means the answer is
+    reached before a connection is opened and phrased in one place.
+
+    The refusal travels with the target rather than being raised, because
+    ``--target all`` is the default: which targets are in scope is the caller's
+    decision, and so is whether "none of them" is an error or a note.
+    """
+    usable: list[DbTarget] = []
+    refused: list[tuple[DbTarget, ValidationError]] = []
+    for tgt in targets:
+        try:
+            require_capability(
+                tgt.engine, Capability.concurrent_sessions, command=command
+            )
+        except ValidationError as exc:
+            refused.append((tgt, exc))
+        else:
+            usable.append(tgt)
+    return usable, refused
 
 
 def _fetch_for_target(
@@ -181,6 +218,25 @@ def long_queries_command(
     except ValidationError as exc:
         fail(exc, console=console)
 
+    # Refused before --history is considered and before anything connects: an
+    # engine with no other sessions cannot answer this question by any route, so
+    # its own reason is more use than "--history needs a Postgres target".
+    usable, refused = _partition_by_sessions(targets, command="dp db long-queries")
+    if refused and not usable:
+        # Nothing in scope can be asked, so the refusal is this command's whole
+        # answer and takes the exit code of the error that carries it (2 — a
+        # combination of arguments that cannot work). One message even for
+        # several such targets: the reason is the engine's, not each target's.
+        fail(refused[0][1], console=console)
+    for tgt, refusal in refused:
+        # A mixed `-t all`: the targets that do have sessions still report, and
+        # the ones that never can say so instead of silently vanishing from a
+        # report someone is reading to conclude nothing is wrong. Not counted as
+        # a failure — nothing failed, the question simply does not apply there.
+        # The literal brackets around the target name need escaping too.
+        notice_console.print(f"[yellow]{esc(f'[{tgt.name}] {refusal}')}[/yellow]")
+    targets = usable
+
     if history:
         targets = [t for t in targets if t.engine == SqlEngine.postgresql]
         if not targets:
@@ -257,10 +313,17 @@ def kill_command(
                 "No target given and none configured. Pass --target or set DP_TARGETS."
             )
         tgt = resolve_target(name)
+        # Before the confirmation prompt and before connecting: there is nothing
+        # to confirm killing on an engine that has no other sessions, and asking
+        # first would be asking about PIDs that cannot exist.
+        require_capability(
+            tgt.engine, Capability.concurrent_sessions, command="dp db kill"
+        )
     except DataplatError as exc:
-        # Two conditions arrive here and they are not the same for a caller: an
-        # unknown/absent target is invalid input (2), a broken DP_TARGETS is a
-        # configuration problem (3). fail() reads the code off the exception.
+        # Three conditions arrive here and they are not the same for a caller: an
+        # unknown/absent target and an engine that cannot be asked are invalid
+        # input (2), a broken DP_TARGETS is a configuration problem (3). fail()
+        # reads the code off the exception.
         fail(exc, console=console)
 
     action = "Cancel" if cancel or tgt.engine == SqlEngine.redshift else "Terminate"

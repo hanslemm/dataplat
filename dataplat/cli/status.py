@@ -31,7 +31,13 @@ from rich.console import Console
 
 from dataplat.cli._options import json_option
 from dataplat.cli._render import esc
-from dataplat.services.db.connection import SqlEngine
+from dataplat.services.db.capabilities import capabilities_for
+from dataplat.services.db.connection import (
+    LIBPQ_ENGINES,
+    DbConnectionParams,
+    DuckDbConnectionParams,
+    SqlEngine,
+)
 from dataplat.services.db.targets import DbTarget, load_targets
 
 console = Console()
@@ -58,16 +64,38 @@ Section = Callable[[], dict[str, Any]]
 
 
 def _probe_target(name: str, target: DbTarget) -> dict[str, Any]:
-    """Connect to one target and count its long-running queries.
+    """Report whether one target is reachable, and what else it can be asked.
 
     Failures are *returned*, not raised, exactly as they were when this ran
     inline: one unreachable warehouse is a red line in the overview, not the end
-    of it. Anything outside the two expected families still propagates, where
+    of it. Anything outside the expected families still propagates, where
     :func:`_guarded` degrades the whole databases section instead of the command.
+
+    Two engine families answer "reachable?" by different means, so the probe
+    dispatches on the resolved parameter *shape* — the same test ``db_session``
+    makes, for the same reason: the shape is what decides which driver can be
+    handed the values. A server is reached over a socket; a DuckDB database is a
+    file this process opens.
     """
+    from dataplat.cli.db._common import ConnCliParams
+    from dataplat.core.errors import DataplatError
+
+    try:
+        params = ConnCliParams(target=name).resolve_any()
+    except DataplatError as exc:
+        # A target that cannot be resolved never reaches a driver, and the
+        # message ("Missing required connection settings", or a HOST on a duckdb
+        # target) is the actionable half of the failure.
+        return {"reachable": False, "error": str(exc)[:160]}
+    if isinstance(params, DuckDbConnectionParams):
+        return _probe_duckdb(params, target.engine)
+    return _probe_libpq(params, target.engine)
+
+
+def _probe_libpq(params: DbConnectionParams, engine: SqlEngine) -> dict[str, Any]:
+    """Connect to a server over libpq and count its long-running queries."""
     import psycopg
 
-    from dataplat.cli.db._common import ConnCliParams
     from dataplat.core.errors import DataplatError
     from dataplat.services.db.long_queries import (
         fetch_long_queries,
@@ -75,10 +103,9 @@ def _probe_target(name: str, target: DbTarget) -> dict[str, Any]:
     )
 
     try:
-        params = ConnCliParams(target=name).resolve()
         kwargs: dict = {**params.as_psycopg_kwargs(), "connect_timeout": 10}
         with psycopg.connect(**kwargs) as conn, conn.cursor() as cursor:
-            if target.engine == SqlEngine.redshift:
+            if engine == SqlEngine.redshift:
                 rows = fetch_long_queries(
                     cursor,
                     min_seconds=_LONG_QUERY_THRESHOLD_S,
@@ -97,38 +124,102 @@ def _probe_target(name: str, target: DbTarget) -> dict[str, Any]:
         return {"reachable": False, "error": str(exc)[:160]}
 
 
+def _probe_duckdb(params: DuckDbConnectionParams, engine: SqlEngine) -> dict[str, Any]:
+    """Open the database file — which *is* the health check — and stop there.
+
+    There is no socket to test and no session catalog to count, so opening the
+    file is the whole probe. It is opened exactly as ``db_session`` would,
+    ``read_only`` included, because "reachable" has to mean "a db command would
+    connect here": probed on duckdb 1.5.5, a database another *process* holds
+    raises IOException whichever mode is asked for, and ``:memory:`` cannot be
+    opened read-only at all — a target configured that way is broken for every
+    command, and a dashboard that opened it some other way would hide that.
+
+    The connection is closed immediately. A health check must not sit on the
+    single-writer lock of a file someone is about to run dbt against.
+    """
+    from dataplat.core.errors import DataplatError
+    from dataplat.services.db.connection import (
+        ensure_duckdb_database_exists,
+        load_duckdb,
+    )
+
+    try:
+        duckdb = load_duckdb()
+        ensure_duckdb_database_exists(params)
+    except DataplatError as exc:
+        # A missing driver package or a path that is not a database file: local
+        # configuration, and the message names the extra or the path.
+        return {"reachable": False, "error": str(exc)[:160]}
+    try:
+        connection = duckdb.connect(database=params.path, read_only=params.read_only)
+    except duckdb.Error as exc:
+        return {"reachable": False, "error": str(exc)[:160]}
+    connection.close()
+    return {
+        "reachable": True,
+        # None, never 0. The count is not "all clear" here, it is unanswerable:
+        # a green "no long-running queries" would be this dashboard's most
+        # misleading line, since it is exactly what a healthy server prints.
+        "long_running": None,
+        "long_running_note": _no_sessions_note(engine),
+    }
+
+
+def _no_sessions_note(engine: SqlEngine) -> str:
+    """Why ``engine`` has no long-running-query count, in the matrix's words.
+
+    Read off :mod:`dataplat.services.db.capabilities` rather than written here,
+    so the dashboard's "not applicable" and ``dp db long-queries``' refusal
+    cannot drift into two different explanations of the same fact. Only reached
+    for an engine that lacks the capability — the count is what a probe returns
+    when it has one.
+    """
+    caps = capabilities_for(engine)
+    return f"not applicable on {caps.label} ({caps.concurrent_sessions.reason})"
+
+
 def _db_section() -> dict[str, Any]:
-    # Imported for its side effect: without the driver there is nothing to probe,
-    # and every target should say so once rather than N times from N threads.
-    # Not `find_spec`, which ruff suggests here — the driver being *importable*
-    # is the question, and a broken install answers that differently.
+    targets = load_targets()
+    if not targets:
+        return {}
+
+    # The driver import is attempted once, here, rather than N times from N
+    # threads. Not `find_spec`, which ruff suggests — the driver being
+    # *importable* is the question, and a broken install answers that
+    # differently. It is no longer fatal to the section either: a DuckDB target
+    # opens a file through its own driver, so psycopg's absence says nothing
+    # about it and must not turn it red.
+    driverless: dict[str, dict[str, Any]] = {}
     try:
         import psycopg  # noqa: F401
     except ImportError:
-        return {
+        driverless = {
             name: {
                 "reachable": False,
                 "error": "psycopg not installed (run `dp config sync`)",
             }
-            for name in load_targets()
+            for name, target in targets.items()
+            if target.engine in LIBPQ_ENGINES
         }
 
-    targets = load_targets()
-    if not targets:
-        return {}
     # Each probe carries a 10s connect timeout and they used to be spent one
     # after another, so three targets behind a dead host cost 30s of a "one-shot
     # overview". Overlapping the waits is the whole fix; the mapping is rebuilt
     # from `targets` afterwards so the key order stays the configured order.
-    with ThreadPoolExecutor(
-        max_workers=min(len(targets), _MAX_TARGET_PROBES),
-        thread_name_prefix="dp-status-db",
-    ) as pool:
-        probes = {
-            name: pool.submit(_probe_target, name, target)
-            for name, target in targets.items()
-        }
-    return {name: probe.result() for name, probe in probes.items()}
+    pending = {n: t for n, t in targets.items() if n not in driverless}
+    probed: dict[str, dict[str, Any]] = {}
+    if pending:
+        with ThreadPoolExecutor(
+            max_workers=min(len(pending), _MAX_TARGET_PROBES),
+            thread_name_prefix="dp-status-db",
+        ) as pool:
+            probes = {
+                name: pool.submit(_probe_target, name, target)
+                for name, target in pending.items()
+            }
+        probed = {name: probe.result() for name, probe in probes.items()}
+    return {name: driverless.get(name) or probed[name] for name in targets}
 
 
 def _airbyte_section() -> dict[str, Any]:
@@ -323,6 +414,17 @@ def _print_db(section: dict[str, Any]) -> None:
             )
             continue
         count = info.get("long_running", 0)
+        if count is None:
+            # Reachable — the ✓ says that here exactly as it does for a server —
+            # but the count is unanswerable rather than zero, so neither claim
+            # the branches below make is available. The reason travels with the
+            # gap: an unexplained "not applicable" reads as a tool defect.
+            note = info.get("long_running_note") or "not applicable"
+            console.print(
+                f"  [green]✓[/green] {esc(name)} "
+                f"[dim]— long-running queries {esc(note)}[/dim]"
+            )
+            continue
         marker = "[yellow]![/yellow]" if count else "[green]✓[/green]"
         detail = (
             f"{count} query(ies) running >{_LONG_QUERY_THRESHOLD_S}s"

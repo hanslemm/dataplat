@@ -8,6 +8,7 @@ before the DROP runs, and Rich would otherwise eat or choke on ``[...]``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -297,3 +298,65 @@ def test_execute_plan_runs_pre_cluster_then_per_db_then_cluster(
     assert all(conn.commits == 1 for _, conn in conns)
     last = conns[-1][1].cursors[0].executed
     assert "DROP ROLE" in last[0].as_string(None)
+
+
+# --- a DuckDB target: there are no roles to drop ---------------------------
+#
+# Against a real DuckDB database, not a stub. `role drop` is irreversible, so
+# the refusal has to land before the plan, before the confirmation gate and
+# before any connection — both drivers are booby-trapped to prove the last one.
+
+
+def _flat(text: str) -> str:
+    """One long line: Rich wraps at the terminal width, assertions are wording."""
+    return " ".join(text.split())
+
+
+def _duckdb_target(monkeypatch, tmp_path: Path) -> Path:
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE TABLE orders(id INTEGER)")
+    connection.close()
+    monkeypatch.setenv("DP_TARGETS", "ddb")
+    monkeypatch.setenv("DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DDB_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def _forbid_connections(monkeypatch) -> None:
+    import duckdb
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused command opened a connection")
+
+    monkeypatch.setattr(psycopg, "connect", _forbidden)
+    monkeypatch.setattr(duckdb, "connect", _forbidden)
+
+
+def test_drop_refuses_a_duckdb_target_before_the_gate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """No ``--yes``: the user must never be asked to approve this at all."""
+    from dataplat.cli.db import app as db_app
+    from dataplat.core.errors import ExitCode
+
+    path = _duckdb_target(monkeypatch, tmp_path)
+    before = path.read_bytes()
+    _forbid_connections(monkeypatch)
+
+    result = runner.invoke(db_app, ["role", "drop", "svc", "-t", "ddb"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "dp db role drop cannot run against DuckDB" in out
+    assert "it has no users or roles at all" in out
+    assert "That is what DuckDB is, not a missing dataplat feature" in out
+    for wording in ("not supported", "not implemented"):
+        assert wording not in out.lower()
+    assert "This is destructive" not in out
+    assert "Plan:" not in out
+    # The database is untouched, byte for byte.
+    assert path.read_bytes() == before
