@@ -11,6 +11,7 @@ from dataplat.cli.cloud.aws import _common
 from dataplat.cli.cloud.aws import redshift as redshift_cli
 from dataplat.cli.cloud.aws.app import app as aws_app
 from dataplat.cli.cloud.aws.redshift import app as redshift_app
+from dataplat.core.trace import verbose
 
 runner = CliRunner()
 
@@ -171,3 +172,73 @@ def test_profile_alias_reaches_boto3_and_the_footer(
     assert seen["profile"] == expected
     # The footer must name the profile boto3 got, not the shorthand typed in.
     assert f"Profile: {expected}" in result.stdout
+
+
+# ── --verbose ────────────────────────────────────────────────────────────────
+# This command makes three different kinds of call and the middle one — the
+# per-metric dimension discovery — is why a row goes missing from the table
+# without any error at all. Tracing is the only way to see that happen.
+
+
+def test_verbose_traces_discovery_and_the_batched_fetch(monkeypatch, wide) -> None:
+    for var in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        monkeypatch.delenv(var, raising=False)
+    workgroups = [{"workgroupName": "wg-1", "namespaceName": "ns-1"}]
+    _patch_session(
+        monkeypatch,
+        _Session(**{"redshift-serverless": _Serverless(workgroups)}, cloudwatch=_Cw()),
+    )
+
+    with verbose():
+        result = runner.invoke(
+            aws_app,
+            ["redshift", "metrics", "-r", "eu-central-1", "--hours", "2"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    err = result.stderr
+    assert (
+        "[dp:aws] redshift-serverless.list_workgroups | profile=default | "
+        "region=eu-central-1 | workgroup=(all)" in err
+    )
+    # Seven workgroup metrics plus two namespace metrics, each discovered
+    # separately, then one batched call for all nine.
+    assert err.count("cloudwatch.list_metrics") == 9
+    assert "| metric=ComputeCapacity | workgroup=wg-1" in err
+    assert "| metric=DataStorage | namespace=ns-1" in err
+    assert (
+        "[dp:aws] cloudwatch.get_metric_data | profile=default | "
+        "region=eu-central-1 | series=9 | window=2.0h | period=300s" in err
+    )
+
+
+def test_verbose_keeps_the_json_payload_clean(monkeypatch, wide) -> None:
+    _patch_session(
+        monkeypatch,
+        _Session(
+            **{"redshift-serverless": _Serverless([{"workgroupName": "wg"}])},
+            cloudwatch=_Cw(),
+        ),
+    )
+
+    with verbose():
+        result = runner.invoke(aws_app, ["redshift", "metrics", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)[0]["scope"] == "workgroup:wg"
+    assert "[dp:aws]" in result.stderr
+
+
+def test_nothing_is_traced_without_verbose(monkeypatch, wide) -> None:
+    _patch_session(
+        monkeypatch,
+        _Session(
+            **{"redshift-serverless": _Serverless([{"workgroupName": "wg"}])},
+            cloudwatch=_Cw(),
+        ),
+    )
+
+    result = runner.invoke(aws_app, ["redshift", "metrics"])
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stderr == ""

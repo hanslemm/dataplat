@@ -18,6 +18,7 @@ from dataplat.cli.cloud.aws._common import (
     make_table,
     profile_option,
     region_option,
+    trace_aws,
 )
 
 app = typer.Typer(
@@ -223,6 +224,13 @@ def metrics(
     start = now - timedelta(hours=hours)
 
     try:
+        trace_aws(
+            "redshift-serverless",
+            "list_workgroups",
+            profile=profile,
+            region=region,
+            workgroup=workgroup or "(all)",
+        )
         with console.status(
             "[bold blue]Fetching Redshift Serverless metrics…[/bold blue]"
         ):
@@ -247,6 +255,17 @@ def metrics(
                 if not wg_name:
                     continue
                 for metric_name in workgroup_metrics:
+                    # Dimension discovery is a list_metrics call per metric, and
+                    # a metric that silently has no matching dimension set is
+                    # the usual reason a row is missing from the table.
+                    trace_aws(
+                        "cloudwatch",
+                        "list_metrics",
+                        profile=profile,
+                        region=region,
+                        metric=metric_name,
+                        workgroup=wg_name,
+                    )
                     dims = _discover_metric_dims(
                         cw, metric_name, [{"Name": "Workgroup", "Value": wg_name}]
                     )
@@ -254,6 +273,14 @@ def metrics(
                         scoped.append((f"workgroup:{wg_name}", metric_name, dims))
                 if ns_name:
                     for metric_name in namespace_metrics:
+                        trace_aws(
+                            "cloudwatch",
+                            "list_metrics",
+                            profile=profile,
+                            region=region,
+                            metric=metric_name,
+                            namespace=ns_name,
+                        )
                         dims = _discover_metric_dims(
                             cw,
                             metric_name,
@@ -262,6 +289,15 @@ def metrics(
                         if dims:
                             scoped.append((f"namespace:{ns_name}", metric_name, dims))
 
+            trace_aws(
+                "cloudwatch",
+                "get_metric_data",
+                profile=profile,
+                region=region,
+                series=len(scoped),
+                window=f"{hours}h",
+                period=f"{period}s",
+            )
             summaries = _batch_metric_summaries(cw, scoped, start, now, period)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
