@@ -2,6 +2,18 @@
 
 Each section degrades independently: a failing service renders as
 "unavailable" with the reason instead of killing the whole command.
+
+Every probe here is blocking I/O — a TCP connect, an HTTP round trip, a
+``docker ps`` — so the sections run in a thread pool rather than one after
+another. Two properties of the serial version survive that unchanged, because
+both are contracts rather than accidents:
+
+- **Order.** The JSON payload's keys and the human sections come out in the
+  order declared in :func:`status`, never in the order the probes answered.
+- **Independence.** :func:`_guarded` turns an exception escaping a section into
+  that section's error line, so one broken system still costs one line.
+
+The AWS section is the exception and stays serial; see :func:`status`.
 """
 
 from __future__ import annotations
@@ -9,6 +21,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -18,7 +32,7 @@ from rich.console import Console
 from dataplat.cli._options import json_option
 from dataplat.cli._render import esc
 from dataplat.services.db.connection import SqlEngine
-from dataplat.services.db.targets import load_targets
+from dataplat.services.db.targets import DbTarget, load_targets
 
 console = Console()
 # Spinners, notices and warnings go here, never to stdout: `dp status --json`
@@ -32,10 +46,64 @@ app = typer.Typer(
 
 _LONG_QUERY_THRESHOLD_S = 60
 
+# One probe per target, capped. The work is waiting on a socket, so the useful
+# width is the number of targets rather than anything CPU-derived; the cap is
+# only there so a 200-target config cannot turn a health check into a thread
+# storm. Every realistic target list fits in one wave.
+_MAX_TARGET_PROBES = 16
+
+# What a section does: no arguments, one JSON-shaped mapping out, never raises
+# once wrapped by _guarded.
+Section = Callable[[], dict[str, Any]]
+
+
+def _probe_target(name: str, target: DbTarget) -> dict[str, Any]:
+    """Connect to one target and count its long-running queries.
+
+    Failures are *returned*, not raised, exactly as they were when this ran
+    inline: one unreachable warehouse is a red line in the overview, not the end
+    of it. Anything outside the two expected families still propagates, where
+    :func:`_guarded` degrades the whole databases section instead of the command.
+    """
+    import psycopg
+
+    from dataplat.cli.db._common import ConnCliParams
+    from dataplat.core.errors import DataplatError
+    from dataplat.services.db.long_queries import (
+        fetch_long_queries,
+        fetch_long_queries_postgres,
+    )
+
+    try:
+        params = ConnCliParams(target=name).resolve()
+        kwargs: dict = {**params.as_psycopg_kwargs(), "connect_timeout": 10}
+        with psycopg.connect(**kwargs) as conn, conn.cursor() as cursor:
+            if target.engine == SqlEngine.redshift:
+                rows = fetch_long_queries(
+                    cursor,
+                    min_seconds=_LONG_QUERY_THRESHOLD_S,
+                    limit=50,
+                    cutoff=datetime.now(UTC),
+                    running_only=True,
+                )
+            else:
+                rows = fetch_long_queries_postgres(
+                    cursor,
+                    min_seconds=_LONG_QUERY_THRESHOLD_S,
+                    limit=50,
+                )
+        return {"reachable": True, "long_running": len(rows)}
+    except (DataplatError, psycopg.Error) as exc:
+        return {"reachable": False, "error": str(exc)[:160]}
+
 
 def _db_section() -> dict[str, Any]:
+    # Imported for its side effect: without the driver there is nothing to probe,
+    # and every target should say so once rather than N times from N threads.
+    # Not `find_spec`, which ruff suggests here — the driver being *importable*
+    # is the question, and a broken install answers that differently.
     try:
-        import psycopg
+        import psycopg  # noqa: F401
     except ImportError:
         return {
             name: {
@@ -45,37 +113,22 @@ def _db_section() -> dict[str, Any]:
             for name in load_targets()
         }
 
-    from dataplat.cli.db._common import ConnCliParams
-    from dataplat.core.errors import DataplatError
-    from dataplat.services.db.long_queries import (
-        fetch_long_queries,
-        fetch_long_queries_postgres,
-    )
-
-    out: dict[str, Any] = {}
-    for name, target in load_targets().items():
-        try:
-            params = ConnCliParams(target=name).resolve()
-            kwargs: dict = {**params.as_psycopg_kwargs(), "connect_timeout": 10}
-            with psycopg.connect(**kwargs) as conn, conn.cursor() as cursor:
-                if target.engine == SqlEngine.redshift:
-                    rows = fetch_long_queries(
-                        cursor,
-                        min_seconds=_LONG_QUERY_THRESHOLD_S,
-                        limit=50,
-                        cutoff=datetime.now(UTC),
-                        running_only=True,
-                    )
-                else:
-                    rows = fetch_long_queries_postgres(
-                        cursor,
-                        min_seconds=_LONG_QUERY_THRESHOLD_S,
-                        limit=50,
-                    )
-            out[name] = {"reachable": True, "long_running": len(rows)}
-        except (DataplatError, psycopg.Error) as exc:
-            out[name] = {"reachable": False, "error": str(exc)[:160]}
-    return out
+    targets = load_targets()
+    if not targets:
+        return {}
+    # Each probe carries a 10s connect timeout and they used to be spent one
+    # after another, so three targets behind a dead host cost 30s of a "one-shot
+    # overview". Overlapping the waits is the whole fix; the mapping is rebuilt
+    # from `targets` afterwards so the key order stays the configured order.
+    with ThreadPoolExecutor(
+        max_workers=min(len(targets), _MAX_TARGET_PROBES),
+        thread_name_prefix="dp-status-db",
+    ) as pool:
+        probes = {
+            name: pool.submit(_probe_target, name, target)
+            for name, target in targets.items()
+        }
+    return {name: probe.result() for name, probe in probes.items()}
 
 
 def _airbyte_section() -> dict[str, Any]:
@@ -212,8 +265,53 @@ def _aws_section() -> dict[str, Any]:
     return {"available": True, "instance": instance, "metrics": metrics}
 
 
+def _guarded(section: Section) -> dict[str, Any]:
+    """Run one section; report anything that escapes it as that section's error.
+
+    Sections are written to return their failures, but only for the families
+    they anticipated — a malformed ``DP_TARGETS`` raises ``ConfigError`` out of
+    ``load_targets()`` and used to end the entire command in a traceback, before
+    a single section had rendered and with ``--json`` producing no document at
+    all. Catching broadly is the point: "this system is unavailable, here is
+    why" is a strictly better answer than a stack trace for every system.
+
+    The type name is kept in the message because an unexpected exception's
+    ``str`` is routinely empty or a bare key, and ``✗ unavailable — ''`` tells
+    the reader nothing.
+    """
+    try:
+        return section()
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
+def _run_concurrently(sections: dict[str, Section]) -> dict[str, Any]:
+    """Probe every section at once; return them in the order they were declared.
+
+    Iterating ``sections`` rather than ``as_completed`` is deliberate and is what
+    keeps the payload stable: whichever probe answers first, the caller sees the
+    declared order, so ``--json`` consumers and the human layout are unaffected
+    by how fast anything was.
+    """
+    with ThreadPoolExecutor(
+        max_workers=len(sections), thread_name_prefix="dp-status"
+    ) as pool:
+        running = {name: pool.submit(_guarded, fn) for name, fn in sections.items()}
+    # The pool has joined here, so every result is already in hand; _guarded
+    # means none of these can raise.
+    return {name: future.result() for name, future in running.items()}
+
+
 def _print_db(section: dict[str, Any]) -> None:
     console.print("[bold cyan]Databases[/bold cyan]")
+    reason = section.get("error")
+    if isinstance(reason, str):
+        # A whole-section failure rather than a per-target one: the probe raised
+        # before it could enumerate targets. Every value in a healthy payload is
+        # a mapping, so a string here is unambiguous even for a target someone
+        # actually named "error".
+        console.print(f"  [red]✗ unavailable[/red] [dim]— {esc(reason)}[/dim]")
+        return
     if not section:
         console.print("  [dim]no targets configured (set DP_TARGETS)[/dim]")
     # Target names come from DP_TARGETS and the errors from psycopg: both are
@@ -305,17 +403,30 @@ def status(
     as_json: bool = json_option("Emit JSON instead of text."),
 ) -> None:
     """Health overview: databases, Airbyte jobs, runners, and RDS."""
-    payload: dict[str, Any] = {}
+    # Built here, not at module scope, so each name resolves at call time: the
+    # tests replace these functions on the module, and a dict captured at import
+    # would hold the originals. Insertion order is the payload's key order and
+    # the order the sections print in — both are pinned by tests.
+    concurrent: dict[str, Section] = {
+        "databases": _db_section,
+        "airbyte": _airbyte_section,
+        "runners": _runners_section,
+    }
 
-    with err_console.status("[bold blue]Checking databases…[/bold blue]"):
-        payload["databases"] = _db_section()
-    with err_console.status("[bold blue]Checking Airbyte…[/bold blue]"):
-        payload["airbyte"] = _airbyte_section()
-    payload["runners"] = _runners_section()
+    with err_console.status(
+        "[bold blue]Checking databases, Airbyte, runners…[/bold blue]"
+    ):
+        payload: dict[str, Any] = _run_concurrently(concurrent)
+
     if aws:
-        # No spinner here: the section may hand the terminal to an
-        # interactive `aws sso login` (browser + code prompt).
-        payload["aws"] = _aws_section()
+        # AWS stays serial, last, and outside the spinner. The section may hand
+        # the terminal to an interactive `aws sso login` (browser + device code),
+        # which cannot share stdin with a Live spinner or with another section
+        # that might prompt; running it only after the pool has joined is what
+        # guarantees it has the terminal to itself. There is no way to find out
+        # in advance whether the token is expired without doing the work, so
+        # "start it concurrently and serialise only the prompt" is not available.
+        payload["aws"] = _guarded(_aws_section)
 
     if as_json:
         typer.echo(json.dumps(payload, indent=2, default=str))

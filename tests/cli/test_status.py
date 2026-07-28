@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -257,6 +258,224 @@ def test_sso_notice_is_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "sso[/x]" in capture.get()
 
 
+# concurrency, ordering and independence
+
+# Long enough that a loaded machine still gets three threads to the barrier,
+# short enough that a serial implementation fails in seconds instead of hanging.
+_GATE_TIMEOUT_S = 10
+
+
+def test_sections_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A barrier, not a stopwatch: three sections must be in flight at once.
+
+    Run serially, every ``wait()`` here times out and the sections come back as
+    errors, so this fails on a serial implementation instead of merely being slow.
+    """
+    _disable_envrc(monkeypatch)
+    gate = threading.Barrier(3, timeout=_GATE_TIMEOUT_S)
+
+    def gated(payload: dict[str, Any]) -> Callable[[], dict[str, Any]]:
+        def probe() -> dict[str, Any]:
+            gate.wait()
+            return payload
+
+        return probe
+
+    monkeypatch.setattr(
+        status_cli,
+        "_db_section",
+        gated({"demo": {"reachable": True, "long_running": 0}}),
+    )
+    monkeypatch.setattr(
+        status_cli,
+        "_airbyte_section",
+        gated({"available": True, "jobs_last_24h": 0, "failed": [], "running": 0}),
+    )
+    monkeypatch.setattr(
+        status_cli, "_runners_section", gated({"available": True, "runners": []})
+    )
+
+    result = runner.invoke(main_module.app, ["status", "--no-aws", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["databases"]["demo"]["reachable"] is True
+    assert payload["airbyte"]["available"] is True
+    assert payload["runners"]["available"] is True
+
+
+def test_aws_section_stays_serial_after_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`aws sso login` can take the terminal, so AWS must not overlap anything.
+
+    It may prompt for a device code and open a browser; sharing stdin with a Live
+    spinner or with another probe that prompts is the failure this pins.
+    """
+    _disable_envrc(monkeypatch)
+    gate = threading.Barrier(3, timeout=_GATE_TIMEOUT_S)
+    lock = threading.Lock()
+    events: list[str] = []
+
+    def traced(
+        name: str, payload: dict[str, Any], *, concurrent: bool
+    ) -> Callable[[], dict[str, Any]]:
+        def probe() -> dict[str, Any]:
+            with lock:
+                events.append(f"{name}:start")
+            if concurrent:
+                gate.wait()
+            with lock:
+                events.append(f"{name}:end")
+            return payload
+
+        return probe
+
+    monkeypatch.setattr(
+        status_cli,
+        "_db_section",
+        traced("db", {"demo": {"reachable": True, "long_running": 0}}, concurrent=True),
+    )
+    monkeypatch.setattr(
+        status_cli,
+        "_airbyte_section",
+        traced(
+            "airbyte",
+            {"available": True, "jobs_last_24h": 0, "failed": [], "running": 0},
+            concurrent=True,
+        ),
+    )
+    monkeypatch.setattr(
+        status_cli,
+        "_runners_section",
+        traced("runners", {"available": True, "runners": []}, concurrent=True),
+    )
+    monkeypatch.setattr(
+        status_cli,
+        "_aws_section",
+        traced(
+            "aws",
+            {"available": True, "instance": "prod-db-1", "metrics": {}},
+            concurrent=False,
+        ),
+    )
+
+    result = runner.invoke(main_module.app, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    # The three concurrent probes all start before any of them finishes...
+    assert set(events[:3]) == {"db:start", "airbyte:start", "runners:start"}
+    # ...and AWS only begins once every one of them has returned.
+    assert events.index("aws:start") == 6
+    assert events[-1] == "aws:end"
+
+
+def test_payload_order_ignores_which_section_finished_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Key order and section order are contracts, not a record of the race."""
+    _disable_envrc(monkeypatch)
+    runners_done = threading.Event()
+
+    def slow_db() -> dict[str, Any]:
+        # Cannot return until the *last* section already has.
+        assert runners_done.wait(_GATE_TIMEOUT_S)
+        return {"demo": {"reachable": True, "long_running": 0}}
+
+    def fast_runners() -> dict[str, Any]:
+        runners_done.set()
+        return {"available": True, "runners": []}
+
+    monkeypatch.setattr(status_cli, "_db_section", slow_db)
+    monkeypatch.setattr(
+        status_cli,
+        "_airbyte_section",
+        lambda: {"available": True, "jobs_last_24h": 0, "failed": [], "running": 0},
+    )
+    monkeypatch.setattr(status_cli, "_runners_section", fast_runners)
+
+    as_json = runner.invoke(main_module.app, ["status", "--no-aws", "--json"])
+    runners_done.clear()
+    human = runner.invoke(main_module.app, ["status", "--no-aws"])
+
+    assert as_json.exit_code == 0, as_json.output
+    assert list(json.loads(as_json.stdout)) == ["databases", "airbyte", "runners"]
+    assert human.exit_code == 0, human.output
+    positions = [human.output.index(h) for h in ("Databases", "Airbyte", "GitHub")]
+    assert positions == sorted(positions)
+
+
+def test_raising_section_degrades_instead_of_crashing_the_overview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed DP_TARGETS used to end the run in a traceback, before any
+    section rendered — and with --json emitting no document at all."""
+    from dataplat.core.errors import ConfigError
+
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch)
+
+    def boom() -> dict[str, Any]:
+        raise ConfigError("'all' is a reserved target name.")
+
+    monkeypatch.setattr(status_cli, "_db_section", boom)
+
+    result = runner.invoke(main_module.app, ["status", "--json"])
+
+    assert result.exception is None, result.exception
+    # status reports; it does not exit non-zero for a section it could not reach.
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["databases"] == {
+        "available": False,
+        # The class name stays: an unexpected exception's str is often empty.
+        "error": "ConfigError: 'all' is a reserved target name.",
+    }
+    # Every other section is untouched.
+    assert payload["airbyte"]["jobs_last_24h"] == 12
+    assert payload["runners"]["available"] is True
+    assert payload["aws"]["available"] is True
+
+
+def test_section_level_database_error_renders_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new whole-section branch of _print_db renders driver text verbatim."""
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch)
+
+    def boom() -> dict[str, Any]:
+        raise RuntimeError(HOSTILE)
+
+    monkeypatch.setattr(status_cli, "_db_section", boom)
+
+    result = runner.invoke(main_module.app, ["status", "--no-aws"])
+
+    assert result.exception is None, result.exception
+    assert result.exit_code == 0, result.output
+    assert f"RuntimeError: {HOSTILE}" in result.output
+
+
+def test_raising_aws_section_degrades_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AWS runs outside the pool, so it needs the same guard, not a bare call."""
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch, aws=False)
+
+    def boom() -> dict[str, Any]:
+        raise RuntimeError("botocore blew up in a way nobody catalogued")
+
+    monkeypatch.setattr(status_cli, "_aws_section", boom)
+
+    result = runner.invoke(main_module.app, ["status", "--json"])
+
+    assert result.exception is None, result.exception
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["aws"] == {
+        "available": False,
+        "error": "RuntimeError: botocore blew up in a way nobody catalogued",
+    }
+
+
 # markup safety
 
 
@@ -471,6 +690,41 @@ def test_db_section_counts_long_running_queries(
     assert section == {"demo": {"reachable": True, "long_running": 2}}
     # A hung target must not hang the dashboard.
     assert seen[0]["connect_timeout"] == 10
+
+
+def test_db_section_probes_targets_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each target carries its own 10s connect timeout; serially those add up.
+
+    The barrier makes it structural rather than timed: a connect that cannot
+    return until the other target's connect has also started can only succeed if
+    the probes overlap.
+    """
+    import psycopg
+
+    from dataplat.services.db import long_queries
+
+    for prefix in ("DEMO_PG", "DEMO_RS"):
+        monkeypatch.setenv(f"{prefix}_HOST", "db.example.invalid")
+        monkeypatch.setenv(f"{prefix}_USER", "svc")
+        monkeypatch.setenv(f"{prefix}_DATABASE", "analytics")
+    gate = threading.Barrier(2, timeout=_GATE_TIMEOUT_S)
+
+    def fake_connect(**kwargs: Any) -> _FakeConn:
+        gate.wait()
+        return _FakeConn()
+
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+    monkeypatch.setattr(long_queries, "fetch_long_queries_postgres", lambda *a, **k: [])
+    monkeypatch.setattr(long_queries, "fetch_long_queries", lambda *a, **k: [])
+
+    section = status_cli._db_section()
+
+    # Both reachable proves the barrier opened; the key order is DP_TARGETS order,
+    # not the order the connects happened to finish in.
+    assert list(section) == ["demo_pg", "demo_rs"]
+    assert all(info["reachable"] for info in section.values())
 
 
 def test_db_section_uses_redshift_query_for_redshift_targets(
