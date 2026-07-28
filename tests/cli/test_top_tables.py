@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import duckdb
 from typer.testing import CliRunner
 
 from dataplat.cli.db import app as db_app
 from dataplat.cli.db.top_tables import _split_prefixes
-from dataplat.core.errors import ExitCode
+from dataplat.core.errors import ConfigError, ExitCode
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.top_tables import TopTableRow, TopTablesResult
 
@@ -246,3 +248,225 @@ def test_top_tables_drop_with_yes_executes() -> None:
 
     assert result.exit_code == 0, result.output
     assert executed.call_count == 2  # one per target
+
+
+# =========================================================================
+# DuckDB. Nothing is patched below: the command opens a real DuckDB file,
+# because that is the only way to find out that the numbers it prints are not
+# the numbers it printed for a server.
+# =========================================================================
+
+
+def _duckdb_target(monkeypatch, path: str | Path, *, read_only: bool = False) -> None:
+    """Declare a third target, `demo_ddb`, alongside the suite's two."""
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DEMO_DDB_PATH", str(path))
+    if read_only:
+        monkeypatch.setenv("DEMO_DDB_READ_ONLY", "1")
+
+
+def _make_warehouse(path: Path) -> Path:
+    conn = duckdb.connect(database=str(path))
+    conn.execute("CREATE SCHEMA dev_alice")
+    conn.execute("CREATE SCHEMA dev_bob")
+    conn.execute("CREATE SCHEMA prod")
+    conn.execute("CREATE TABLE dev_alice.big_fact(id BIGINT)")
+    conn.execute("INSERT INTO dev_alice.big_fact SELECT i FROM range(3000) t(i)")
+    conn.execute("CREATE TABLE dev_bob.tmp(a INTEGER)")
+    conn.execute("CREATE TABLE prod.keepme(a INTEGER)")
+    conn.execute("CHECKPOINT")
+    conn.close()
+    return path
+
+
+def test_top_tables_duckdb_reports_rows_and_no_size(monkeypatch, tmp_path) -> None:
+    """The DuckDB section shows what DuckDB knows, and says what it does not."""
+    _duckdb_target(monkeypatch, _make_warehouse(tmp_path / "w.duckdb"))
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb"])
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "DuckDB" in out
+    assert "ranked by estimated rows" in out
+    assert "Rows (est.)" in out
+    assert "3,000" in out
+    # The two byte-valued columns are absent rather than full of dashes, and the
+    # footer names the file total instead of implying a share of it.
+    assert "% of disk" not in out
+    assert "Database file:" in out
+    assert "sizes unknown" in out
+    # And why, where the reader is already looking.
+    assert "estimated_size" in out
+    assert "pragma_database_size" in out
+    assert "not comparable" in out
+    # prod does not match dev_.
+    assert "keepme" not in out
+
+
+def test_top_tables_duckdb_json_marks_the_unknown_sizes(monkeypatch, tmp_path) -> None:
+    _duckdb_target(monkeypatch, _make_warehouse(tmp_path / "w.duckdb"))
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)["databases"]["demo_ddb"]
+    assert payload["engine"] == "duckdb"
+    assert payload["ranked_by"] == "row_estimate"
+    assert "estimated" in payload["size_basis"]
+    assert payload["matched_bytes"] is None
+    assert payload["matched_count"] == 2
+    assert payload["disk_bytes"] > 0
+    # null, not 0: a consumer must be able to tell "unknown" from "empty".
+    assert [row["size_bytes"] for row in payload["rows"]] == [None, None]
+    assert payload["rows"][0]["row_estimate"] == 3000
+
+
+def test_top_tables_postgres_json_still_carries_its_own_basis() -> None:
+    """The new keys are per-engine facts, so the libpq engines get theirs too."""
+    runner = CliRunner()
+    with patch("dataplat.cli.db.top_tables._collect", side_effect=_fake_collect):
+        result = runner.invoke(db_app, ["top-tables", "--json"])
+
+    assert result.exit_code == 0, result.output
+    databases = json.loads(result.stdout)["databases"]
+    assert databases["demo_pg"]["ranked_by"] == "size_bytes"
+    assert "pg_total_relation_size" in databases["demo_pg"]["size_basis"]
+    assert "svv_table_info" in databases["demo_rs"]["size_basis"]
+
+
+def test_top_tables_duckdb_drop_sql_is_honest_about_dependents(
+    monkeypatch, tmp_path
+) -> None:
+    """The script must be valid DuckDB *and* not promise a guard DuckDB lacks."""
+    _duckdb_target(monkeypatch, _make_warehouse(tmp_path / "w.duckdb"))
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb", "--drop-sql"])
+
+    assert result.exit_code == 0, result.output
+    out = result.stdout
+    assert "-- DuckDB" in out
+    assert 'DROP TABLE IF EXISTS "dev_alice"."big_fact";' in out
+    assert "DROP MATERIALIZED VIEW" not in out  # DuckDB has none, and rejects it
+    assert "~3,000 rows" in out
+    assert "BEGIN;" in out and "COMMIT;" in out
+    # The libpq script promises dependent views will block the drop. On DuckDB
+    # they do not (probed on 1.5.5), so printing that line here would tell a
+    # reviewer the script is safer than it is.
+    assert "dependent views/FKs will block" not in out
+    assert "does NOT block a drop on a dependent view" in out
+    assert "of disk" not in out
+
+
+def test_top_tables_duckdb_drop_executes_against_the_file(
+    monkeypatch, tmp_path
+) -> None:
+    database = _make_warehouse(tmp_path / "w.duckdb")
+    _duckdb_target(monkeypatch, database)
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb", "--drop", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "dropped dev_alice.big_fact" in result.output
+    conn = duckdb.connect(database=str(database))
+    remaining = conn.execute(
+        "SELECT table_name FROM duckdb_tables() "
+        "WHERE database_name = current_database() ORDER BY 1"
+    ).fetchall()
+    conn.close()
+    assert remaining == [("keepme",)]
+
+
+def test_top_tables_duckdb_read_only_target_refuses_the_drop(
+    monkeypatch, tmp_path
+) -> None:
+    """<PREFIX>_READ_ONLY is a real guard, and the failure is per target."""
+    database = _make_warehouse(tmp_path / "w.duckdb")
+    _duckdb_target(monkeypatch, database, read_only=True)
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb", "--drop", "--yes"])
+
+    assert result.exit_code == 1
+    assert "read-only" in result.output
+    conn = duckdb.connect(database=str(database), read_only=True)
+    count = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database()"
+    ).fetchone()
+    conn.close()
+    assert count == (3,)  # DuckDB rolls the transaction back: nothing dropped
+
+
+def test_top_tables_duckdb_missing_file_is_one_targets_error(
+    monkeypatch, tmp_path
+) -> None:
+    """Regression: a DuckDB target used to abort the run with a traceback.
+
+    ``_collect`` resolved through the libpq-only resolver, which raises
+    ValidationError for a DuckDB target — a type this command's loop does not
+    catch — so a single DuckDB entry in DP_TARGETS took down `-t all` for every
+    other database too. Now it is a line like any other unreachable target.
+    """
+    _duckdb_target(monkeypatch, tmp_path / "not-there.duckdb")
+    runner = CliRunner()
+
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb"])
+
+    assert result.exit_code == 1
+    assert "DuckDB" in result.output
+    assert "not found" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_top_tables_all_targets_survives_a_broken_duckdb(monkeypatch, tmp_path) -> None:
+    """One bad DuckDB target must not stop the libpq ones from reporting.
+
+    The DuckDB half runs for real (its file is missing, which is the failure
+    under test); only the two servers are faked, since there is none to reach.
+    """
+    from dataplat.cli.db import top_tables as top_tables_mod
+
+    real_collect = top_tables_mod._collect
+
+    def collect(target, prefixes: list[str], limit: int):
+        if target.engine is SqlEngine.duckdb:
+            return real_collect(target, prefixes, limit)
+        return _fake_collect(target, prefixes, limit)
+
+    _duckdb_target(monkeypatch, tmp_path / "not-there.duckdb")
+    runner = CliRunner()
+
+    with patch("dataplat.cli.db.top_tables._collect", side_effect=collect):
+        result = runner.invoke(db_app, ["top-tables", "-t", "all"])
+
+    assert result.exit_code == 1
+    assert "big_fact" in result.output  # the Postgres section still rendered
+    assert "not found" in result.output
+
+
+def test_top_tables_duckdb_without_the_driver_is_a_config_error(
+    monkeypatch, tmp_path
+) -> None:
+    """duckdb is an optional extra, so a target may name an engine we cannot open.
+
+    That is local configuration, not a database failure, and it must land as one
+    target's error line — the same shape as an unreachable server — rather than
+    taking the run down.
+    """
+    _duckdb_target(monkeypatch, _make_warehouse(tmp_path / "w.duckdb"))
+    runner = CliRunner()
+
+    def missing() -> None:
+        raise ConfigError("A duckdb target needs the duckdb package")
+
+    monkeypatch.setattr("dataplat.cli.db.top_tables.load_duckdb", missing)
+    result = runner.invoke(db_app, ["top-tables", "-t", "demo_ddb"])
+
+    assert result.exit_code == 1
+    assert "needs the duckdb package" in result.output
+    assert "Traceback" not in result.output

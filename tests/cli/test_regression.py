@@ -42,7 +42,10 @@ class _FakeConnection:
 
 
 def _patch_connection(monkeypatch, cursor: _FakeCursor) -> None:
-    monkeypatch.setattr(db_cli, "resolve_params_or_exit", lambda params: object())
+    # resolve_any_params_or_exit, not resolve_params_or_exit: adding DuckDB gave
+    # the resolver a union return type (libpq params or a DuckDB path), and
+    # `dp db query` works with either, so it calls the widening variant.
+    monkeypatch.setattr(db_cli, "resolve_any_params_or_exit", lambda params: object())
 
     @contextmanager
     def fake_session(params):

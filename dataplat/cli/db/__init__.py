@@ -32,7 +32,7 @@ from dataplat.cli.db._common import (
     TargetOption,
     UserOption,
     db_session,
-    resolve_params_or_exit,
+    resolve_any_params_or_exit,
 )
 from dataplat.cli.db.dbt_orphans import app as dbt_orphans_app
 from dataplat.cli.db.describe import app as describe_app
@@ -76,7 +76,47 @@ class OutputFormat(str, Enum):
 
 _SQL_COMMENT_RE = re.compile(r"(--[^\n]*)|(/\*.*?\*/)", re.DOTALL)
 _WRITE_KEYWORD_RE = re.compile(r"\b(insert|update|delete|merge)\b", re.IGNORECASE)
-_READ_FIRST_KEYWORDS = {"select", "show", "explain", "table", "values"}
+
+# Statement heads that cannot modify anything on any supported engine.
+#
+# The last four are DuckDB's own query forms, probed on 1.5.5: DESCRIBE and
+# SUMMARIZE return one row per column, PIVOT/UNPIVOT are reshaping queries.
+# Listing them costs the libpq engines nothing — none is valid PostgreSQL or
+# Redshift SQL, so those servers reject the statement as a syntax error exactly
+# as they did before, which is a wrong statement failing rather than a write
+# slipping through.
+_READ_FIRST_KEYWORDS = {
+    "select",
+    "show",
+    "explain",
+    "table",
+    "values",
+    "describe",
+    "summarize",
+    "pivot",
+    "unpivot",
+}
+
+# Heads whose statement is a read *unless* it carries a data-modifying keyword.
+#
+# ``with``: a CTE can hide an INSERT/UPDATE/DELETE with RETURNING.
+# ``from``: DuckDB's FROM-first syntax, where ``FROM t`` means ``SELECT * FROM
+# t`` — the form a DuckDB user types by hand, and the reason a read used to be
+# stopped by the write gate. It is scanned rather than trusted outright even
+# though no FROM-first write form was found (``FROM t DELETE WHERE …`` parses
+# DELETE as a table alias and deletes nothing, probed on 1.5.5): the cost of
+# scanning is a confirmation prompt on a query whose *literal* mentions
+# "delete", and the cost of not scanning would be an unprompted write if a
+# later DuckDB release grows one.
+_SCANNED_FIRST_KEYWORDS = {"with", "from"}
+
+# Heads the LIMIT/OFFSET wrapper may be wrapped around. Narrower than the read
+# set on purpose: the wrapper is ``SELECT * FROM (<statement>) AS dp_query``, and
+# only a statement that is legal as a subquery may go inside one — ``EXPLAIN``
+# and ``SHOW`` are not. All three were probed inside the wrapper on duckdb 1.5.5;
+# ``from`` matters most there, because an unpaginated ``FROM huge_table`` is
+# exactly the runaway result set the wrapper exists to prevent.
+_PAGINATED_FIRST_KEYWORDS = {"select", "with", "from"}
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -86,8 +126,18 @@ def _strip_sql_comments(sql: str) -> str:
 def _classify_sql(sql: str) -> str:
     """Classify a statement as ``read`` or ``write``.
 
-    Conservative: a WITH query containing any data-modifying keyword is
-    treated as a write even if the keyword only appears in a literal.
+    Conservative in both directions: a WITH or FROM query containing any
+    data-modifying keyword is treated as a write even if the keyword only
+    appears in a literal, and any head not listed above is a write.
+
+    That default is what covers the statements DuckDB has and PostgreSQL does
+    not, and it is the right answer for every one of them: ``COPY`` writes a
+    file or a table, ``EXPORT DATABASE`` writes a directory, ``IMPORT DATABASE``
+    replays it, ``ATTACH`` creates the database file when it is missing (probed
+    on 1.5.5), and ``INSTALL``/``LOAD`` fetch and execute an extension binary —
+    not a data change, but the last thing that should happen without the user
+    seeing it. So none of them needs a branch here; what they need is for
+    nobody to add them to the read list.
     """
     cleaned = _strip_sql_comments(sql).strip()
     if not cleaned:
@@ -95,7 +145,7 @@ def _classify_sql(sql: str) -> str:
     first = cleaned.split(None, 1)[0].lower().rstrip(";")
     if first in _READ_FIRST_KEYWORDS:
         return "read"
-    if first == "with":
+    if first in _SCANNED_FIRST_KEYWORDS:
         return "write" if _WRITE_KEYWORD_RE.search(cleaned) else "read"
     return "write"
 
@@ -108,8 +158,17 @@ def _supports_live_query_progress(spinner_console: Console) -> bool:
     )
 
 
+# The Unix spelling of "the statement is on stdin". `dp db top-tables
+# --drop-sql` has always printed `dp db query -t <target> -` as the way to run
+# the script it emits, and until this was here that invocation sent the server a
+# statement consisting of one hyphen: `sql` was non-blank, so the stdin branch
+# below was never reached. A statement that is literally "-" has no other
+# meaning, so there is nothing to weigh against the convention.
+_STDIN_SQL = "-"
+
+
 def _load_sql(sql: str | None) -> str:
-    if sql and sql.strip():
+    if sql and sql.strip() and sql.strip() != _STDIN_SQL:
         return sql
     if not sys.stdin.isatty():
         return sys.stdin.read()
@@ -208,7 +267,9 @@ def _execute_query(
     cleaned = sql_text.strip().rstrip(";")
     stripped = _strip_sql_comments(cleaned).strip()
     first_keyword = stripped.split(None, 1)[0].lower() if stripped else ""
-    is_select = first_keyword in {"select", "with"} and _classify_sql(cleaned) == "read"
+    is_select = (
+        first_keyword in _PAGINATED_FIRST_KEYWORDS and _classify_sql(cleaned) == "read"
+    )
 
     # --limit 0 disables the LIMIT/OFFSET wrapper entirely.
     paginate = is_select and (limit is None or limit > 0)
@@ -227,7 +288,11 @@ def _execute_query(
             f" LIMIT {safe_limit + 1} OFFSET {offset}"
         )
 
-    conn_params = resolve_params_or_exit(conn_cli)
+    # resolve_any_*, so a DuckDB target resolves to its own param shape instead
+    # of being refused by the libpq resolver. This command needs nothing from
+    # either shape — db_session takes both, and the SQL is the user's — which is
+    # what makes it engine-agnostic where its siblings are not.
+    conn_params = resolve_any_params_or_exit(conn_cli)
     # Decorative output goes to stderr for machine-readable formats.
     note = console if fmt == OutputFormat.table else err_console
 
@@ -291,6 +356,11 @@ def _execute_query(
                     f"Use --page {page + 1} to fetch the next page.[/yellow]"
                 )
         else:
+            # psycopg only. DuckDB answers every statement with a result set of
+            # its own — a 'Count' column for DML and DDL, 'Success' for the rest
+            # (probed on 1.5.5) — so this branch cannot be reached there, which
+            # is fortunate: its rowcount is -1 for everything, and "-1 rows
+            # affected" is what printing it anyway would produce.
             note.print(f"[green]✓ {cursor.rowcount} rows affected[/green]")
         elapsed = perf_counter() - started
         note.print(f"[dim]Execution time: {elapsed:.3f}s[/dim]")
@@ -329,7 +399,13 @@ def query(
         help="Allow statements that modify data without prompting.",
     ),
 ) -> None:
-    """Run ad-hoc SQL against Postgres or Redshift."""
+    """Run ad-hoc SQL against Postgres, Redshift or DuckDB.
+
+    The SQL is yours and is sent as written — no dialect translation — so a
+    DuckDB target takes DuckDB SQL and ``?`` placeholders, and a libpq target
+    takes its own. The only statement dataplat composes is the LIMIT/OFFSET
+    pagination wrapper around a paginated read.
+    """
     _execute_query(
         sql=sql,
         conn_cli=ConnCliParams(
