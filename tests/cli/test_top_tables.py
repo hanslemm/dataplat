@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from dataplat.cli.db import app as db_app
 from dataplat.cli.db.top_tables import _split_prefixes
+from dataplat.core.errors import ExitCode
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.top_tables import TopTableRow, TopTablesResult
 
@@ -135,6 +136,13 @@ def test_top_tables_drop_sql_emits_script() -> None:
     assert "Database disk:" in out
     assert "of disk" in out
     assert "8.0% of disk" in out  # 8 MiB / 100 MiB
+
+
+def test_top_tables_unknown_target_exits_invalid_input() -> None:
+    runner = CliRunner()
+    result = runner.invoke(db_app, ["top-tables", "-t", "nope"])
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Unknown target" in result.output
 
 
 def test_top_tables_json_and_drop_sql_mutually_exclusive() -> None:

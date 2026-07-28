@@ -100,11 +100,11 @@ def _classify_sql(sql: str) -> str:
     return "write"
 
 
-def _supports_live_query_progress() -> bool:
+def _supports_live_query_progress(spinner_console: Console) -> bool:
     return (
-        isinstance(console, Console)
-        and console.is_terminal
-        and not console.is_dumb_terminal
+        isinstance(spinner_console, Console)
+        and spinner_console.is_terminal
+        and not spinner_console.is_dumb_terminal
     )
 
 
@@ -237,13 +237,27 @@ def _execute_query(
         columns: list[str] = []
         has_result_set = False
 
-        if _supports_live_query_progress():
+        if _supports_live_query_progress(note):
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[cyan]Running query...[/cyan]"),
                 TimeElapsedColumn(),
-                console=console,
+                # The spinner follows the same sink as the notices: stdout for a
+                # table, stderr for --format json/csv. Painting it on stdout was
+                # harmless while Rich only did so for a real terminal, where the
+                # frames are erased — but FORCE_COLOR makes is_terminal true for
+                # a pipe too, and then `--format json > file` collected the
+                # escape sequences and stopped parsing.
+                console=note,
                 transient=True,
+                # Rich's Live replaces both streams with proxies that paint into
+                # its own console. Left at the default, the `--verbose` SQL trace
+                # surfaced on stdout for the duration of the query — the one
+                # thing dataplat.core.trace promises never to do — and anything
+                # written meanwhile would land in the spinner's stream rather
+                # than the caller's.
+                redirect_stderr=False,
+                redirect_stdout=False,
             ) as progress:
                 progress.add_task("query", total=None)
                 cursor.execute(cast(Query, sql_text))

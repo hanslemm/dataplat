@@ -12,10 +12,16 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import esc
-from dataplat.core.errors import ConfigError, ServiceError, ValidationError
+from dataplat.core.errors import (
+    ConfigError,
+    DataplatError,
+    ServiceError,
+    ValidationError,
+)
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
     DEPRECATED_SUFFIX,
@@ -124,8 +130,7 @@ def _engines_for_target(name: str) -> list[tuple[str, SqlEngine, str]]:
     try:
         targets = resolve_targets(name)
     except ValidationError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     return [(_ENGINE_LABELS[t.engine], t.engine, t.env_prefix) for t in targets]
 
 
@@ -227,9 +232,9 @@ def main(
             exclude, exclude_file
         )
     except ValidationError as exc:
-        # The message quotes the offending --exclude token back at the user.
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        # The message quotes the offending --exclude token back at the user, so
+        # fail() escaping it is what keeps a hostile token from crashing Rich.
+        fail(exc, console=console)
 
     engines = _engines_for_target(target)
     if not dry_run:
@@ -256,14 +261,19 @@ def main(
                     dry_run=dry_run,
                 )
             )
-    except ServiceError as exc:
+    except DataplatError as exc:
         _write_audit_log(log, all_entries, dry_run=dry_run)
         console.print(f"[red]{esc(exc)}[/red]")
         console.print(
             f"[yellow]Partial audit log written to {esc(log)} "
             f"({len(all_entries)} entries).[/yellow]"
         )
-        raise typer.Exit(code=1)
+        # exit_code_for, not fail(): the log path is the actionable half of this
+        # failure and has to be printed *after* the error, which fail() cannot do
+        # because it exits. The code still comes from the exception, which is
+        # also why the handler catches DataplatError rather than ServiceError —
+        # a ConfigError from a per-engine step keeps its own 3.
+        raise typer.Exit(code=exit_code_for(exc))
 
     _write_audit_log(log, all_entries, dry_run=dry_run)
 
@@ -304,7 +314,11 @@ def _run_for_engine(
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
         dbt_node_prefix = node_prefix()
     except ConfigError as exc:
-        raise ServiceError(f"[{label}] {exc}") from exc
+        # Re-raised as the same class, not widened to ServiceError: "set
+        # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
+        # told the warehouse failed (5) would retry it forever. The label is the
+        # only reason this is re-raised at all.
+        raise ConfigError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
             f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"
@@ -494,12 +508,14 @@ def revert_cmd(
             total += _revert_for_engine(
                 label, engine, entries, env_prefix=env_prefix, dry_run=dry_run
             )
-    except ServiceError as exc:
+    except DataplatError as exc:
         console.print(f"[red]{esc(exc)}[/red]")
         console.print(
             f"[yellow]Reverted {total} object(s) before the failure.[/yellow]"
         )
-        raise typer.Exit(code=1)
+        # See the note in `main`: the count printed after the error is why this
+        # takes the code from the exception instead of calling fail().
+        raise typer.Exit(code=exit_code_for(exc))
 
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(f"[green]{prefix}Reverted {total} object(s).[/green]")
@@ -518,7 +534,11 @@ def _revert_for_engine(
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
     except ConfigError as exc:
-        raise ServiceError(f"[{label}] {exc}") from exc
+        # Re-raised as the same class, not widened to ServiceError: "set
+        # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
+        # told the warehouse failed (5) would retry it forever. The label is the
+        # only reason this is re-raised at all.
+        raise ConfigError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
             f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"
@@ -684,8 +704,7 @@ def purge_cmd(
             exclude, exclude_file
         )
     except ValidationError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     engines = _engines_for_target(target)
     if not dry_run:
@@ -738,7 +757,7 @@ def purge_cmd(
                     )
                 )
                 raise ServiceError(f"[{label}] {exc}") from exc
-    except ServiceError as exc:
+    except DataplatError as exc:
         _write_purge_log(log, all_drops, dry_run=dry_run, blocked=blocked)
         console.print(f"[red]{esc(exc)}[/red]")
         if blocked:
@@ -751,7 +770,10 @@ def purge_cmd(
             f"[yellow]Partial purge log written to {esc(log)} "
             f"({len(all_drops)} entries).[/yellow]"
         )
-        raise typer.Exit(code=1)
+        # See the note in `main`. DependentObjectsError is a ServiceError too, so
+        # a refused drop and an unreachable warehouse both exit 5 — which is
+        # right: in both cases the warehouse, not the invocation, said no.
+        raise typer.Exit(code=exit_code_for(exc))
 
     _write_purge_log(log, all_drops, dry_run=dry_run)
 
@@ -781,7 +803,11 @@ def _purge_for_engine(
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
     except ConfigError as exc:
-        raise ServiceError(f"[{label}] {exc}") from exc
+        # Re-raised as the same class, not widened to ServiceError: "set
+        # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
+        # told the warehouse failed (5) would retry it forever. The label is the
+        # only reason this is re-raised at all.
+        raise ConfigError(f"[{label}] {exc}") from exc
     if params is None:
         console.print(
             f"[yellow]{_tag(label)} Missing connection parameters, skipping.[/yellow]"

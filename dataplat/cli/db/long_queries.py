@@ -16,6 +16,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._exit import fail
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
@@ -178,8 +179,7 @@ def long_queries_command(
     try:
         targets = resolve_targets(target)
     except ValidationError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if history:
         targets = [t for t in targets if t.engine == SqlEngine.postgresql]
@@ -258,8 +258,10 @@ def kill_command(
             )
         tgt = resolve_target(name)
     except DataplatError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        # Two conditions arrive here and they are not the same for a caller: an
+        # unknown/absent target is invalid input (2), a broken DP_TARGETS is a
+        # configuration problem (3). fail() reads the code off the exception.
+        fail(exc, console=console)
 
     action = "Cancel" if cancel or tgt.engine == SqlEngine.redshift else "Terminate"
     confirm_or_exit(

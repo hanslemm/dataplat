@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from dataplat.cli.db import app as db_app
 from dataplat.cli.db.describe import render_description
+from dataplat.core.errors import ExitCode
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.describe import (
     ColumnInfo,
@@ -678,6 +679,20 @@ def test_render_schema_highlights_top_largest() -> None:
     # without parsing sections, so at minimum verify tbl_10 appears somewhere
     # (in Contents) — confirming it wasn't lost.
     assert "tbl_10" in out
+
+
+def test_describe_unknown_db_target_exits_invalid_input() -> None:
+    """The shared resolver's exit code reaches this command too.
+
+    ``describe`` never opens a connection here: an unknown ``--target`` fails in
+    ``resolve_params_or_exit``, which is the funnel the whole area shares.
+    """
+    # The flag precedes the argument: `describe` is a Typer sub-app, so a value
+    # after the positional is parsed as a subcommand name.
+    result = CliRunner().invoke(db_app, ["describe", "--target", "nope", "public"])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Unknown target" in result.output
 
 
 def test_describe_malformed_target_exits_1(monkeypatch) -> None:
