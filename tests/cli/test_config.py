@@ -261,6 +261,123 @@ def test_doctor_renders_markup_in_detail_verbatim(monkeypatch, tmp_path: Path) -
     assert str(hostile) in result.output
 
 
+def _pin_envrc_file(monkeypatch, tmp_path: Path, content: str) -> Path:
+    """Write a real .envrc and make it the active one for both commands."""
+    envrc = tmp_path / "active" / ".envrc"
+    envrc.parent.mkdir(parents=True, exist_ok=True)
+    envrc.write_text(content)
+    _pin_envrc(monkeypatch, envrc)
+    return envrc
+
+
+def test_doctor_warns_about_unexpanded_shell_vars_without_failing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`export PGHOST=$DB_HOST` loads the literal, and the connection error that
+    follows looks like a bad host or password. Doctor names it instead."""
+    _isolate_config_link(monkeypatch, tmp_path)
+    _pin_envrc_file(
+        monkeypatch,
+        tmp_path,
+        'export DEMO_PG_HOST=$DB_HOST\nexport DEMO_PG_PASSWORD="p$ssw0rd"\n',
+    )
+    _configure_everything(monkeypatch)
+    monkeypatch.setenv("DEMO_PG_HOST", "$DB_HOST")
+    monkeypatch.setenv("DEMO_PG_PASSWORD", "p$ssw0rd")
+
+    result = runner.invoke(config_cli.app, ["doctor"])
+
+    # A warning must never flip a setup that used to exit 0.
+    assert result.exit_code == 0, result.output
+    assert "shell expansion" in result.output
+    assert "DEMO_PG_HOST" in result.output
+    assert "DEMO_PG_PASSWORD" in result.output
+    assert config_cli.UNEXPANDED_HINT.split(".")[0] in result.output
+    assert "All checks passed" in result.output
+    assert "1 warning(s)" in result.output
+    # The referenced name is extracted from the value, so it is never printed:
+    # here it is a fragment of the password.
+    assert "ssw0rd" not in result.output
+    assert "DB_HOST" not in result.output.replace("DEMO_PG_HOST", "")
+
+
+def test_doctor_stays_quiet_when_nothing_needs_expanding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Including the single-quoted case the shell would not expand either."""
+    _isolate_config_link(monkeypatch, tmp_path)
+    _pin_envrc_file(monkeypatch, tmp_path, "export DEMO_PG_HOST='db$1.example.com'\n")
+    _configure_everything(monkeypatch)
+    monkeypatch.setenv("DEMO_PG_HOST", "db$1.example.com")
+
+    result = runner.invoke(config_cli.app, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "shell expansion" not in result.output
+    assert "warning(s)" not in result.output
+
+
+def test_show_marks_unexpanded_values_and_explains_the_marker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _isolate_config_link(monkeypatch, tmp_path)
+    _pin_envrc_file(
+        monkeypatch,
+        tmp_path,
+        'export DEMO_PG_HOST=$DB_HOST\nexport DEMO_PG_PASSWORD="$DB_PASS"\n',
+    )
+    monkeypatch.setenv("DEMO_PG_HOST", "$DB_HOST")
+    monkeypatch.setenv("DEMO_PG_PASSWORD", "$DB_PASS")
+
+    result = runner.invoke(config_cli.app, ["show"])
+
+    assert result.exit_code == 0, result.output
+    # The literal is shown *and* flagged: on its own it looks like a working line.
+    assert "$DB_HOST" in result.output
+    assert config_cli.UNEXPANDED_MARK in result.output
+    assert config_cli.UNEXPANDED_HINT.split(".")[0] in result.output
+    # A secret keeps its value hidden but still gets the marker.
+    assert "$DB_PASS" not in result.output
+    assert result.output.count(config_cli.UNEXPANDED_MARK) == 3  # 2 rows + footnote
+
+
+def test_show_does_not_mark_a_value_the_shell_already_supplied(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """setdefault-based loading means the file's line never took effect."""
+    _isolate_config_link(monkeypatch, tmp_path)
+    _pin_envrc_file(monkeypatch, tmp_path, "export DEMO_PG_HOST=$DB_HOST\n")
+    monkeypatch.setenv("DEMO_PG_HOST", "db.example.com")
+
+    result = runner.invoke(config_cli.app, ["show"])
+
+    assert result.exit_code == 0, result.output
+    assert config_cli.UNEXPANDED_MARK not in result.output
+
+
+def test_show_reports_a_broken_dp_targets_instead_of_crashing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`dp config show` is what you run *because* the config is broken.
+
+    A reserved target name used to end it in a ConfigError traceback, hiding the
+    "active .envrc" header that had already printed.
+    """
+    _isolate_config_link(monkeypatch, tmp_path)
+    active = tmp_path / "trusted" / ".envrc"
+    _pin_envrc(monkeypatch, active)
+    monkeypatch.setenv("DP_TARGETS", "all")
+
+    result = runner.invoke(config_cli.app, ["show"])
+
+    # A clean exit, not an escaped ConfigError: it used to reach the top level.
+    assert isinstance(result.exception, SystemExit), result.exception
+    # ExitCode.CONFIG, taken from the exception itself — not the old bare 1.
+    assert result.exit_code == 3, result.output
+    assert "reserved target name" in result.output
+    assert str(active) in result.output  # the header survives
+
+
 def test_render_checks_counts_failures_but_not_warnings(capsys) -> None:
     failures = config_cli._render_checks(
         [

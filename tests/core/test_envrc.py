@@ -83,6 +83,88 @@ def test_parse_envrc_unterminated_quote_collects_to_eof() -> None:
     assert parsed["A"] == "never closed\nline2"
 
 
+# unexpanded $VAR detection
+
+
+def test_unexpanded_env_refs_reports_unquoted_and_braced_forms() -> None:
+    content = (
+        "export PGHOST=$DB_HOST\n"
+        "export PGUSER=${DB_USER}\n"
+        "export PGDATABASE=${DB_NAME:-analytics}\n"
+    )
+    environ = {
+        "PGHOST": "$DB_HOST",
+        "PGUSER": "${DB_USER}",
+        "PGDATABASE": "${DB_NAME:-analytics}",
+    }
+
+    assert envrc.unexpanded_env_refs(content, environ) == {
+        "PGHOST": ["DB_HOST"],
+        "PGUSER": ["DB_USER"],
+        "PGDATABASE": ["DB_NAME"],
+    }
+
+
+def test_unexpanded_env_refs_reports_double_quoted_values() -> None:
+    # The shell expands inside double quotes, so this one really is broken.
+    content = 'export PGHOST="$DB_HOST"\n'
+
+    assert envrc.unexpanded_env_refs(content, {"PGHOST": "$DB_HOST"}) == {
+        "PGHOST": ["DB_HOST"]
+    }
+
+
+def test_unexpanded_env_refs_ignores_single_quoted_values() -> None:
+    """Single quotes suppress expansion in the shell too, so nothing differs.
+
+    This is also what keeps a password out of the report: `'p$ssw0rd'` would
+    otherwise be read as a reference to `$ssw0rd`.
+    """
+    content = "export PGPASSWORD='p$ssw0rd'\nexport LABEL='cost is $AMOUNT'\n"
+    environ = {"PGPASSWORD": "p$ssw0rd", "LABEL": "cost is $AMOUNT"}
+
+    assert envrc.unexpanded_env_refs(content, environ) == {}
+
+
+def test_unexpanded_env_refs_ignores_escaped_and_non_identifier_dollars() -> None:
+    """`\\$X` is a literal the shell would not expand; `$$`/`$1` cannot be vars."""
+    content = 'export A="\\$LITERAL"\nexport B=$$\nexport C=$1\nexport D=cost$\n'
+    environ = {"A": "\\$LITERAL", "B": "$$", "C": "$1", "D": "cost$"}
+
+    assert envrc.unexpanded_env_refs(content, environ) == {}
+
+
+def test_unexpanded_env_refs_skips_vars_the_shell_already_exported() -> None:
+    """load_envrc is setdefault-based: the file's line never took effect."""
+    content = "export PGHOST=$DB_HOST\n"
+
+    assert envrc.unexpanded_env_refs(content, {"PGHOST": "real.example.com"}) == {}
+
+
+def test_unexpanded_env_refs_dedupes_and_keeps_reference_order() -> None:
+    content = "export DSN=postgres://$DB_USER@$DB_HOST/$DB_NAME?u=$DB_USER\n"
+    value = "postgres://$DB_USER@$DB_HOST/$DB_NAME?u=$DB_USER"
+
+    assert envrc.unexpanded_env_refs(content, {"DSN": value}) == {
+        "DSN": ["DB_USER", "DB_HOST", "DB_NAME"]
+    }
+
+
+def test_unexpanded_env_refs_is_empty_for_an_ordinary_file() -> None:
+    content = 'export PGHOST=db.example.com\nexport PEM="line1\nline2"\n'
+    environ = {"PGHOST": "db.example.com", "PEM": "line1\nline2"}
+
+    assert envrc.unexpanded_env_refs(content, environ) == {}
+
+
+def test_unexpanded_env_refs_defaults_to_the_real_environment(monkeypatch) -> None:
+    monkeypatch.setenv("PGHOST", "$DB_HOST")
+
+    assert envrc.unexpanded_env_refs("export PGHOST=$DB_HOST\n") == {
+        "PGHOST": ["DB_HOST"]
+    }
+
+
 def test_find_envrc_prefers_override(monkeypatch, tmp_path: Path) -> None:
     env_file = tmp_path / ".envrc"
     env_file.write_text("export A=1")
