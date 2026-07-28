@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -230,3 +231,146 @@ def test_kill_redshift_issues_cancel(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "CANCEL 456" in calls
+
+
+# --- a DuckDB target: both commands rest on other sessions existing ---------
+#
+# Every test below runs against a real DuckDB database, not a stub. DuckDB is
+# in-process and file-backed, so there is nothing to fake, and a refusal that
+# only works against an imagined target proves nothing about the one a user has.
+
+
+def _flat(text: str) -> str:
+    """One long line, because Rich wraps at the terminal width.
+
+    Every assertion below is about wording, and a clause that happens to fit
+    today would silently start straddling a line break the next time the
+    sentence grows or COLUMNS changes.
+    """
+    return " ".join(text.split())
+
+
+def _duckdb_target(monkeypatch, tmp_path: Path, name: str = "ddb") -> Path:
+    """Create a real DuckDB database and declare it as the only target."""
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE TABLE orders(id INTEGER)")
+    connection.close()
+    monkeypatch.setenv("DP_TARGETS", name)
+    monkeypatch.setenv(f"{name.upper()}_ENGINE", "duckdb")
+    monkeypatch.setenv(f"{name.upper()}_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def _forbid_connections(monkeypatch) -> None:
+    """Make opening any database fail the test.
+
+    A refusal that arrives *after* a connection is a different thing: it has
+    already taken DuckDB's single-writer lock on a file someone may be running
+    dbt against, or spent a round trip on a server. Patching both drivers at the
+    module they are called through is what pins "before".
+    """
+    import duckdb
+    import psycopg
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused command opened a connection")
+
+    monkeypatch.setattr(psycopg, "connect", _forbidden)
+    monkeypatch.setattr(duckdb, "connect", _forbidden)
+
+
+def test_long_queries_refuses_a_duckdb_target(monkeypatch, tmp_path: Path) -> None:
+    """Exit 2 with the engine's own reason, and nothing opened."""
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = runner.invoke(db_app, ["long-queries", "-t", "ddb"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "dp db long-queries cannot run against DuckDB" in out
+    assert "no other sessions to inspect or cancel" in out
+    # The distinction the message exists to draw: this is what the engine is.
+    assert "That is what DuckDB is, not a missing dataplat feature" in out
+    for wording in ("not supported", "not implemented"):
+        assert wording not in out.lower()
+
+
+def test_long_queries_refuses_duckdb_before_history_is_considered(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """--history's own error would send the reader after the wrong fact.
+
+    "--history uses pg_stat_statements and needs a Postgres target" is true and
+    useless here: no flag on this command can work against an engine with no
+    other sessions, and only the engine's reason says so.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = runner.invoke(db_app, ["long-queries", "-t", "ddb", "--history"])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "no other sessions to inspect or cancel" in _flat(result.output)
+    assert "pg_stat_statements" not in result.output
+
+
+def test_long_queries_all_still_serves_the_targets_that_have_sessions(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`-t all` is the default, so one DuckDB target must not end the report."""
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "ddb,demo_pg")
+
+    with patch(_FETCH, return_value=[_row("42", "running", 120)]) as fetch:
+        result = runner.invoke(db_app, ["long-queries", "-t", "all"])
+
+    # Nothing failed: the question does not apply to one target, which is not
+    # the same as that target being broken.
+    assert result.exit_code == 0, result.output
+    assert [call.args[0].name for call in fetch.call_args_list] == ["demo_pg"]
+    assert "Postgres" in result.stdout
+    # Named, with its reason, rather than silently absent from a report someone
+    # is reading to conclude nothing is wrong.
+    assert "[ddb]" in result.stderr
+    assert "no other sessions to inspect or cancel" in _flat(result.stderr)
+
+
+def test_long_queries_json_stays_parseable_with_a_duckdb_target(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The note is a notice, so it goes to stderr — `--json` is a document."""
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "ddb,demo_pg")
+
+    with patch(_FETCH, return_value=[]):
+        result = runner.invoke(db_app, ["long-queries", "-t", "all", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"demo_pg": []}
+    assert "DuckDB" in result.stderr
+
+
+def test_kill_refuses_a_duckdb_target_before_asking(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """There is nothing to confirm terminating: those PIDs cannot exist.
+
+    ``--yes`` is deliberately absent. The refusal has to precede the gate, or a
+    user would be asked to approve killing sessions on an engine that has none.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = runner.invoke(db_app, ["kill", "123", "-t", "ddb"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "dp db kill cannot run against DuckDB" in out
+    assert "no other sessions to inspect or cancel" in out
+    assert "Terminate 1 session(s)" not in out
+    assert "--yes" not in out

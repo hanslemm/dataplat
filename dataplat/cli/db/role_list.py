@@ -16,6 +16,7 @@ from rich import box as _box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._exit import fail
 from dataplat.cli._options import json_option
 from dataplat.cli._render import cell
 from dataplat.cli.db._common import (
@@ -30,8 +31,11 @@ from dataplat.cli.db._common import (
     TargetOption,
     UserOption,
     db_session,
+    engine_or_exit,
     resolve_params_or_exit,
 )
+from dataplat.core.errors import ValidationError
+from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role_admin import RoleSummary
 from dataplat.services.db.role_dialects import dialect_for
@@ -123,19 +127,27 @@ def list_command(
 ) -> None:
     """Entry point for ``dp db role list``."""
     console = Console()
-    conn_params = resolve_params_or_exit(
-        ConnCliParams(
-            target=target,
-            engine=engine,
-            user=user,
-            password=password,
-            database=database,
-            host=host,
-            port=port,
-            sslmode=sslmode,
-            env_prefix=env_prefix,
-        )
+    conn_cli = ConnCliParams(
+        target=target,
+        engine=engine,
+        user=user,
+        password=password,
+        database=database,
+        host=host,
+        port=port,
+        sslmode=sslmode,
+        env_prefix=env_prefix,
     )
+    # Before resolving, and before opening anything: the refusal belongs to the
+    # engine, so it can name the reason. See the longer note in role.py, which
+    # also says why the four role commands each spell this out.
+    try:
+        require_capability(
+            engine_or_exit(conn_cli), Capability.roles, command="dp db role list"
+        )
+    except ValidationError as exc:
+        fail(exc, console=console)
+    conn_params = resolve_params_or_exit(conn_cli)
 
     dialect = dialect_for(conn_params.engine)
     with db_session(conn_params) as conn, conn.cursor() as cursor:

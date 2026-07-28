@@ -794,3 +794,155 @@ def test_log_discovery_still_globs_the_timestamp(
 
     assert do._matching_logs("dbt_orphans") == [str(older), str(newer)]
     assert do._find_latest_log("dbt_orphans") == str(newer)
+
+
+# --- a DuckDB target: the mechanism itself is refused ----------------------
+#
+# Against a real DuckDB database, not a stub, and with the drivers booby-trapped
+# so that a refusal arriving after a connection fails the test. This command
+# renames and drops, so "before any work" is the whole point: the file is also
+# compared byte for byte afterwards.
+#
+# Note these tests do *not* use the `warehouse` fixture, which stubs out
+# `_engines_for_target` — the very function that refuses.
+
+
+def _flat(text: str) -> str:
+    """One long line: Rich wraps at the terminal width, assertions are wording."""
+    return " ".join(text.split())
+
+
+def _duckdb_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A real DuckDB database with a view over a table — the dbt shape.
+
+    The view is what makes the refusal concrete rather than theoretical: renaming
+    `orders` here raises DependencyException on duckdb 1.5.5, and there is no
+    CASCADE. In a dbt project this is the ordinary case, not a corner.
+    """
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE SCHEMA analytics")
+    connection.execute("CREATE TABLE analytics.orders(id INTEGER)")
+    connection.execute(
+        "CREATE VIEW analytics.v_orders AS SELECT * FROM analytics.orders"
+    )
+    connection.close()
+    monkeypatch.setenv("DP_TARGETS", "ddb")
+    monkeypatch.setenv("DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DDB_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def _forbid_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    import duckdb
+    import psycopg
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused command opened a connection")
+
+    monkeypatch.setattr(psycopg, "connect", _forbidden)
+    monkeypatch.setattr(duckdb, "connect", _forbidden)
+
+
+def _assert_rename_refusal(result: Any) -> None:
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "[ddb] dp db dbt-orphans cannot run against DuckDB" in out
+    # The engine fact...
+    assert "ALTER TABLE ... RENAME TO fails with a DependencyException" in out
+    assert "no CASCADE" in out
+    # ...and why *this* command needs it, which the fact alone does not say.
+    assert "quarantines an orphan by renaming it" in out
+    assert "a view on a model is the normal case" in out
+    assert "That is what DuckDB is, not a missing dataplat feature" in out
+    for wording in ("not supported", "not implemented"):
+        assert wording not in out.lower()
+
+
+def test_scan_refuses_a_duckdb_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _duckdb_target(monkeypatch, tmp_path)
+    before = path.read_bytes()
+    _forbid_connections(monkeypatch)
+    log = tmp_path / "s.log.json"
+
+    result = _scan(["--target", "ddb", "--log", str(log)])
+
+    _assert_rename_refusal(result)
+    # Nothing was renamed, and no audit log claims anything was.
+    assert not log.exists()
+    assert path.read_bytes() == before
+
+
+def test_scan_refuses_a_duckdb_target_before_the_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_tty: None
+) -> None:
+    """--no-dry-run must not prompt for renames that cannot happen."""
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = _scan(
+        ["--target", "ddb", "--no-dry-run", "--log", str(tmp_path / "s.json")]
+    )
+
+    _assert_rename_refusal(result)
+    assert "Rename every orphaned dbt object" not in _flat(result.output)
+
+
+def test_purge_refuses_a_duckdb_target_before_the_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_tty: None
+) -> None:
+    """The destructive half: refused before the prompt and before any DROP."""
+    path = _duckdb_target(monkeypatch, tmp_path)
+    before = path.read_bytes()
+    _forbid_connections(monkeypatch)
+    log = tmp_path / "p.log.json"
+
+    result = _scan(["purge", "--target", "ddb", "--no-dry-run", "--log", str(log)])
+
+    _assert_rename_refusal(result)
+    assert "Permanently DROP" not in _flat(result.output)
+    assert not log.exists()
+    assert path.read_bytes() == before
+
+
+def test_revert_refuses_a_duckdb_target_before_looking_for_a_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ "No log found" would send the reader after a file that is not the problem.
+
+    Revert renames too, so the engine refuses it whether or not a previous run
+    left a log behind — and the log is deliberately absent here, which is the
+    error this used to report instead.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+    monkeypatch.setattr(do, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    result = _scan(["revert", "--target", "ddb"])
+
+    _assert_rename_refusal(result)
+    assert "no dbt_orphans log found" not in result.output
+
+
+def test_all_refuses_when_one_target_cannot_rename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`-t all` is the default, and this command renames and drops.
+
+    Deliberately not per-target degradation: a partly-applied destructive run is
+    the outcome worth avoiding most, and the refusal names the target so the
+    operator can ask for the rest explicitly.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,ddb")
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["--target", "all", "--log", str(tmp_path / "s.json")])
+
+    _assert_rename_refusal(result)

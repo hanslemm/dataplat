@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import typer
 from rich.console import Console
@@ -663,3 +665,170 @@ def test_show_command_error_escapes_markup(monkeypatch, capsys) -> None:
         )
     assert excinfo.value.exit_code == 1
     assert HOSTILE_NAME in capsys.readouterr().out
+
+
+# --- a DuckDB target: there are no roles to describe -----------------------
+#
+# Against a real DuckDB database, not a stub: the engine is in-process and
+# file-backed, so there is nothing to fake, and both drivers are booby-trapped
+# so that a refusal arriving *after* a connection fails the test. Opening first
+# would already have taken DuckDB's single-writer lock on a file someone may be
+# running dbt against.
+
+
+def _duckdb_target(monkeypatch, tmp_path) -> Path:
+    """Create a real DuckDB database and declare it as the only target."""
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE TABLE orders(id INTEGER)")
+    connection.close()
+    monkeypatch.setenv("DP_TARGETS", "ddb")
+    monkeypatch.setenv("DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DDB_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def _forbid_connections(monkeypatch) -> None:
+    import duckdb
+    import psycopg
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused command opened a connection")
+
+    monkeypatch.setattr(psycopg, "connect", _forbidden)
+    monkeypatch.setattr(duckdb, "connect", _forbidden)
+
+
+def _flat(text: str) -> str:
+    """One long line, because Rich wraps at the terminal width.
+
+    Every assertion below is about wording, and a clause that happens to fit
+    today would silently start straddling a line break the next time the
+    sentence grows or COLUMNS changes.
+    """
+    return " ".join(text.split())
+
+
+def _assert_no_roles_refusal(result, command: str) -> None:
+    """The one shape every role refusal takes, asserted once."""
+    from dataplat.core.errors import ExitCode
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert f"{command} cannot run against DuckDB" in out
+    # The reason, not merely the fact: this is the only place a user learns it.
+    assert "it has no users or roles at all" in out
+    assert "That is what DuckDB is, not a missing dataplat feature" in out
+    for wording in ("not supported", "not implemented"):
+        assert wording not in out.lower()
+
+
+def test_role_show_refuses_a_duckdb_target(monkeypatch, tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from dataplat.cli.db import app as db_app
+
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = CliRunner().invoke(db_app, ["role", "show", "alice", "-t", "ddb"])
+
+    _assert_no_roles_refusal(result, "dp db role show")
+
+
+def test_role_list_refuses_a_duckdb_target(monkeypatch, tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from dataplat.cli.db import app as db_app
+
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+
+    result = CliRunner().invoke(db_app, ["role", "list", "-t", "ddb"])
+
+    _assert_no_roles_refusal(result, "dp db role list")
+
+
+def test_role_show_refuses_duckdb_named_by_flag_without_a_target(
+    monkeypatch, tmp_path
+) -> None:
+    """`--engine duckdb` is the other way in, and it must refuse identically.
+
+    A target is not required to reach a DuckDB database: ``-e duckdb -d <path>``
+    is enough. The capability question is asked about the *resolved* engine, so
+    the flag route cannot slip past the check that the target route hits.
+    """
+    from typer.testing import CliRunner
+
+    from dataplat.cli.db import app as db_app
+
+    path = _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.delenv("DP_TARGETS", raising=False)
+    _forbid_connections(monkeypatch)
+
+    result = CliRunner().invoke(
+        db_app, ["role", "show", "alice", "-e", "duckdb", "-d", str(path)]
+    )
+
+    _assert_no_roles_refusal(result, "dp db role show")
+
+
+def test_role_commands_still_serve_a_postgres_target(monkeypatch, tmp_path) -> None:
+    """The refusal is the engine's, not a new gate in front of every target.
+
+    Cheap to state and worth stating: a capability check placed one line too
+    early is exactly how a working command starts refusing everything.
+    """
+    import contextlib
+    from types import SimpleNamespace
+
+    from dataplat.cli.db import role_list as rl
+    from dataplat.services.db.role_admin import RoleSummary
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    @contextlib.contextmanager
+    def _sess(params):
+        yield _Conn()
+
+    monkeypatch.setattr(
+        rl,
+        "resolve_params_or_exit",
+        lambda p: SimpleNamespace(engine=SqlEngine.postgresql),
+    )
+    monkeypatch.setattr(rl, "db_session", _sess)
+    monkeypatch.setattr(
+        rl,
+        "dialect_for",
+        lambda engine: SimpleNamespace(
+            list_roles=lambda cur: [RoleSummary("svc", True, False, False, False, 0, 0)]
+        ),
+    )
+
+    rl.list_command(
+        filter_substring=None,
+        users_only=False,
+        groups_only=False,
+        as_json=False,
+        target="demo_pg",
+        engine=None,
+        user="u",
+        password=None,
+        database="analytics",
+        host="h",
+        port=5432,
+        sslmode=None,
+        env_prefix="DEMO_PG",
+    )

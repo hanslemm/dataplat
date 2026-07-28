@@ -42,6 +42,12 @@ class _FakeConn:
 
 def _invoke_create(creds_path: Path) -> None:
     rc.create_command(
+        # target=None, like the CLI passes when --target is omitted: the command
+        # now asks the capability matrix which engine it is talking to before it
+        # resolves anything, and that reads the target. Leaving the parameter at
+        # its Typer default hands `resolve_target` an OptionInfo object.
+        target=None,
+        engine=None,
         names=["alice"],
         schema_usage=None,
         schema_create=None,
@@ -144,6 +150,8 @@ def test_no_login_writes_no_credentials_file(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(rc, "_execute_per_db_ops", lambda **kw: None)
 
     rc.create_command(
+        target=None,  # see _invoke_create
+        engine=None,
         names=["readers"],
         schema_usage=None,
         schema_create=None,
@@ -455,3 +463,77 @@ def test_dry_run_never_prompts(monkeypatch) -> None:
     executed = _gate(monkeypatch, tty=False)
     _create(dry_run=True, yes=False)
     assert executed == []
+
+
+# --- a DuckDB target: there are no roles to create -------------------------
+#
+# Against a real DuckDB database, not a stub, with both drivers booby-trapped:
+# `role create` writes, and a refusal that arrives after a connection has been
+# opened has already taken DuckDB's single-writer lock. It also generates
+# passwords and a credentials file, so "before any work" is not a nicety here.
+
+
+def _flat(text: str) -> str:
+    """One long line: Rich wraps at the terminal width, assertions are wording."""
+    return " ".join(text.split())
+
+
+def _duckdb_target(monkeypatch, tmp_path: Path) -> Path:
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE TABLE orders(id INTEGER)")
+    connection.close()
+    monkeypatch.setenv("DP_TARGETS", "ddb")
+    monkeypatch.setenv("DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DDB_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def _forbid_connections(monkeypatch) -> None:
+    import duckdb
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused command opened a connection")
+
+    monkeypatch.setattr(psycopg, "connect", _forbidden)
+    monkeypatch.setattr(duckdb, "connect", _forbidden)
+
+
+def test_create_refuses_a_duckdb_target(monkeypatch, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from dataplat.cli.db import app as db_app
+    from dataplat.core.errors import ExitCode
+
+    _duckdb_target(monkeypatch, tmp_path)
+    _forbid_connections(monkeypatch)
+    creds = tmp_path / "creds.csv"
+
+    result = CliRunner().invoke(
+        db_app,
+        [
+            "role",
+            "create",
+            "svc",
+            "-t",
+            "ddb",
+            "--yes",
+            "--credentials-out",
+            str(creds),
+        ],
+    )
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "dp db role create cannot run against DuckDB" in out
+    assert "it has no users or roles at all" in out
+    assert "That is what DuckDB is, not a missing dataplat feature" in out
+    for wording in ("not supported", "not implemented"):
+        assert wording not in out.lower()
+    # No plan was built, and above all no password was generated and written to
+    # disk for a role that could never exist.
+    assert not creds.exists()
+    assert "Plan:" not in out

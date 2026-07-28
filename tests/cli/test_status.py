@@ -7,6 +7,7 @@ import sys
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -1050,3 +1051,303 @@ def test_aws_section_keeps_only_the_two_headline_metrics(
     section = status_cli._aws_section()
 
     assert section["metrics"] == {"CPUUtilization": 12.5, "FreeStorageSpace": 200.0}
+
+
+# a DuckDB target
+#
+# Every test here uses a real DuckDB database. Opening the file *is* the health
+# check, so a stub would be testing nothing: what is under test is precisely
+# whether the file opens.
+
+
+def _flat(text: str) -> str:
+    """One long line: Rich wraps at the terminal width, assertions are wording."""
+    return " ".join(text.split())
+
+
+def _duckdb_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, create: bool = True
+) -> Path:
+    """Declare a DuckDB target, with a real database behind it by default."""
+    import duckdb
+
+    path = tmp_path / "warehouse.duckdb"
+    if create:
+        connection = duckdb.connect(str(path))
+        connection.execute("CREATE TABLE orders(id INTEGER)")
+        connection.close()
+    monkeypatch.setenv("DP_TARGETS", "ddb")
+    monkeypatch.setenv("DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DDB_PATH", str(path))
+    monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    return path
+
+
+def test_db_section_reports_a_duckdb_target_as_reachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Opening the file is the whole probe: there is no socket and no session."""
+    _duckdb_target(monkeypatch, tmp_path)
+
+    section = status_cli._db_section()
+
+    assert section["ddb"]["reachable"] is True
+    # None, not 0. A count of 0 is what a healthy *server* reports, so it would
+    # read as "all clear" about a question this engine cannot be asked at all.
+    assert section["ddb"]["long_running"] is None
+    assert section["ddb"]["long_running"] != 0
+    # And the reason travels with the gap, in the capability matrix's own words.
+    note = section["ddb"]["long_running_note"]
+    assert "DuckDB" in note
+    assert "no other sessions to inspect or cancel" in note
+
+
+def test_duckdb_note_comes_from_the_capability_matrix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One fact, one wording: `dp db long-queries` refuses with the same reason.
+
+    Two hand-written explanations of the same engine property is exactly how a
+    dashboard ends up contradicting the command it points at.
+    """
+    from dataplat.services.db.capabilities import capabilities_for
+    from dataplat.services.db.connection import SqlEngine
+
+    _duckdb_target(monkeypatch, tmp_path)
+    reason = capabilities_for(SqlEngine.duckdb).concurrent_sessions.reason
+
+    section = status_cli._db_section()
+
+    assert reason in section["ddb"]["long_running_note"]
+
+
+def test_db_section_json_keys_keep_their_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`reachable` first, as for every other target; the note is an addition."""
+    _duckdb_target(monkeypatch, tmp_path)
+
+    info = status_cli._db_section()["ddb"]
+
+    assert list(info) == ["reachable", "long_running", "long_running_note"]
+
+
+def test_db_section_reports_a_missing_duckdb_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A mistyped path is unreachable, and the message names the path.
+
+    dataplat does not create the file — an empty database would report an empty
+    warehouse instead of a wrong path — so this is the common misconfiguration.
+    """
+    path = _duckdb_target(monkeypatch, tmp_path, create=False)
+
+    section = status_cli._db_section()
+
+    error = section["ddb"]["error"]
+    assert section["ddb"]["reachable"] is False
+    assert error.startswith("DuckDB database not found:")
+    # Truncated to 160 like every error in this section, so a deep tmp_path
+    # leaves only the head of the path — naming it at all is the point.
+    assert str(path)[:40] in error
+    assert len(error) <= 160
+    assert not path.exists()  # the probe did not create it either
+
+
+def test_db_section_reports_a_file_that_is_not_a_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The driver's own refusal, which is the other half of "reachable"."""
+    path = _duckdb_target(monkeypatch, tmp_path, create=False)
+    path.write_bytes(b"not a duckdb file")
+
+    section = status_cli._db_section()
+
+    assert section["ddb"]["reachable"] is False
+    # duckdb.Error, caught and reported rather than allowed to escape into
+    # _guarded and take the whole section down with it.
+    assert section["ddb"]["error"].startswith("IO Error:")
+
+
+def test_db_section_reports_a_duckdb_target_with_no_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.delenv("DDB_PATH")
+    monkeypatch.delenv("DDB_DATABASE", raising=False)
+
+    section = status_cli._db_section()
+
+    assert section["ddb"]["reachable"] is False
+    assert "Missing the DuckDB database path" in section["ddb"]["error"]
+
+
+def test_db_section_refuses_a_duckdb_target_carrying_a_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A target configured both ways is a mistake, not something to half-use."""
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DDB_HOST", "db.example.invalid")
+
+    section = status_cli._db_section()
+
+    assert section["ddb"]["reachable"] is False
+    assert "DDB_HOST" in section["ddb"]["error"]
+
+
+def test_missing_psycopg_no_longer_reddens_a_duckdb_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """psycopg's absence says nothing about a database opened in-process.
+
+    The section used to answer "psycopg not installed" for *every* target, which
+    for a DuckDB target is both false and unactionable.
+    """
+    # Imported before psycopg is broken: _probe_target imports this module
+    # lazily, and _common imports psycopg at its top.
+    import dataplat.cli.db._common  # noqa: F401
+
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "ddb,demo_pg")
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+
+    section = status_cli._db_section()
+
+    # Key order is the configured order, whichever path each target took.
+    assert list(section) == ["ddb", "demo_pg"]
+    assert section["ddb"]["reachable"] is True
+    assert section["demo_pg"]["reachable"] is False
+    assert "psycopg not installed" in section["demo_pg"]["error"]
+
+
+def test_db_section_probes_a_mixed_target_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One unreachable server must not affect the DuckDB target, or the order."""
+    import psycopg
+
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "ddb,demo")
+    monkeypatch.setenv("DEMO_ENGINE", "postgresql")
+    monkeypatch.setenv("DEMO_HOST", "db.example.invalid")
+    monkeypatch.setenv("DEMO_USER", "svc")
+    monkeypatch.setenv("DEMO_DATABASE", "analytics")
+
+    def fake_connect(**kwargs: Any) -> _FakeConn:
+        raise psycopg.OperationalError("connection to server failed")
+
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+
+    section = status_cli._db_section()
+
+    assert list(section) == ["ddb", "demo"]
+    assert section["ddb"]["reachable"] is True
+    assert section["demo"]["reachable"] is False
+
+
+def test_overview_never_calls_an_unanswerable_count_all_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rendered line is where "not applicable" has to beat "0"."""
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch)
+    monkeypatch.setattr(
+        status_cli,
+        "_db_section",
+        lambda: {
+            "ddb": {
+                "reachable": True,
+                "long_running": None,
+                "long_running_note": "not applicable on DuckDB (no other sessions)",
+            }
+        },
+    )
+
+    result = runner.invoke(main_module.app, ["status"])
+
+    out = _flat(result.output)
+    assert result.exit_code == 0, result.output
+    assert "✓ ddb" in out  # reachable, and marked as healthy
+    assert "not applicable on DuckDB (no other sessions)" in out
+    assert "no long-running queries" not in out
+
+
+def test_overview_still_defaults_a_missing_count_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an explicit None means "unanswerable"; an absent key is unchanged."""
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch)
+    monkeypatch.setattr(
+        status_cli, "_db_section", lambda: {"demo": {"reachable": True}}
+    )
+
+    result = runner.invoke(main_module.app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "no long-running queries" in _flat(result.output)
+
+
+def test_overview_escapes_a_hostile_not_applicable_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The note reaches Rich as markup, so it takes the same treatment as errors."""
+    _disable_envrc(monkeypatch)
+    _patch_sections(monkeypatch)
+    monkeypatch.setattr(
+        status_cli,
+        "_db_section",
+        lambda: {
+            "tgt": {
+                "reachable": True,
+                "long_running": None,
+                "long_running_note": HOSTILE,
+            }
+        },
+    )
+
+    result = runner.invoke(main_module.app, ["status"])
+
+    assert result.exception is None, result.exception
+    assert result.exit_code == 0, result.output
+    assert HOSTILE in _flat(result.output)
+
+
+def test_the_duckdb_probe_lets_go_of_the_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A health check must not sit on DuckDB's single-writer lock.
+
+    Probed on duckdb 1.5.5: while one connection to a file is alive, opening the
+    same file with a *different* configuration raises ConnectionException. So a
+    read-only open succeeding right after the probe is proof the probe closed.
+    """
+    import duckdb
+
+    path = _duckdb_target(monkeypatch, tmp_path)
+
+    assert status_cli._db_section()["ddb"]["reachable"] is True
+
+    duckdb.connect(str(path), read_only=True).close()  # raises if still held
+
+
+def test_the_duckdb_probe_opens_the_target_as_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`reachable` has to mean "a db command would connect", flags included.
+
+    A read-only target opens read-only, and the pair that cannot work — an
+    in-memory database asked for read-only, which DuckDB refuses outright — is
+    reported unreachable rather than smoothed over by opening it some other way.
+    Every command would fail on that target; the dashboard says so first.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DDB_READ_ONLY", "1")
+
+    assert status_cli._db_section()["ddb"]["reachable"] is True
+
+    monkeypatch.setenv("DDB_PATH", ":memory:")
+    section = status_cli._db_section()
+
+    assert section["ddb"]["reachable"] is False
+    assert "read-only" in section["ddb"]["error"]

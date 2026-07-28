@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
+from dataplat.cli._exit import fail
 from dataplat.cli._options import json_option
 from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import (
@@ -28,6 +29,7 @@ from dataplat.cli.db._common import (
     TargetOption,
     UserOption,
     db_session,
+    engine_or_exit,
     limit_option,
     resolve_params_or_exit,
 )
@@ -46,6 +48,8 @@ from dataplat.cli.db._report import (
 from dataplat.cli.db._report import (
     title_card as _title_card,
 )
+from dataplat.core.errors import ValidationError
+from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role import (
     DefaultPrivilege,
@@ -435,19 +439,32 @@ def show_command(
 ) -> None:
     """Entry point for ``dp db role show <name>``."""
     console = Console()
-    conn_params = resolve_params_or_exit(
-        ConnCliParams(
-            target=target,
-            engine=engine,
-            user=user,
-            password=password,
-            database=database,
-            host=host,
-            port=port,
-            sslmode=sslmode,
-            env_prefix=env_prefix,
-        )
+    conn_cli = ConnCliParams(
+        target=target,
+        engine=engine,
+        user=user,
+        password=password,
+        database=database,
+        host=host,
+        port=port,
+        sslmode=sslmode,
+        env_prefix=env_prefix,
     )
+    # Asked before anything is resolved and before a connection is opened,
+    # because the answer is a property of the engine rather than of this
+    # invocation: a DuckDB target then learns *why* — it has no users or roles
+    # at all — instead of the generic "this command speaks libpq" refusal
+    # resolve() would raise a moment later. Each of the four role commands does
+    # this for itself; the block is not shared because `role.py` imports
+    # role_list/role_create/role_drop at the bottom of this file, so a helper
+    # here would make those modules circular.
+    try:
+        require_capability(
+            engine_or_exit(conn_cli), Capability.roles, command="dp db role show"
+        )
+    except ValidationError as exc:
+        fail(exc, console=console)
+    conn_params = resolve_params_or_exit(conn_cli)
 
     resolved_engine = conn_params.engine
     try:

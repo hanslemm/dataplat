@@ -22,6 +22,7 @@ from dataplat.core.errors import (
     ServiceError,
     ValidationError,
 )
+from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
     DEPRECATED_SUFFIX,
@@ -68,10 +69,24 @@ APPLY_LOG_PREFIX = "dbt_orphans"
 PURGE_LOG_PREFIX = "dbt_orphans_purge"
 
 # Log entries keep the historical engine labels so old logs stay revertable.
+# Only the engines this command can act on appear here; _engines_for_target
+# refuses the others before it reaches this mapping.
 _ENGINE_LABELS: dict[SqlEngine, str] = {
     SqlEngine.postgresql: "postgres",
     SqlEngine.redshift: "redshift",
 }
+
+# Why this command needs `rename_with_dependents`, which the capability's own
+# reason ("renames fail when a view depends on the table") does not say. Written
+# once and passed to every check, because all three subcommands — apply, revert
+# and purge — rest on the same mechanism.
+_RENAME_DETAIL = (
+    "dbt-orphans quarantines an orphan by renaming it (and revert renames it "
+    "back), so a dependent view does not merely complicate the rename, it "
+    "refuses the one operation this command is. In a dbt project a view on a "
+    "model is the normal case, not the exception. `purge` then drops what was "
+    "renamed, and a half-working destructive command is worse than none."
+)
 
 TargetOption = typer.Option(
     "all",
@@ -126,11 +141,36 @@ def _find_latest_log(prefix: str) -> str | None:
 
 
 def _engines_for_target(name: str) -> list[tuple[str, SqlEngine, str]]:
-    """Return ``(label, engine, env_prefix)`` per target; label is the log key."""
+    """Return ``(label, engine, env_prefix)`` per target; label is the log key.
+
+    Also the one gate every subcommand passes through, which is why the
+    capability check lives here: apply, revert and purge each start by calling
+    this, and none of them has opened a connection yet.
+
+    An engine that cannot rename a relation a view depends on refuses the *whole*
+    invocation, including a ``--target all`` where other targets would have
+    worked. That is deliberate for this command and only this command: it renames
+    and drops, so "did some of it" is the outcome worth avoiding most, and naming
+    targets explicitly is a cheap way to get the rest done.
+    """
     try:
         targets = resolve_targets(name)
     except ValidationError as exc:
         fail(exc, console=console)
+    for tgt in targets:
+        try:
+            require_capability(
+                tgt.engine,
+                Capability.rename_with_dependents,
+                command="dp db dbt-orphans",
+                detail=_RENAME_DETAIL,
+            )
+        except ValidationError as exc:
+            # Prefixed with the target name, like every other per-target error in
+            # this module: with `all` the engine's reason alone would not say
+            # which target brought the command to a stop. fail() escapes the
+            # brackets before Rich sees them.
+            fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
     return [(_ENGINE_LABELS[t.engine], t.engine, t.env_prefix) for t in targets]
 
 
@@ -459,6 +499,12 @@ def revert_cmd(
     ),
 ) -> None:
     """Undo a previous dbt-orphans run using the audit log."""
+    # Resolved before the log is even located, so an engine that cannot rename
+    # is refused whether or not a previous run left a log behind. The other
+    # order answers "no dbt_orphans log found" to a target where there could
+    # never have been one, sending the reader to look for a missing file
+    # instead of at the engine.
+    engines = _engines_for_target(target)
     if log is None:
         log = _find_latest_log(APPLY_LOG_PREFIX)
         if log is None:
@@ -498,7 +544,7 @@ def revert_cmd(
 
     total = 0
     try:
-        for label, engine, env_prefix in _engines_for_target(target):
+        for label, engine, env_prefix in engines:
             entries = [
                 r for r in renames if isinstance(r, dict) and r.get("database") == label
             ]
