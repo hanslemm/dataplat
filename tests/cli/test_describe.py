@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import duckdb
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -12,6 +15,7 @@ from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.describe import (
     ColumnInfo,
     ConstraintBundle,
+    NotApplicable,
     ObjectKind,
     PartitioningInfo,
     PrivilegeGrant,
@@ -803,3 +807,333 @@ def test_describe_comma_separated_continues_on_failure(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert "Error (missing)" in result.output
     assert "public" in result.output
+
+
+# =========================================================================
+# DuckDB: the report against a real database, and the sections it cannot have.
+#
+# The render tests build descriptions directly, as the rest of this file does.
+# The end-to-end tests open a real DuckDB file, because that is the whole point
+# of the engine being in-process — and because the command's own change was to
+# stop resolving through the libpq-only resolver, which no fixture can prove.
+# =========================================================================
+
+DDB = SqlEngine.duckdb
+
+
+def _duckdb_target(monkeypatch, path: Path) -> None:
+    """Declare a `demo_ddb` target alongside the suite's two libpq ones."""
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,demo_ddb")
+    monkeypatch.setenv("DEMO_DDB_ENGINE", "duckdb")
+    monkeypatch.setenv("DEMO_DDB_PATH", str(path))
+
+
+def _make_duckdb_warehouse(path: Path) -> None:
+    """A small warehouse with one table, one view and one comment each."""
+    connection = duckdb.connect(str(path))
+    connection.execute("CREATE SCHEMA analytics")
+    connection.execute(
+        "CREATE TABLE analytics.users ("
+        " id BIGINT PRIMARY KEY,"
+        " email VARCHAR NOT NULL UNIQUE,"
+        " tags VARCHAR[],"
+        " created_at TIMESTAMP DEFAULT now())"
+    )
+    connection.execute("COMMENT ON TABLE analytics.users IS 'application users'")
+    connection.execute("CREATE INDEX users_created ON analytics.users (created_at)")
+    connection.execute(
+        "CREATE VIEW analytics.recent AS SELECT id, email FROM analytics.users"
+    )
+    connection.execute("INSERT INTO analytics.users VALUES (1, 'a@x.y', ['t'], now())")
+    connection.close()
+
+
+def _duckdb_table_description(
+    not_applicable: list[NotApplicable] | None = None,
+) -> TableDescription:
+    """What describe_table returns for DuckDB: no owner, no size, no grants."""
+    from dataplat.services.db.describe import table_not_applicable
+
+    header = RelationHeader(
+        "analytics",
+        "users",
+        "",
+        None,
+        "application users",
+        2500,
+        None,
+        None,
+        None,
+        None,
+    )
+    return TableDescription(
+        ref=TargetRef(ObjectKind.table, "analytics", "users", 42),
+        header=header,
+        columns=[
+            ColumnInfo(1, "id", "BIGINT", False, None, True, None, None, None),
+            ColumnInfo(2, "tags", "VARCHAR[]", True, None, False, None, None, None),
+        ],
+        constraints=ConstraintBundle(None, [], [], []),
+        indexes=[],
+        privileges=[],
+        triggers=[],
+        policies=[],
+        policies_enabled=False,
+        partitioning=PartitioningInfo(None, None, None, []),
+        redshift_distribution=None,
+        redshift_stats=None,
+        definition=None,
+        not_applicable=(
+            table_not_applicable(DDB) if not_applicable is None else not_applicable
+        ),
+    )
+
+
+def _render(desc, engine: SqlEngine = DDB, width: int = 200) -> str:
+    console = Console(record=True, width=width)
+    render_description(console, desc, engine)
+    return console.export_text()
+
+
+def test_render_names_the_engine_in_the_not_applicable_heading() -> None:
+    """ "Not applicable on DuckDB", from the capability declaration's own label.
+
+    The heading is what makes the rows readable: each reason is phrased "it has
+    no ...", and this is where the reader learns what "it" is.
+    """
+    out = _render(_duckdb_table_description())
+    assert "Not applicable on DuckDB" in out
+    assert "Privileges" in out
+    assert "it has no aclexplode()" in out
+
+
+def test_render_not_applicable_explains_rather_than_lists() -> None:
+    """A reason accompanies every section, so no row reads as a bare "n/a"."""
+    out = _render(_duckdb_table_description())
+    for section, fragment in (
+        ("Size", "row count"),
+        ("Triggers", "no trigger system"),
+        ("Row-level security", "no pg_policy"),
+        ("Partitioning", "pg_inherits"),
+    ):
+        assert section in out, section
+        assert fragment in out, fragment
+
+
+def test_render_not_applicable_is_a_numbered_section_after_the_data() -> None:
+    """It carries a section number like the rest — it is an answer, not a note."""
+    out = _render(_duckdb_table_description())
+    assert "1. Columns" in out
+    assert "2. Not applicable on DuckDB" in out
+
+
+def test_render_omits_the_not_applicable_section_on_postgresql() -> None:
+    """The existing reports must not move: a libpq description carries no notes."""
+    out = _render(_blank_table_description(), SqlEngine.postgresql)
+    assert "Not applicable" not in out
+
+
+def test_render_table_omits_an_empty_owner_and_size() -> None:
+    """DuckDB has no owner to name and no per-relation size to report.
+
+    The title card drops both rather than printing "Owner:" with nothing after
+    it; the Privileges note is where the absence is explained.
+    """
+    out = _render(_duckdb_table_description())
+    assert "Owner" not in out
+    assert "Rows (est)" in out and "2,500" in out
+    # "Size" appears only as a not-applicable section name, never as a metadata
+    # label with a value after it.
+    assert "Size" in out
+    assert "KiB" not in out and "MiB" not in out
+
+
+def test_render_schema_contents_drops_an_all_empty_owner_column() -> None:
+    desc = SchemaDescription(
+        header=SchemaHeader("analytics", "", None),
+        privileges=[],
+        contents=[
+            SchemaContentItem("users", "table", "", 2500, None),
+            SchemaContentItem("recent", "view", "", None, None),
+        ],
+    )
+    out = _render(desc)
+    assert "Contents" in out
+    assert "users" in out and "recent" in out
+    assert "Owner" not in out
+
+
+def test_render_schema_contents_keeps_the_owner_column_when_there_is_one() -> None:
+    desc = SchemaDescription(
+        header=SchemaHeader("public", "dbadmin", None),
+        privileges=[],
+        contents=[SchemaContentItem("users", "table", "dbadmin", 100, 1024)],
+    )
+    out = _render(desc, SqlEngine.postgresql)
+    assert "Owner" in out
+    assert "dbadmin" in out
+
+
+def test_render_not_applicable_text_is_data_not_markup() -> None:
+    """Same rule as every other cell in this report, applied to the new one."""
+    desc = _duckdb_table_description(
+        not_applicable=[NotApplicable("Privileges[/x]", "it has no [bold] catalog")]
+    )
+    out = _render(desc)
+    assert "Privileges[/x]" in out
+    assert "it has no [bold] catalog" in out
+
+
+def test_render_duckdb_view_reports_absent_lineage_rather_than_none() -> None:
+    from dataplat.services.db.describe import view_not_applicable
+
+    desc = ViewDescription(
+        ref=TargetRef(ObjectKind.view, "analytics", "recent", 7),
+        header=RelationHeader(
+            "analytics", "recent", "", None, None, None, None, None, None, None
+        ),
+        columns=[ColumnInfo(1, "id", "BIGINT", True, None, False, None, None, None)],
+        definition=ViewDefinition(
+            sql="CREATE VIEW analytics.recent AS SELECT id FROM analytics.users;",
+            is_updatable=False,
+            check_option=None,
+        ),
+        upstream=[],
+        downstream=[],
+        privileges=[],
+        triggers=[],
+        not_applicable=view_not_applicable(DDB),
+    )
+    out = _render(desc)
+    # No Dependencies section (there is no data), and an explicit reason instead.
+    assert "Reads from" not in out
+    assert "Dependencies" in out
+    assert "pg_rewrite" in out
+    # The definition still renders last, and DuckDB's is a whole CREATE VIEW.
+    assert out.index("Dependencies") < out.index("Definition")
+    assert "CREATE VIEW analytics.recent" in out
+
+
+def test_describe_a_duckdb_table_end_to_end(monkeypatch, tmp_path: Path) -> None:
+    """The command's own change: a DuckDB target used to exit 2 here.
+
+    describe resolved through resolve_params_or_exit, whose return type is the
+    libpq shape, so every DuckDB target was refused before a file was opened.
+    """
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app, ["describe", "--target", "demo_ddb", "analytics.users"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "analytics.users" in result.output
+    assert "application users" in result.output
+    # DuckDB's own type spelling, not format_type()'s 'list'.
+    assert "VARCHAR[]" in result.output
+    assert "now()" in result.output
+    assert "users_created" in result.output
+    assert "Not applicable on DuckDB" in result.output
+
+
+def test_describe_a_duckdb_schema_end_to_end(monkeypatch, tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app, ["describe", "--target", "demo_ddb", "analytics"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "users" in result.output
+    assert "recent" in result.output
+    assert "Not applicable on DuckDB" in result.output
+    # No Highlights section: nothing has a size, so there is nothing to rank.
+    assert "Highlights" not in result.output
+
+
+def test_describe_a_duckdb_view_end_to_end(monkeypatch, tmp_path: Path) -> None:
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app, ["describe", "--target", "demo_ddb", "analytics.recent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "analytics.recent" in result.output
+    assert "CREATE VIEW analytics.recent" in result.output
+
+
+def test_describe_a_duckdb_target_json_carries_the_absences(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """--json is what a wrapper reads, so the absences have to be in there too.
+
+    A consumer seeing `privileges: []` and nothing else would record "no grants".
+    """
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app, ["describe", "--target", "demo_ddb", "--json", "analytics.users"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload[0]["target"] == "analytics.users"
+    assert payload[0]["privileges"] == []
+    sections = {na["section"] for na in payload[0]["not_applicable"]}
+    assert sections == {
+        "Size",
+        "Privileges",
+        "Triggers",
+        "Row-level security",
+        "Partitioning",
+    }
+    assert all(na["reason"] for na in payload[0]["not_applicable"])
+
+
+def test_describe_a_missing_duckdb_object_still_exits_1(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The exit-code contract does not change with the driver."""
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app, ["describe", "--target", "demo_ddb", "analytics.nope"]
+    )
+
+    assert result.exit_code == 1
+    assert "analytics.nope" in result.output
+
+
+def test_describe_refuses_a_libpq_flag_on_a_duckdb_target(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """--host cannot mean anything here, and is refused rather than ignored.
+
+    Exit 3, not 2: the resolver calls this a ConfigError because the settings are
+    what is wrong, and switching describe to resolve_any_params_or_exit is what
+    lets that specific message through — the libpq-only resolver refused every
+    DuckDB target at exit 2 before it could look at the flags.
+    """
+    database = tmp_path / "w.duckdb"
+    _make_duckdb_warehouse(database)
+    _duckdb_target(monkeypatch, database)
+
+    result = CliRunner().invoke(
+        db_app,
+        ["describe", "--target", "demo_ddb", "--host", "localhost", "analytics"],
+    )
+
+    assert result.exit_code == ExitCode.CONFIG
+    assert "--host" in result.output
+    assert "duckdb target" in result.output

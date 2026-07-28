@@ -3,6 +3,39 @@
 Returns plain dataclasses so the CLI layer can render them without being
 coupled to psycopg. Each fetcher takes an open cursor; callers manage the
 connection lifecycle.
+
+Three dialects live here. PostgreSQL and Redshift are servers reached over
+libpq; DuckDB is a database file opened in this process, and it is not a
+smaller PostgreSQL. The ``_*_SQL_DUCKDB`` constants exist where they do because
+each was measured against duckdb 1.5.5 first -- reuse was the goal, and this is
+what survived it:
+
+- **Placeholders are part of the statement.** DuckDB binds ``?`` where psycopg
+  binds ``%s``, and :class:`~dataplat.cli.db._common.DuckDbCursor` refuses to
+  translate (rewriting means deciding which ``%`` are literals). So even a body
+  that is portable is spelled twice. ``pg_namespace`` and ``pg_class`` are the
+  only two -- see :func:`resolve_target`.
+- **Several pg_catalog entries are present but empty or constant, which is
+  worse than absent.** ``pg_attrdef`` exists and holds no rows, so the
+  PostgreSQL columns query silently loses every ``DEFAULT``.
+  ``pg_get_constraintdef()`` returns NULL. ``pg_constraint.conname`` holds the
+  constraint *text* (``'PRIMARY KEY(id)'``) rather than a name, its ``conkey``
+  is 0-based, and ``confrelid`` is always 0. ``pg_class.relrowsecurity`` is
+  false for every relation. None of these raise, so the DuckDB path uses the
+  ``duckdb_*()`` catalogs instead, which carry the real answers.
+- **format_type() loses the type.** ``pg_catalog.format_type()`` renders
+  ``VARCHAR[]`` as ``list``, ``STRUCT(a INTEGER, b VARCHAR)`` as ``struct``,
+  ``MAP(VARCHAR, INTEGER)`` as ``map`` and ``JSON`` as ``varchar``.
+  ``duckdb_columns().data_type`` gives DuckDB's own spelling back exactly.
+- **Genuinely absent, so refused rather than emulated:** ``pg_trigger``,
+  ``pg_policy``, ``pg_inherits``, ``pg_partitioned_table``, ``pg_matviews``,
+  ``pg_rewrite``, ``pg_roles``, ``pg_default_acl``,
+  ``information_schema.role_table_grants``, ``aclexplode()``,
+  ``pg_get_userbyid()``, ``pg_get_indexdef()``, ``quote_ident()``,
+  ``generate_subscripts()`` and the ``pg_*_size()`` family. Those sections are
+  reported as :class:`NotApplicable` rather than as empty results -- an empty
+  privileges table reads as "nobody has access", which is a different and false
+  statement (CONTRIBUTING: prefer "unknown" to a confident falsehood).
 """
 
 from __future__ import annotations
@@ -11,6 +44,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from dataplat.services.db.capabilities import Capability, capabilities_for
 from dataplat.services.db.connection import SqlEngine
 
 
@@ -25,6 +59,110 @@ class ObjectKind(str, Enum):
 
 class TargetNotFoundError(Exception):
     """Raised when the target schema/object does not exist."""
+
+
+@dataclass(frozen=True)
+class NotApplicable:
+    """A report section the target engine has no concept of.
+
+    The distinction this carries is the whole point: a *missing* Triggers
+    section and an *empty* one say different things, and only one of them is
+    true on DuckDB. Rendering nothing would tell the reader "no triggers are
+    configured"; rendering an empty privileges table would tell them "nobody
+    has access". Both are false about an engine that has no triggers and no
+    users, so the reason travels with the absence.
+    """
+
+    # Matches the heading the section would have had, so the reader can connect
+    # "Privileges" here to the Privileges section they expected.
+    section: str
+    # Phrased as the tail of "<engine> ...", present tense, no trailing period.
+    reason: str
+
+
+def _duckdb_reason(capability: Capability) -> str:
+    """DuckDB's own declared reason for lacking ``capability``.
+
+    Sourced from :mod:`dataplat.services.db.capabilities` rather than restated,
+    so ``dp db role list`` refusing a DuckDB target and this report explaining
+    an absent section give the same reason in the same words.
+    """
+    return capabilities_for(SqlEngine.duckdb).support(capability).reason
+
+
+# Reasons with no capability behind them, because no command turns on them --
+# they are report sections, not whole commands. Each was probed on duckdb 1.5.5,
+# and each is phrased like a capability reason ("it has no ...") so a section
+# note and a command refusal read in one voice.
+_DUCKDB_NO_RELATION_SIZE = (
+    "it reports no per-relation byte size — pg_total_relation_size() does not "
+    "exist, and duckdb_tables().estimated_size is a row count rather than a "
+    "size, so reading it as bytes would be wrong by orders of magnitude"
+)
+_DUCKDB_NO_TRIGGERS = "it has no trigger system at all, and no pg_trigger catalog"
+_DUCKDB_NO_RLS = (
+    "it has no row-level security: there is no pg_policy catalog, and "
+    "pg_class.relrowsecurity is false for every relation rather than reflecting "
+    "a setting that could be turned on"
+)
+_DUCKDB_NO_PARTITIONS = (
+    "it has no declarative partitioning: neither pg_inherits nor "
+    "pg_partitioned_table exists, so no relation can be a partition or a parent"
+)
+_DUCKDB_NO_VIEW_LINEAGE = (
+    "it has no pg_rewrite catalog, and duckdb_dependencies() records only "
+    "foreign-key and index dependencies, so what a view reads and what reads it "
+    "cannot be listed"
+)
+_DUCKDB_NO_DEFAULT_PRIVILEGES = (
+    "it has no pg_default_acl, and nothing to grant to: future objects cannot "
+    "inherit privileges an engine without users never had"
+)
+
+
+# Why only DuckDB appears below: Redshift lacks several of these catalogs too
+# and has always reported them as silently empty. Saying so there is the same
+# one-line addition -- the mechanism takes an engine -- but it changes the
+# output of a path with no integration suite, so it belongs to whoever can
+# state the evidence for it (CONTRIBUTING, "Dialect changes"). This function
+# deliberately answers [] for it rather than guessing.
+def table_not_applicable(engine: SqlEngine) -> list[NotApplicable]:
+    """Sections a table/matview report cannot have on ``engine``."""
+    if engine is not SqlEngine.duckdb:
+        return []
+    return [
+        NotApplicable("Size", _DUCKDB_NO_RELATION_SIZE),
+        NotApplicable("Privileges", _duckdb_reason(Capability.acl_introspection)),
+        NotApplicable("Triggers", _DUCKDB_NO_TRIGGERS),
+        NotApplicable("Row-level security", _DUCKDB_NO_RLS),
+        NotApplicable("Partitioning", _DUCKDB_NO_PARTITIONS),
+    ]
+
+
+def view_not_applicable(engine: SqlEngine) -> list[NotApplicable]:
+    """Sections a view report cannot have on ``engine``."""
+    if engine is not SqlEngine.duckdb:
+        return []
+    return [
+        NotApplicable("Privileges", _duckdb_reason(Capability.acl_introspection)),
+        NotApplicable("Dependencies", _DUCKDB_NO_VIEW_LINEAGE),
+        NotApplicable("Triggers", _DUCKDB_NO_TRIGGERS),
+    ]
+
+
+def schema_not_applicable(engine: SqlEngine) -> list[NotApplicable]:
+    """Sections a schema report cannot have on ``engine``."""
+    if engine is not SqlEngine.duckdb:
+        return []
+    return [
+        NotApplicable("Privileges", _duckdb_reason(Capability.acl_introspection)),
+        NotApplicable("Default privileges", _DUCKDB_NO_DEFAULT_PRIVILEGES),
+        NotApplicable("Size", _DUCKDB_NO_RELATION_SIZE),
+        # Listed because a reader scanning Contents for their matviews needs to
+        # know none can exist here -- resolve_target cannot even return
+        # ObjectKind.matview on DuckDB, since relkind 'm' never occurs.
+        NotApplicable("Materialized views", _duckdb_reason(Capability.matview_catalog)),
+    ]
 
 
 @dataclass(frozen=True)
@@ -53,17 +191,48 @@ def parse_target(target: str) -> tuple[str, str | None]:
     raise ValueError('target must be "<schema>" or "<schema>.<object>"')
 
 
+# The two statements whose body really is portable to DuckDB: pg_namespace and
+# pg_class are present there with real relkind values ('r', 'v', 'S', 'i' -- no
+# 'p' and no 'm', so a partitioned table or a matview simply never resolves).
+# They are still spelled twice because the placeholder is part of the
+# statement: DuckDB binds '?', psycopg binds '%s', and nothing in this codebase
+# translates between them (dataplat/cli/db/_common.py explains why not).
+_RESOLVE_SCHEMA_SQL = "SELECT 1 FROM pg_namespace WHERE nspname = %s"
+_RESOLVE_SCHEMA_SQL_DUCKDB = "SELECT 1 FROM pg_namespace WHERE nspname = ?"
+
+_RESOLVE_RELATION_SQL = """
+SELECT c.oid, c.relkind
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relname = %s
+"""
+
+_RESOLVE_RELATION_SQL_DUCKDB = """
+SELECT c.oid, c.relkind
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ? AND c.relname = ?
+"""
+
+
 def resolve_target(cursor: Any, engine: SqlEngine, target: str) -> TargetRef:
     """Resolve a dotted target into a ``TargetRef`` with kind + oid.
 
-    Queries ``pg_namespace`` for schemas and ``pg_class`` for relations.
+    Queries ``pg_namespace`` for schemas and ``pg_class`` for relations. Both
+    exist on DuckDB, and the oid it reports there is the same one every
+    ``duckdb_*()`` catalog keys on (``duckdb_tables().table_oid``,
+    ``duckdb_views().view_oid``, ``duckdb_indexes().index_oid`` and
+    ``duckdb_constraints().table_oid`` all equal ``pg_class.oid`` -- probed on
+    1.5.5), which is what lets the fetchers below keep taking an oid.
+
     Raises ``TargetNotFoundError`` with a user-facing message on miss.
     """
     schema, obj = parse_target(target)
+    is_duckdb = engine is SqlEngine.duckdb
 
     if obj is None:
         cursor.execute(
-            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            _RESOLVE_SCHEMA_SQL_DUCKDB if is_duckdb else _RESOLVE_SCHEMA_SQL,
             (schema,),
         )
         row = cursor.fetchone()
@@ -72,12 +241,7 @@ def resolve_target(cursor: Any, engine: SqlEngine, target: str) -> TargetRef:
         return TargetRef(kind=ObjectKind.schema, schema=schema, name=None, oid=None)
 
     cursor.execute(
-        """
-        SELECT c.oid, c.relkind
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = %s AND c.relname = %s
-        """,
+        _RESOLVE_RELATION_SQL_DUCKDB if is_duckdb else _RESOLVE_RELATION_SQL,
         (schema, obj),
     )
     row = cursor.fetchone()
@@ -179,11 +343,74 @@ ORDER BY a.attnum
 """
 
 
+# Not the pg_attribute form above, and not because it errors -- because it
+# would answer, wrongly, three times over (all probed on duckdb 1.5.5):
+#
+#   - pg_attrdef exists and is *empty*, so every LEFT JOIN against it yields
+#     NULL and a column declared `DEFAULT now()` would report no default.
+#     duckdb_columns().column_default has it.
+#   - pg_catalog.format_type() flattens DuckDB's own types: VARCHAR[] becomes
+#     'list', STRUCT(a INTEGER, b VARCHAR) becomes 'struct', MAP(...) becomes
+#     'map', JSON becomes 'varchar'. duckdb_columns().data_type round-trips the
+#     declared spelling.
+#   - quote_ident() does not exist, so the PostgreSQL query's FK subquery cannot
+#     even parse.
+#
+# The two correlated subqueries replace that LATERAL: DuckDB has no
+# pg_constraint worth reading (conkey is 0-based and confrelid is always 0), and
+# duckdb_constraints() names the columns directly. list_position() pairs a local
+# column with its referenced one positionally, which is what conkey/confkey do
+# on PostgreSQL. The referenced table is qualified with the constraint's *own*
+# schema because DuckDB refuses a cross-schema foreign key outright ("Creating
+# foreign keys across different schemas or catalogs is not supported"), so there
+# is no other schema it could be in. LIMIT 1 matches the PostgreSQL query's
+# behaviour for a column carried by more than one foreign key.
+_COLUMNS_SQL_DUCKDB = """
+SELECT
+    col.column_index AS ordinal,
+    col.column_name AS name,
+    col.data_type AS data_type,
+    col.is_nullable AS nullable,
+    col.column_default AS default_expr,
+    EXISTS (
+        SELECT 1
+        FROM duckdb_constraints() pk
+        WHERE pk.table_oid = col.table_oid
+          AND pk.constraint_type = 'PRIMARY KEY'
+          AND list_contains(pk.constraint_column_names, col.column_name)
+    ) AS is_primary_key,
+    (SELECT fk.schema_name || '.' || fk.referenced_table
+       FROM duckdb_constraints() fk
+      WHERE fk.table_oid = col.table_oid
+        AND fk.constraint_type = 'FOREIGN KEY'
+        AND list_contains(fk.constraint_column_names, col.column_name)
+      LIMIT 1) AS fk_target_table,
+    (SELECT fk.referenced_column_names[
+                list_position(fk.constraint_column_names, col.column_name)]
+       FROM duckdb_constraints() fk
+      WHERE fk.table_oid = col.table_oid
+        AND fk.constraint_type = 'FOREIGN KEY'
+        AND list_contains(fk.constraint_column_names, col.column_name)
+      LIMIT 1) AS fk_target_column,
+    col.comment AS comment
+FROM duckdb_columns() col
+WHERE col.table_oid = ?
+ORDER BY col.column_index
+"""
+
+
 def fetch_columns(cursor: Any, oid: int, engine: SqlEngine) -> list[ColumnInfo]:
-    """Return ordinal-ordered columns for the given relation oid."""
-    sql = (
-        _COLUMNS_SQL_REDSHIFT if engine == SqlEngine.redshift else _COLUMNS_SQL_POSTGRES
-    )
+    """Return ordinal-ordered columns for the given relation oid.
+
+    Covers views as well as tables on every engine: ``duckdb_columns()`` lists a
+    view's columns too, and reports no primary or foreign key for them.
+    """
+    if engine is SqlEngine.duckdb:
+        sql = _COLUMNS_SQL_DUCKDB
+    elif engine is SqlEngine.redshift:
+        sql = _COLUMNS_SQL_REDSHIFT
+    else:
+        sql = _COLUMNS_SQL_POSTGRES
     cursor.execute(sql, (oid,))
     return [ColumnInfo(*row) for row in cursor.fetchall()]
 
@@ -259,6 +486,60 @@ ORDER BY CASE c.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 ELSE 3 E
 """
 
 
+# DuckDB has a pg_constraint, and it is a trap rather than a shortcut: conname
+# holds the constraint *text* ('PRIMARY KEY(id)') instead of a name, conkey is
+# 0-based where PostgreSQL's is 1-based, confrelid is always 0 so a foreign key's
+# target is unreachable, and pg_get_constraintdef() returns NULL. Every one of
+# those answers looks valid. duckdb_constraints() carries the real names,
+# columns and targets, so it is what this reads.
+#
+# The column list matches _CONSTRAINTS_SQL position for position, so
+# fetch_constraints unpacks both dialects the same way. Three tails are constant
+# rather than read:
+#
+#   - confdeltype/confupdtype are NULL, which _FK_ACTION_MAP maps to NO ACTION.
+#     That is not a fallback: DuckDB *refuses* referential actions at parse time
+#     ("FOREIGN KEY constraints cannot use CASCADE, SET NULL or SET DEFAULT"),
+#     so NO ACTION is the only thing a DuckDB foreign key can do.
+#   - deferrable is false; DuckDB has no DEFERRABLE constraints.
+#
+# NOT NULL is excluded on purpose. duckdb_constraints() reports it as a
+# constraint row, but PostgreSQL keeps it in pg_attribute.attnotnull and this
+# report shows it in the Columns section -- listing it in both places for one
+# engine only would make the same table look different per dialect.
+_CONSTRAINTS_SQL_DUCKDB = """
+SELECT
+    con.constraint_name AS name,
+    CASE con.constraint_type
+        WHEN 'PRIMARY KEY' THEN 'p'
+        WHEN 'UNIQUE' THEN 'u'
+        WHEN 'FOREIGN KEY' THEN 'f'
+        WHEN 'CHECK' THEN 'c'
+    END AS kind,
+    con.constraint_text AS definition,
+    con.constraint_column_names AS local_columns,
+    CASE WHEN con.constraint_type = 'FOREIGN KEY'
+         THEN con.schema_name || '.' || con.referenced_table
+    END AS referenced_table,
+    CASE WHEN con.constraint_type = 'FOREIGN KEY'
+         THEN con.referenced_column_names
+    END AS referenced_columns,
+    NULL::VARCHAR AS confdeltype,
+    NULL::VARCHAR AS confupdtype,
+    false AS deferrable
+FROM duckdb_constraints() con
+WHERE con.table_oid = ?
+  AND con.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')
+ORDER BY CASE con.constraint_type
+             WHEN 'PRIMARY KEY' THEN 0
+             WHEN 'UNIQUE' THEN 1
+             WHEN 'FOREIGN KEY' THEN 2
+             ELSE 3
+         END,
+         con.constraint_name
+"""
+
+
 @dataclass(frozen=True)
 class IndexInfo:
     name: str
@@ -308,11 +589,50 @@ ORDER BY ic.relname
 """
 
 
+# pg_index exists on DuckDB but carries no key columns (indkey is NULL), and
+# neither pg_get_indexdef() nor generate_subscripts() nor pg_relation_size()
+# exists, so the PostgreSQL query cannot run at all. duckdb_indexes() has what
+# is left.
+#
+# `expressions` is a VARCHAR holding DuckDB's own rendering of a list --
+# '[lo, hi]' for two plain columns, '[''(concat("a", b))'']' for one expression
+# that needs quoting. Casting it back to VARCHAR[] hands the parsing to the
+# engine that wrote it, which is exact where splitting on ', ' would tear
+# `concat(a, b)` in half. COALESCE keeps the column non-NULL so IndexInfo.columns
+# is always a list.
+#
+# Two honest constants: 'art' is the only index type DuckDB has (pg_am holds the
+# single row 'art', an adaptive radix tree), and predicate is NULL because there
+# are no partial indexes -- pg_index.indpred is NULL for every row.
+#
+# What is *absent* here is worth knowing: DuckDB does not expose the indexes it
+# builds for PRIMARY KEY and UNIQUE constraints. duckdb_tables().index_count
+# counts them, duckdb_indexes() does not list them, so this section shows
+# explicitly created indexes and the Constraints section shows the rest. is_unique
+# therefore reflects CREATE UNIQUE INDEX, and is_primary is false throughout.
+_INDEXES_SQL_DUCKDB = """
+SELECT
+    idx.index_name AS name,
+    COALESCE(idx.expressions::VARCHAR[], []::VARCHAR[]) AS columns,
+    idx.is_unique AS is_unique,
+    idx.is_primary AS is_primary,
+    'art' AS method,
+    NULL::BIGINT AS size_bytes,
+    NULL::VARCHAR AS predicate
+FROM duckdb_indexes() idx
+WHERE idx.table_oid = ?
+ORDER BY idx.is_primary DESC, idx.is_unique DESC, idx.index_name
+"""
+
+
 def fetch_indexes(cursor: Any, oid: int, engine: SqlEngine) -> list[IndexInfo]:
     """Return indexes for the given relation oid."""
-    sql = (
-        _INDEXES_SQL_REDSHIFT if engine == SqlEngine.redshift else _INDEXES_SQL_POSTGRES
-    )
+    if engine is SqlEngine.duckdb:
+        sql = _INDEXES_SQL_DUCKDB
+    elif engine is SqlEngine.redshift:
+        sql = _INDEXES_SQL_REDSHIFT
+    else:
+        sql = _INDEXES_SQL_POSTGRES
     cursor.execute(sql, (oid,))
     return [IndexInfo(*row) for row in cursor.fetchall()]
 
@@ -409,13 +729,58 @@ WHERE c.oid = %s
 """
 
 
+# The UNION is what makes one query serve both relation kinds: DuckDB keeps
+# tables and views in separate catalogs, and this fetcher is called for each.
+# Exactly one arm can match, since an oid identifies one relation.
+#
+# Four fields are constant, and each is a withdrawn claim rather than a guess
+# (CONTRIBUTING, evidence class 3):
+#
+#   - owner is '' because DuckDB has no users. pg_tables.tableowner and
+#     pg_views.viewowner do say 'duckdb', but printing "Owner: duckdb" invites
+#     the reader to look for the other users, and there are none; the report
+#     says so once, in its Privileges note, instead of implying a user model on
+#     every line. The renderer omits an empty owner.
+#   - tablespace is NULL: DuckDB has no tablespaces (pg_tablespace holds one
+#     synthetic 'pg_default' row and reltablespace is always 0).
+#   - the four size columns are NULL. duckdb_tables().estimated_size is a *row
+#     count*, not a byte count -- probed on 1.5.5, a 10,000-row table reports
+#     10000 while its file is 1.5 MiB -- so it feeds row_estimate here and
+#     nothing feeds size. NotApplicable("Size", ...) says why in the report.
+#
+# row_estimate is left NULL for a view rather than read: DuckDB's
+# pg_class.reltuples is 0.0 for every view, which would render as "0 rows".
+_RELATION_HEADER_SQL_DUCKDB = """
+SELECT
+    t.schema_name AS schema,
+    t.table_name AS name,
+    '' AS owner,
+    NULL::VARCHAR AS tablespace,
+    t.comment AS comment,
+    t.estimated_size::BIGINT AS row_estimate,
+    NULL::BIGINT AS total_size,
+    NULL::BIGINT AS table_size,
+    NULL::BIGINT AS index_size,
+    NULL::BIGINT AS toast_size
+FROM duckdb_tables() t
+WHERE t.table_oid = ?
+UNION ALL
+SELECT
+    v.schema_name, v.view_name, '', NULL::VARCHAR, v.comment,
+    NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::BIGINT
+FROM duckdb_views() v
+WHERE v.view_oid = ?
+"""
+
+
 def fetch_relation_header(cursor: Any, oid: int, engine: SqlEngine) -> RelationHeader:
-    sql = (
-        _RELATION_HEADER_SQL_REDSHIFT
-        if engine == SqlEngine.redshift
-        else _RELATION_HEADER_SQL_POSTGRES
-    )
-    cursor.execute(sql, (oid,))
+    if engine is SqlEngine.duckdb:
+        # Two placeholders, one per UNION arm -- see _RELATION_HEADER_SQL_DUCKDB.
+        cursor.execute(_RELATION_HEADER_SQL_DUCKDB, (oid, oid))
+    elif engine is SqlEngine.redshift:
+        cursor.execute(_RELATION_HEADER_SQL_REDSHIFT, (oid,))
+    else:
+        cursor.execute(_RELATION_HEADER_SQL_POSTGRES, (oid,))
     row = cursor.fetchone()
     if row is None:
         raise TargetNotFoundError(f"relation with oid {oid} not found")
@@ -438,8 +803,20 @@ ORDER BY grantee, privilege
 
 
 def fetch_relation_privileges(
-    cursor: Any, schema: str, name: str
+    cursor: Any, schema: str, name: str, engine: SqlEngine = SqlEngine.postgresql
 ) -> list[PrivilegeGrant]:
+    """Return grants on the relation, including a synthetic OWNER row.
+
+    ``engine`` decides only whether the engine has a grant catalog at all, which
+    is why it defaults to a libpq engine: :data:`_PRIVILEGES_SQL` runs unchanged
+    on both PostgreSQL and Redshift. DuckDB has neither
+    ``information_schema.role_table_grants`` nor ``pg_get_userbyid()``, and no
+    users to be grantees, so it gets ``[]`` and the caller pairs that with
+    :func:`table_not_applicable`'s Privileges entry -- an empty grant table on
+    its own would read as "nobody has access".
+    """
+    if engine is SqlEngine.duckdb:
+        return []
     cursor.execute(_PRIVILEGES_SQL, (schema, name, schema, name))
     return [PrivilegeGrant(*row) for row in cursor.fetchall()]
 
@@ -489,7 +866,13 @@ ORDER BY t.tgname
 
 
 def fetch_triggers(cursor: Any, oid: int, engine: SqlEngine) -> list[TriggerInfo]:
-    if engine == SqlEngine.redshift:
+    """Return non-internal triggers on the relation.
+
+    Empty without a query on Redshift (no ``pg_trigger``) and on DuckDB (no
+    trigger system at all -- see :func:`table_not_applicable`, which is what
+    tells the reader those two emptinesses mean different things).
+    """
+    if engine in {SqlEngine.redshift, SqlEngine.duckdb}:
         return []
     cursor.execute(_TRIGGERS_SQL, (oid,))
     return [TriggerInfo(*row) for row in cursor.fetchall()]
@@ -517,7 +900,14 @@ ORDER BY pol.polname
 def fetch_policies(
     cursor: Any, oid: int, engine: SqlEngine
 ) -> tuple[list[PolicyInfo], bool]:
-    if engine == SqlEngine.redshift:
+    """Return row-level security policies and whether RLS is enabled.
+
+    DuckDB is refused rather than probed even though ``pg_class.relrowsecurity``
+    happens to exist there: it is false for every relation because there is no
+    row-level security to enable, so reading it would turn a missing feature into
+    a report saying "RLS: disabled" -- which implies it could be enabled.
+    """
+    if engine in {SqlEngine.redshift, SqlEngine.duckdb}:
         return [], False
     cursor.execute(_RLS_ENABLED_SQL, (oid,))
     row = cursor.fetchone()
@@ -559,7 +949,13 @@ ORDER BY cc.relname
 
 
 def fetch_partitioning(cursor: Any, oid: int, engine: SqlEngine) -> PartitioningInfo:
-    if engine == SqlEngine.redshift:
+    """Return the relation's place in a partition tree, if any.
+
+    Four statements on PostgreSQL, none on Redshift or DuckDB: DuckDB has
+    neither ``pg_inherits`` nor ``pg_partitioned_table`` nor
+    ``pg_get_partkeydef()``, because it has no declarative partitioning.
+    """
+    if engine in {SqlEngine.redshift, SqlEngine.duckdb}:
         return PartitioningInfo(
             parent=None, strategy=None, partition_key=None, children=[]
         )
@@ -608,6 +1004,19 @@ WHERE c.oid = %s
 _VIEW_DEFINITION_SQL_REDSHIFT = "SELECT pg_get_viewdef(%s, true) AS sql"
 
 
+# DuckDB has a pg_get_viewdef(), but only the one-argument macro: the
+# two-argument call above fails with "Macro pg_get_viewdef() does not support the
+# supplied arguments". duckdb_views().sql is the same text without the
+# arity guess, and it is the catalog DuckDB documents for the purpose.
+#
+# One difference the reader will notice: DuckDB returns the whole
+# `CREATE VIEW x AS SELECT ...;` statement where PostgreSQL returns the bare
+# SELECT. It is passed through verbatim -- it is the engine's own answer, and
+# trimming a prefix off catalog text is how a report starts lying about what is
+# stored.
+_VIEW_DEFINITION_SQL_DUCKDB = "SELECT v.sql FROM duckdb_views() v WHERE v.view_oid = ?"
+
+
 _DEPS_UPSTREAM_SQL = """
 SELECT DISTINCT
     quote_ident(sn.nspname) || '.' || quote_ident(sc.relname) AS name,
@@ -650,7 +1059,20 @@ _KIND_LABEL = {
 
 
 def fetch_view_definition(cursor: Any, oid: int, engine: SqlEngine) -> ViewDefinition:
-    """Return the SQL definition + updatability info for a view/matview."""
+    """Return the SQL definition + updatability info for a view/matview.
+
+    ``is_updatable`` and ``check_option`` are constant on the two non-PostgreSQL
+    dialects rather than queried. On DuckDB that is a read, not an assumption:
+    ``information_schema.views`` exists there and answers ``is_updatable='NO'``
+    and ``check_option='NONE'`` for every view, because DuckDB has neither
+    updatable views nor ``WITH CHECK OPTION``.
+    """
+    if engine is SqlEngine.duckdb:
+        cursor.execute(_VIEW_DEFINITION_SQL_DUCKDB, (oid,))
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            raise TargetNotFoundError(f"view with oid {oid} not found")
+        return ViewDefinition(sql=row[0], is_updatable=False, check_option=None)
     if engine == SqlEngine.redshift:
         cursor.execute(_VIEW_DEFINITION_SQL_REDSHIFT, (oid,))
         row = cursor.fetchone()
@@ -684,8 +1106,14 @@ def fetch_view_definition(cursor: Any, oid: int, engine: SqlEngine) -> ViewDefin
 def fetch_dependencies(
     cursor: Any, oid: int, direction: str, engine: SqlEngine
 ) -> list[DependencyEdge]:
-    """Return upstream or downstream dependency edges for the given relation."""
-    if engine == SqlEngine.redshift:
+    """Return upstream or downstream dependency edges for the given relation.
+
+    Both directions read ``pg_rewrite``, which neither Redshift nor DuckDB has.
+    DuckDB's ``duckdb_dependencies()`` is not a substitute: probed on 1.5.5 it
+    records foreign-key and index dependencies only, and a view that reads a
+    table produces no row at all -- so there is nothing to build lineage from.
+    """
+    if engine in {SqlEngine.redshift, SqlEngine.duckdb}:
         return []
     if direction == "upstream":
         sql = _DEPS_UPSTREAM_SQL
@@ -726,6 +1154,24 @@ WHERE n.nspname = %s
 """
 
 
+# pg_namespace exists on DuckDB, but nspowner is always 0 and there is no
+# pg_get_userbyid() to resolve it with; obj_description() exists and returns NULL
+# for everything. duckdb_schemas() has the comment column instead -- always NULL
+# today, because DuckDB refuses COMMENT ON SCHEMA ("Adding comments to schemas is
+# not implemented"), so this reads it rather than hardcoding None: the day that
+# lands, the report picks it up.
+#
+# The database_name filter is load-bearing. duckdb_schemas() lists every attached
+# catalog, and 'main' exists in the user database, in 'system' and in 'temp'; the
+# unfiltered query would return three rows for it and the header would describe
+# whichever came first.
+_SCHEMA_HEADER_SQL_DUCKDB = """
+SELECT s.schema_name, '' AS owner, s.comment
+FROM duckdb_schemas() s
+WHERE s.schema_name = ? AND s.database_name = current_database()
+"""
+
+
 _SCHEMA_CONTENTS_SQL_POSTGRES = """
 SELECT
     c.relname AS name,
@@ -754,6 +1200,35 @@ FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = %s
   AND c.relkind IN ('r','v','m','S','f')
+ORDER BY c.relkind, c.relname
+"""
+
+
+# The closest the DuckDB path comes to reusing a PostgreSQL query: pg_class here
+# is genuinely right, so this keeps its shape and drops the two expressions
+# DuckDB cannot evaluate.
+#
+#   - pg_get_userbyid() does not exist and there is no owner to resolve -- see
+#     _RELATION_HEADER_SQL_DUCKDB on why that becomes '' rather than 'duckdb'.
+#   - pg_total_relation_size() does not exist, and nothing replaces it per
+#     relation; NotApplicable("Size", ...) is what tells the reader so.
+#
+# reltuples is real here (it matches duckdb_tables().estimated_size row for row)
+# but is only reported for a table: DuckDB reports 0.0 for a view, which would
+# render as "0 rows". The relkind filter drops 'm', 'p' and 'f' -- DuckDB has no
+# materialized views, no partitioned tables and no foreign tables -- and 'i',
+# which it does have and which never belonged in a schema listing.
+_SCHEMA_CONTENTS_SQL_DUCKDB = """
+SELECT
+    c.relname AS name,
+    c.relkind AS kind,
+    '' AS owner,
+    CASE WHEN c.relkind = 'r' THEN c.reltuples::BIGINT END AS row_estimate,
+    NULL::BIGINT AS size_bytes
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ?
+  AND c.relkind IN ('r', 'v', 'S')
 ORDER BY c.relkind, c.relname
 """
 
@@ -870,9 +1345,19 @@ ORDER BY object_type, grantee
 """
 
 
-def fetch_schema_header(cursor: Any, schema: str) -> SchemaHeader:
-    """Return the schema header (name, owner, comment)."""
-    cursor.execute(_SCHEMA_HEADER_SQL, (schema,))
+def fetch_schema_header(
+    cursor: Any, schema: str, engine: SqlEngine = SqlEngine.postgresql
+) -> SchemaHeader:
+    """Return the schema header (name, owner, comment).
+
+    ``engine`` decides only whether the engine has a schema owner to name, which
+    is why it defaults to a libpq engine: :data:`_SCHEMA_HEADER_SQL` runs
+    unchanged on PostgreSQL and Redshift, and only DuckDB needs the other query.
+    """
+    if engine is SqlEngine.duckdb:
+        cursor.execute(_SCHEMA_HEADER_SQL_DUCKDB, (schema,))
+    else:
+        cursor.execute(_SCHEMA_HEADER_SQL, (schema,))
     row = cursor.fetchone()
     if row is None:
         raise TargetNotFoundError(f'schema "{schema}" not found')
@@ -883,7 +1368,9 @@ def fetch_schema_contents(
     cursor: Any, schema: str, engine: SqlEngine
 ) -> list[SchemaContentItem]:
     """Return relations contained in the schema, labelled by kind."""
-    if engine == SqlEngine.redshift:
+    if engine is SqlEngine.duckdb:
+        cursor.execute(_SCHEMA_CONTENTS_SQL_DUCKDB, (schema,))
+    elif engine == SqlEngine.redshift:
         cursor.execute(_SCHEMA_CONTENTS_SQL_REDSHIFT, (schema, schema, schema))
     else:
         cursor.execute(_SCHEMA_CONTENTS_SQL_POSTGRES, (schema,))
@@ -910,7 +1397,15 @@ def fetch_schema_privileges(
     ``with_grant_option`` follows the server's rule rather than the ACL bit, so
     an owner reports the grant option it really has -- the same answer
     :func:`fetch_relation_privileges` gets from ``information_schema``.
+
+    DuckDB gets ``[]`` and no query. It has ``pg_namespace.nspacl`` (always NULL)
+    but no ``aclexplode()`` to expand one and no ``pg_roles`` to scan, and its
+    ``has_schema_privilege()`` returns true unconditionally for the single
+    implicit user -- so the Redshift scan would report exactly one grantee that
+    means nothing. :func:`schema_not_applicable` says that instead.
     """
+    if engine is SqlEngine.duckdb:
+        return []
     if engine == SqlEngine.redshift:
         cursor.execute(_SCHEMA_PRIVILEGES_SQL_REDSHIFT, (schema, schema))
     else:
@@ -939,9 +1434,10 @@ def fetch_schema_default_privileges(
     """Return default privileges defined for future objects in the schema.
 
     Reads ``pg_default_acl`` aggregated by (grantee, object type, grantor role).
-    Returns ``[]`` on Redshift (lacks ``pg_default_acl`` semantics).
+    Returns ``[]`` on Redshift (lacks ``pg_default_acl`` semantics) and on DuckDB
+    (no ``pg_default_acl``, and no roles for a default grant to name).
     """
-    if engine == SqlEngine.redshift:
+    if engine in {SqlEngine.redshift, SqlEngine.duckdb}:
         return []
     cursor.execute(_SCHEMA_DEFAULT_PRIVILEGES_SQL, (schema,))
     return [
@@ -1044,6 +1540,10 @@ class TableDescription:
     redshift_distribution: RedshiftDistribution | None
     redshift_stats: RedshiftTableStats | None
     definition: str | None  # mview only
+    # Sections this engine has no concept of. Defaulted so a libpq description
+    # is built exactly as before, and empty for those engines today -- see
+    # table_not_applicable.
+    not_applicable: list[NotApplicable] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1056,6 +1556,7 @@ class ViewDescription:
     downstream: list[DependencyEdge]
     privileges: list[PrivilegeGrant]
     triggers: list[TriggerInfo]
+    not_applicable: list[NotApplicable] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1064,6 +1565,7 @@ class SchemaDescription:
     privileges: list[PrivilegeGrant]
     contents: list[SchemaContentItem]
     default_privileges: list[DefaultPrivilegeGrant] = field(default_factory=list)
+    not_applicable: list[NotApplicable] = field(default_factory=list)
 
 
 def describe_table(cursor: Any, ref: TargetRef, engine: SqlEngine) -> TableDescription:
@@ -1073,7 +1575,7 @@ def describe_table(cursor: Any, ref: TargetRef, engine: SqlEngine) -> TableDescr
     columns = fetch_columns(cursor, ref.oid, engine)
     constraints = fetch_constraints(cursor, ref.oid, engine)
     indexes = fetch_indexes(cursor, ref.oid, engine)
-    privileges = fetch_relation_privileges(cursor, ref.schema, ref.name)
+    privileges = fetch_relation_privileges(cursor, ref.schema, ref.name, engine)
     triggers = fetch_triggers(cursor, ref.oid, engine)
     policies, policies_enabled = fetch_policies(cursor, ref.oid, engine)
     partitioning = fetch_partitioning(cursor, ref.oid, engine)
@@ -1104,6 +1606,7 @@ def describe_table(cursor: Any, ref: TargetRef, engine: SqlEngine) -> TableDescr
         redshift_distribution=redshift_distribution,
         redshift_stats=redshift_stats,
         definition=definition,
+        not_applicable=table_not_applicable(engine),
     )
 
 
@@ -1117,7 +1620,7 @@ def describe_view(cursor: Any, ref: TargetRef, engine: SqlEngine) -> ViewDescrip
     downstream = fetch_dependencies(
         cursor, ref.oid, direction="downstream", engine=engine
     )
-    privileges = fetch_relation_privileges(cursor, ref.schema, ref.name)
+    privileges = fetch_relation_privileges(cursor, ref.schema, ref.name, engine)
     triggers = fetch_triggers(cursor, ref.oid, engine)
     return ViewDescription(
         ref=ref,
@@ -1128,6 +1631,7 @@ def describe_view(cursor: Any, ref: TargetRef, engine: SqlEngine) -> ViewDescrip
         downstream=downstream,
         privileges=privileges,
         triggers=triggers,
+        not_applicable=view_not_applicable(engine),
     )
 
 
@@ -1135,7 +1639,7 @@ def describe_schema(
     cursor: Any, ref: TargetRef, engine: SqlEngine
 ) -> SchemaDescription:
     """Compose a full schema description by invoking each fetcher."""
-    header = fetch_schema_header(cursor, ref.schema)
+    header = fetch_schema_header(cursor, ref.schema, engine)
     privileges = fetch_schema_privileges(cursor, ref.schema, engine)
     default_privileges = fetch_schema_default_privileges(cursor, ref.schema, engine)
     contents = fetch_schema_contents(cursor, ref.schema, engine)
@@ -1144,10 +1648,18 @@ def describe_schema(
         privileges=privileges,
         contents=contents,
         default_privileges=default_privileges,
+        not_applicable=schema_not_applicable(engine),
     )
 
 
 def fetch_constraints(cursor: Any, oid: int, engine: SqlEngine) -> ConstraintBundle:
+    """Return the relation's primary key, foreign keys, uniques and checks.
+
+    Redshift declares constraints but does not enforce or record them usefully,
+    so it returns an empty bundle with no query. DuckDB enforces them and
+    ``duckdb_constraints()`` records them fully -- see
+    :data:`_CONSTRAINTS_SQL_DUCKDB` for why its ``pg_constraint`` is not used.
+    """
     if engine == SqlEngine.redshift:
         return ConstraintBundle(
             primary_key=None,
@@ -1155,7 +1667,10 @@ def fetch_constraints(cursor: Any, oid: int, engine: SqlEngine) -> ConstraintBun
             unique_constraints=[],
             check_constraints=[],
         )
-    cursor.execute(_CONSTRAINTS_SQL, (oid,))
+    if engine is SqlEngine.duckdb:
+        cursor.execute(_CONSTRAINTS_SQL_DUCKDB, (oid,))
+    else:
+        cursor.execute(_CONSTRAINTS_SQL, (oid,))
     pk: PrimaryKeyInfo | None = None
     fks: list[ForeignKeyInfo] = []
     uniques: list[ConstraintInfo] = []
