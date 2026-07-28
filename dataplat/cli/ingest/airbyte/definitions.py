@@ -9,7 +9,8 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from dataplat.cli._render import cell, esc
+from dataplat.cli._exit import fail
+from dataplat.cli._render import cell
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.definitions import (
@@ -34,8 +35,7 @@ def list_source_definitions_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         definitions = list(list_source_definitions(client, base_url, workspace_id))
@@ -75,8 +75,7 @@ def list_source_definitions_cmd(
         console.print(f"\n[dim]Total: {len(definitions)} definition(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing source definitions: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()
 
@@ -92,8 +91,7 @@ def list_destination_definitions_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         definitions = list(list_destination_definitions(client, base_url, workspace_id))
@@ -133,7 +131,6 @@ def list_destination_definitions_cmd(
         console.print(f"\n[dim]Total: {len(definitions)} definition(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing destination definitions: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()

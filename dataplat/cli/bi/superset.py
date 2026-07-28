@@ -5,24 +5,25 @@ from __future__ import annotations
 import json
 from enum import Enum
 
-import httpx
 import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import JsonOption, YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.superset.client import (
+    build_client,
+    get_auth_config_from_env,
+)
+from dataplat.services.superset.client import (
     create_user as _create_user,
 )
 from dataplat.services.superset.client import (
     delete_user as _delete_user,
-)
-from dataplat.services.superset.client import (
-    get_auth_config_from_env,
 )
 from dataplat.services.superset.client import (
     iter_groups as _iter_groups,
@@ -109,8 +110,7 @@ def _load_auth_context() -> tuple[str, str, str]:
     try:
         cfg = get_auth_config_from_env()
     except ConfigError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     return cfg.base_url, cfg.username, cfg.password
 
 
@@ -132,12 +132,11 @@ def list_roles(
     base_url, admin_username, admin_password = _load_auth_context()
 
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
             roles = list(_iter_roles(client, base_url, access_token))
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if as_json:
         typer.echo(json.dumps(roles, indent=2, ensure_ascii=False))
@@ -216,7 +215,7 @@ def create_user(
     group_names = group_name if group_name else []
 
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
             role_ids = _resolve_role_ids(client, base_url, access_token, role_names)
             payload = {
@@ -236,8 +235,7 @@ def create_user(
 
             response = _create_user(client, base_url, access_token, payload)
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     user_id = response.get("id") or response.get("result", {}).get("id")
     console.print(
@@ -307,7 +305,7 @@ def update_users(
     email_set = {e.lower() for e in (email or [])}
 
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
 
             filter_role_ids = (
@@ -391,8 +389,7 @@ def update_users(
                 _update_user(client, base_url, access_token, user_id, payload)
                 updated += 1
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if matched == 0:
         console.print("[yellow]No users matched the criteria[/yellow]")
@@ -420,7 +417,7 @@ def list_users(
     base_url, admin_username, admin_password = _load_auth_context()
 
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
             users = list(_iter_users(client, base_url, access_token))
             role_filter_ids: set[int] = set()
@@ -429,8 +426,7 @@ def list_users(
                     _resolve_role_ids(client, base_url, access_token, filter_role)
                 )
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if role_filter_ids:
         users = [u for u in users if role_filter_ids & set(_user_role_ids(u))]
@@ -491,9 +487,14 @@ def delete_users(
 
     base_url, admin_username, admin_password = _load_auth_context()
 
-    failures = 0
+    # Kept as the exceptions, not a counter: this loop deliberately survives a
+    # per-user failure so the other ids still get deleted, which means fail()
+    # cannot be used — it exits. Holding the errors lets the exit code still
+    # come from them rather than from a literal that would report a 404 from
+    # Superset as an unclassified failure.
+    failures: list[ServiceError] = []
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
             for user_id in user_ids:
                 try:
@@ -501,13 +502,12 @@ def delete_users(
                     console.print(f"[green]✓ Deleted user {user_id}[/green]")
                 except ServiceError as exc:
                     console.print(f"[red]✗ user {user_id}: {esc(exc)}[/red]")
-                    failures += 1
+                    failures.append(exc)
     except (AuthError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if failures:
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(failures[0]))
 
 
 @groups_app.command("list")
@@ -518,12 +518,11 @@ def list_groups(
     base_url, admin_username, admin_password = _load_auth_context()
 
     try:
-        with httpx.Client() as client:
+        with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
             groups = list(_iter_groups(client, base_url, access_token))
     except (AuthError, ServiceError, ConfigError) as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if as_json:
         typer.echo(json.dumps(groups, indent=2, ensure_ascii=False))

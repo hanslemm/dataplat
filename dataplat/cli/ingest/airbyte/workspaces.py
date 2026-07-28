@@ -9,7 +9,8 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from dataplat.cli._render import cell, esc
+from dataplat.cli._exit import fail
+from dataplat.cli._render import cell
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.workspaces import get_workspace, list_workspaces
@@ -30,8 +31,7 @@ def list_workspaces_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         workspaces = list(list_workspaces(client, base_url))
@@ -63,8 +63,7 @@ def list_workspaces_cmd(
         console.print(f"\n[dim]Total: {len(workspaces)} workspace(s)[/dim]")
 
     except ServiceError as exc:
-        console.print(f"[red]Error listing workspaces: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()
 
@@ -77,14 +76,12 @@ def get_workspace_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         workspace = get_workspace(client, base_url, workspace_id)
         console.print(cell(json.dumps(workspace, indent=2, ensure_ascii=False)))
     except ServiceError as exc:
-        console.print(f"[red]Error getting workspace: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
     finally:
         client.close()

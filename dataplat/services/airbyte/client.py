@@ -5,14 +5,66 @@ from __future__ import annotations
 import base64
 import os
 import time
+from collections.abc import Callable
 from zoneinfo import ZoneInfo
 
 import httpx
 from croniter import croniter
 
 from dataplat.core.errors import AuthError, ConfigError
+from dataplat.core.trace import CATEGORY_HTTP, is_enabled, trace, trace_http
 
 _TOKEN_CACHE: dict[str, str | float | None] = {"token": None, "expires_at": 0.0}
+
+# --- request tracing --------------------------------------------------------
+# Wired into the one place this area builds a client, as httpx event hooks,
+# rather than around each call: the hooks see every request — the token
+# exchange below included — and no call site has to remember anything. They
+# also cannot leak the Authorization header, because they never look at headers.
+#
+# `dataplat.services.superset.client` carries a twin of this. Two copies is one
+# too many; they belong in a shared HTTP seam that does not exist yet, and a
+# third service is the point at which it should.
+
+# perf_counter at request time, stashed on the Request so the response hook can
+# report a duration. httpx's own `response.elapsed` cannot serve: it is set when
+# the body is read, which happens *after* the response hooks run, and under
+# httpx.MockTransport it is never set at all.
+_TRACE_STARTED = "_dp_trace_started"
+
+
+def _trace_hooks() -> dict[str, list[Callable[..., None]]]:
+    """Event hooks that trace method, URL, status and duration to stderr.
+
+    Two lines per request, not the single combined line
+    :func:`~dataplat.core.trace.trace_http` also supports, because httpx has no
+    hook for a *failed* send: a connect error, a TLS refusal or a hang would
+    otherwise trace nothing at all, and those are exactly the failures someone
+    turns ``--verbose`` on for. The pre-flight line is the record that the
+    request was attempted; a line without its ``-> status`` partner is the
+    signal.
+    """
+
+    def on_request(request: httpx.Request) -> None:
+        if not is_enabled():
+            return
+        setattr(request, _TRACE_STARTED, time.perf_counter())
+        trace_http(request.method, str(request.url))
+
+    def on_response(response: httpx.Response) -> None:
+        if not is_enabled():
+            return
+        started = getattr(response.request, _TRACE_STARTED, None)
+        trace_http(
+            response.request.method,
+            str(response.request.url),
+            status=response.status_code,
+            elapsed_ms=None
+            if started is None
+            else (time.perf_counter() - started) * 1000,
+        )
+
+    return {"request": [on_request], "response": [on_response]}
 
 
 def parse_jwt_exp(token: str) -> int | None:
@@ -71,6 +123,12 @@ def get_access_token(
     expires_raw = _TOKEN_CACHE.get("expires_at")
     expires_at = float(expires_raw) if isinstance(expires_raw, (int, float)) else 0.0
     if isinstance(cached_token, str) and cached_token and expires_at - 30 > now:
+        # Whether a run re-authenticated or reused a token decides what a 401
+        # halfway through it means, and nothing else records it.
+        trace(
+            CATEGORY_HTTP,
+            f"airbyte auth: reusing cached access_token, expires_at={expires_at:.0f}",
+        )
         return cached_token
 
     token_url = f"{base_url}/api/public/v1/applications/token"
@@ -108,13 +166,24 @@ def get_access_token(
         expires_in = payload.get("expires_in")
         exp = parse_jwt_exp(token)
         if expires_in:
-            _TOKEN_CACHE["expires_at"] = now + int(expires_in)
+            token_expires_at = now + int(expires_in)
         elif exp:
-            _TOKEN_CACHE["expires_at"] = float(exp)
+            token_expires_at = float(exp)
         else:
-            _TOKEN_CACHE["expires_at"] = now + 900
+            token_expires_at = now + 900
+        _TOKEN_CACHE["expires_at"] = token_expires_at
         _TOKEN_CACHE["token"] = token
 
+        # That a token exists and when it dies, never the token: the value is
+        # the credential, and the expiry is the whole diagnostic. Which of the
+        # three sources supplied it is worth having too — a server that sends no
+        # expires_in leaves us guessing 900s, and that guess explains a lot.
+        trace(
+            CATEGORY_HTTP,
+            "airbyte cloud auth: access_token acquired, "
+            f"expires_at={token_expires_at:.0f} "
+            f"(from={'expires_in' if expires_in else 'jwt-exp' if exp else 'default'})",
+        )
         return token
     except httpx.HTTPStatusError as exc:
         raise AuthError(
@@ -145,6 +214,12 @@ def login_airbyte_oss(
         token = (response.json() or {}).get("token")
         if not token:
             raise AuthError("No token in Airbyte OSS login response")
+        # A JWT states its own expiry, so it can be reported without asking the
+        # server. Only the claim is traced; the JWT never leaves this function.
+        trace(
+            CATEGORY_HTTP,
+            f"airbyte oss auth: jwt acquired, exp={parse_jwt_exp(token)}",
+        )
         return token
     except httpx.HTTPStatusError as exc:
         raise AuthError(
@@ -202,6 +277,7 @@ def build_authenticated_client() -> tuple[httpx.Client, str]:
         follow_redirects=False,
         timeout=httpx.Timeout(60.0),
         transport=httpx.HTTPTransport(retries=2),
+        event_hooks=_trace_hooks(),
     )
     use_cloud = bool(client_id and client_secret)
 
@@ -210,6 +286,13 @@ def build_authenticated_client() -> tuple[httpx.Client, str]:
             "For Airbyte Cloud, set AIRBYTE_CLIENT_ID and AIRBYTE_CLIENT_SECRET. "
             "For OSS, set AIRBYTE_EMAIL and AIRBYTE_PASSWORD"
         )
+
+    # Which credential pair the environment selected, not the credentials.
+    # "It works for me" is usually two people on different auth modes.
+    trace(
+        CATEGORY_HTTP,
+        f"airbyte auth mode={'cloud' if use_cloud else 'oss'}, base_url={base_url}",
+    )
 
     try:
         if use_cloud:
@@ -223,6 +306,15 @@ def build_authenticated_client() -> tuple[httpx.Client, str]:
             token = login_airbyte_oss(client, base_url, email or "", password or "")
     except AuthError as primary_error:
         if use_cloud and email and password:
+            # On a successful fallback this error is discarded and never
+            # reaches the user, so the trace is the only place the reason a
+            # Cloud credential stopped working is ever recorded. It is the same
+            # text fail() would have printed had there been no fallback.
+            trace(
+                CATEGORY_HTTP,
+                f"airbyte cloud auth failed ({primary_error}); "
+                "falling back to OSS login",
+            )
             token = login_airbyte_oss(client, base_url, email or "", password or "")
         else:
             client.close()

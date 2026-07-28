@@ -12,6 +12,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption, json_option
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
@@ -162,8 +163,7 @@ def list_connections_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if not as_json:
         console.print("[blue]Fetching Airbyte connections...[/blue]\n")
@@ -331,8 +331,15 @@ def list_connections_cmd(
                 console.print(f"\n[dim]Total: {len(connections)} connection(s)[/dim]")
 
     except Exception as e:
+        # exit_code_for rather than a literal, here and at the other broad
+        # handlers in this file: `except Exception` swallows the ServiceErrors
+        # the connections service raises, so a 500 from the API used to exit 1
+        # here while the identical failure through airbyte_client() exits 5.
+        # An untyped exception still maps to 1, so nothing else moves. The
+        # message keeps its prefix: unlike a ServiceError, a stray KeyError
+        # says nothing about which call produced it.
         console.print(f"[red]Error fetching connections: {esc(e)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(e))
     finally:
         client.close()
 
@@ -545,8 +552,7 @@ def update(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     # Update connection(s)
     updated = 0
@@ -612,7 +618,7 @@ def update(
                 raise
             except Exception as e:
                 console.print(f"[red]Error updating connection: {esc(e)}[/red]")
-                raise typer.Exit(code=1)
+                raise typer.Exit(code=exit_code_for(e))
 
         else:
             # Update all active connections
@@ -676,7 +682,7 @@ def update(
         raise
     except Exception as e:
         console.print(f"[red]Error updating connections: {esc(e)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(e))
     finally:
         client.close()
 
@@ -960,8 +966,7 @@ def sync(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     if wait and not connection_id:
         console.print("[red]--wait is only supported with --connection-id[/red]")
@@ -1049,7 +1054,7 @@ def sync(
         raise
     except Exception as e:
         console.print(f"[red]Error triggering sync: {esc(e)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(e))
     finally:
         client.close()
 
@@ -1064,15 +1069,14 @@ def get_connection_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         conn = get_connection(client, base_url, connection_id)
         console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
     except Exception as exc:
         console.print(f"[red]Error getting connection: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(exc))
     finally:
         client.close()
 
@@ -1125,8 +1129,7 @@ def create_connection_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         conn = create_connection(
@@ -1144,7 +1147,7 @@ def create_connection_cmd(
         console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
     except Exception as exc:
         console.print(f"[red]Error creating connection: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(exc))
     finally:
         client.close()
 
@@ -1166,15 +1169,14 @@ def delete_connection_cmd(
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
     try:
         delete_connection(client, base_url, connection_id)
         console.print(f"[green]Connection {esc(connection_id)} deleted[/green]")
     except Exception as exc:
         console.print(f"[red]Error deleting connection: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code_for(exc))
     finally:
         client.close()
 

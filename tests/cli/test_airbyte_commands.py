@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 import dataplat.main as main_module
 import dataplat.services.airbyte.client as airbyte_client
-from dataplat.core.errors import AuthError, ConfigError, ServiceError
+from dataplat.core.errors import AuthError, ConfigError, ExitCode, ServiceError
 
 runner = CliRunner()
 
@@ -1491,11 +1491,19 @@ def _raiser(exc: Exception):
     return fail
 
 
-@pytest.mark.parametrize("error_type", [ConfigError, AuthError])
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [(ConfigError, ExitCode.CONFIG), (AuthError, ExitCode.AUTH)],
+)
 def test_airbyte_client_reports_startup_failures_literally(
-    monkeypatch, error_type
+    monkeypatch, error_type, code
 ) -> None:
-    """A ConfigError/AuthError message is provider text: escaped, exit 1."""
+    """A ConfigError/AuthError message is provider text: escaped, own code.
+
+    The code is what the funnel used to get wrong: a missing AIRBYTE_BASE_URL
+    and a rejected credential both exited 1, so a script could tell that
+    something broke and nothing else. They are 3 and 4 now.
+    """
     import dataplat.cli.ingest.airbyte._common as _common
 
     _disable_envrc(monkeypatch)
@@ -1508,7 +1516,7 @@ def test_airbyte_client_reports_startup_failures_literally(
         ["ingest", "airbyte", "connections", "refresh", "-c", "c1"],
         env=WIDE,
     )
-    assert result.exit_code == 1
+    assert result.exit_code == code
     _assert_literal(result.stdout, CLOSING_TAG, STYLE_TAG)
 
 
@@ -1528,8 +1536,41 @@ def test_airbyte_client_reports_service_errors_literally(monkeypatch) -> None:
         ["ingest", "airbyte", "connections", "refresh", "-c", "c1"],
         env=WIDE,
     )
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.SERVICE
     _assert_literal(result.stdout, CLOSING_TAG, STYLE_TAG)
+
+
+def test_broad_handler_still_reads_the_code_off_the_exception(monkeypatch) -> None:
+    """`connections get` reports through `except Exception`, not the funnel.
+
+    It has to: the prefix it prints is the only thing that identifies the call
+    when what escapes is an untyped KeyError. That breadth also swallowed every
+    ServiceError, so a 500 from the API exited 1 there while the same failure
+    exited 5 everywhere else. Both cases are pinned, because the fix is only
+    correct if the untyped one did not move.
+    """
+    import dataplat.cli.ingest.airbyte.connections as _conn
+
+    _disable_envrc(monkeypatch)
+    _patch_airbyte_client(monkeypatch, _AirbyteFake({}))
+
+    monkeypatch.setattr(_conn, "get_connection", _raiser(ServiceError("502 upstream")))
+    typed = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "get", "-c", "c1"],
+        env=WIDE,
+    )
+    assert typed.exit_code == ExitCode.SERVICE
+    assert "Error getting connection: 502 upstream" in typed.stdout
+
+    monkeypatch.setattr(_conn, "get_connection", _raiser(KeyError("streams")))
+    untyped = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "get", "-c", "c1"],
+        env=WIDE,
+    )
+    assert untyped.exit_code == ExitCode.FAILURE
+    assert "Error getting connection:" in untyped.stdout
 
 
 # --- startup cost --------------------------------------------------------
