@@ -773,12 +773,31 @@ ORDER BY c.relkind, c.relname
 # Reading the ACL also makes grantor and WITH GRANT OPTION truthful: the CREATE
 # half of the old query derived grantees from has_schema_privilege() and had to
 # hardcode grantor='' and with_grant_option=false.
+#
+# The grant option needs more than the raw ACL bit, though. An owner holds every
+# grant option implicitly and PostgreSQL never writes it down: acldefault('n',
+# owner) is `owner=UC/owner`, no `*`. Reporting that bit alone said "cannot
+# delegate" about a role that can, and said it only for schemas -- the relation
+# half of this report reads information_schema.role_table_grants, which
+# synthesises is_grantable='YES' for an owner, so one authority was reported two
+# ways depending on which object you asked about.
+#
+# pg_has_role((acl).grantee, n.nspowner, 'USAGE') is the server's own rule
+# (aclmask(): "owner always implicitly has all grant options", tested with
+# has_privs_of_role(roleid, ownerId)) and is the very expression
+# information_schema.table_privileges uses, so both halves now answer one
+# question one way. Verified against PostgreSQL 16: has_schema_privilege(owner,
+# s, 'USAGE WITH GRANT OPTION') is true, and `SET ROLE owner; GRANT USAGE ON
+# SCHEMA s TO other` succeeds. PUBLIC is grantee oid 0, which is no role at all;
+# pg_has_role returns false for it rather than erroring, exactly as
+# information_schema relies on.
 _SCHEMA_PRIVILEGES_SQL_POSTGRES = """
 SELECT
     CASE WHEN (acl).grantee = 0 THEN 'PUBLIC'
          ELSE pg_get_userbyid((acl).grantee) END AS grantee,
     (acl).privilege_type AS privilege_type,
-    (acl).is_grantable AS with_grant_option,
+    ((acl).is_grantable OR pg_has_role((acl).grantee, n.nspowner, 'USAGE'))
+        AS with_grant_option,
     pg_get_userbyid((acl).grantor) AS grantor
 FROM pg_namespace n
 CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) AS acl
@@ -803,6 +822,12 @@ ORDER BY grantee, privilege_type
 # cannot report a grantor or a grant option, so both are reported empty, and
 # roles holding the privilege only through membership appear as their own rows.
 # The PostgreSQL path reads the ACL and does better on both counts.
+#
+# That gap includes the owner's implicit grant option, which the PostgreSQL half
+# above now reports through pg_has_role(). This constant stays as it is: closing
+# the gap here would mean new Redshift SQL with no cluster to test it against,
+# whereas the PostgreSQL fix touches no Redshift SQL at all (CONTRIBUTING,
+# evidence class 1).
 _SCHEMA_PRIVILEGES_SQL_REDSHIFT = """
 SELECT grantee, 'USAGE', false, ''
 FROM (
@@ -882,6 +907,9 @@ def fetch_schema_privileges(
     On PostgreSQL these come from ``pg_namespace.nspacl``, which lists explicit
     ACL entries plus the owner's implicit default; a role that only holds the
     privilege through membership in a granted role is not a separate row.
+    ``with_grant_option`` follows the server's rule rather than the ACL bit, so
+    an owner reports the grant option it really has -- the same answer
+    :func:`fetch_relation_privileges` gets from ``information_schema``.
     """
     if engine == SqlEngine.redshift:
         cursor.execute(_SCHEMA_PRIVILEGES_SQL_REDSHIFT, (schema, schema))

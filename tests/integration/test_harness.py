@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import os
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -689,6 +690,99 @@ def test_temp_role_can_take_ownership_of_objects(
         f"{sample_schema}.customers",
     )
     assert owner == name
+
+
+# Any ACL entry, anywhere in this database, that mentions a harness-generated
+# role -- as grantee or as grantor -- plus any entry pointing at a role oid that
+# no longer exists. The second half matters because pg_get_userbyid() renders a
+# dropped oid as "unknown (OID=...)", which the name patterns would miss.
+# Grantee oid 0 is PUBLIC, which is no role and so is exempt from that check;
+# a grantor is always a real role.
+_LEAKED_ACL_SQL = r"""
+SELECT count(*) FROM (
+    SELECT (aclexplode(n.nspacl)).* FROM pg_namespace n
+    UNION ALL
+    SELECT (aclexplode(c.relacl)).* FROM pg_class c
+) AS acl (grantor, grantee, privilege_type, is_grantable)
+WHERE pg_get_userbyid(grantee) LIKE 'dp\_it\_%'
+   OR pg_get_userbyid(grantor) LIKE 'dp\_it\_%'
+   OR (grantee <> 0
+       AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = grantee))
+   OR NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = grantor)
+"""
+
+
+@pytest.fixture
+def temp_roles_left_no_trace(pg_cursor: Cursor[TupleRow]) -> Iterator[None]:
+    """Assert, after ``temp_role`` tore down, that its DROPs actually worked.
+
+    Fixture ordering is the whole mechanism: pytest finalises in reverse setup
+    order, so a test that requests this fixture *before* ``temp_role`` gets this
+    check run after that fixture's DROP statements but before ``pg_cursor``
+    rolls the transaction back. That is the only window in which the teardown's
+    own effect is observable -- assert after the rollback and every leak looks
+    cleaned up, because the rollback cleans up regardless.
+
+    Requesting it in the wrong order fails loudly rather than silently passing:
+    the check would then run while the roles still exist.
+    """
+    yield
+    leaked_roles = _scalar(
+        pg_cursor,
+        r"SELECT count(*) FROM pg_roles WHERE rolname LIKE 'dp\_it\_r%'",
+    )
+    leaked_acl = _scalar(pg_cursor, _LEAKED_ACL_SQL)
+    assert (leaked_roles, leaked_acl) == (0, 0)
+
+
+# Deliberately not `sample_schema`: that fixture's own teardown drops the schema,
+# and it would take the ACL entries under test with it, leaving the sweep in
+# `temp_roles_left_no_trace` nothing to find.
+_DELEGATED_GRANT_SCHEMA = f"dp_it_delegated_{os.getpid()}"
+
+
+def test_temp_role_teardown_unwinds_a_delegated_grant(
+    pg_cursor: Cursor[TupleRow],
+    temp_roles_left_no_trace: None,
+    temp_role: TempRoleFactory,
+) -> None:
+    """A grant one temp role made to another must not defeat the teardown.
+
+    ``DROP OWNED BY r CASCADE`` is a ``REVOKE ALL ... FROM r CASCADE`` attributed
+    to this session's grantor, so it cannot remove an entry a *different* role
+    granted. While the fixture dropped each role right after draining that one
+    role, the DROP ROLE here failed with DependentObjectsStillExist, and the
+    only way to test a delegated grant was to REVOKE it by hand first.
+
+    The test deliberately leaves the grant in place; the assertions live in
+    ``temp_roles_left_no_trace``, which runs after the teardown.
+    """
+    delegate = temp_role("delegate")
+    onward = temp_role("onward")
+    pg_cursor.execute(f"CREATE SCHEMA {_DELEGATED_GRANT_SCHEMA}")
+    pg_cursor.execute(
+        f"GRANT USAGE ON SCHEMA {_DELEGATED_GRANT_SCHEMA} "
+        f"TO {delegate} WITH GRANT OPTION"
+    )
+    pg_cursor.execute(f"SET ROLE {delegate}")
+    pg_cursor.execute(f"GRANT USAGE ON SCHEMA {_DELEGATED_GRANT_SCHEMA} TO {onward}")
+    # DROP ROLE cannot run while this session still *is* one of those roles.
+    pg_cursor.execute("RESET ROLE")
+
+    # Guard against a vacuous test: the entry the teardown has to unwind is the
+    # one whose grantor is the delegate rather than the schema owner.
+    grantor = _scalar(
+        pg_cursor,
+        """
+        SELECT pg_get_userbyid((acl).grantor)
+        FROM pg_namespace n
+        CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
+        WHERE n.nspname = %s AND pg_get_userbyid((acl).grantee) = %s
+        """,
+        _DELEGATED_GRANT_SCHEMA,
+        onward,
+    )
+    assert grantor == delegate
 
 
 _ROLES_FROM_PREVIOUS_TEST: list[str] = []

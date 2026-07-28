@@ -1328,7 +1328,10 @@ def test_schema_privileges_report_public_grantor_and_grant_option(
         d=delegate,
     )
     # Re-granted by the delegate rather than the owner, so grantor has to come
-    # from the ACL entry instead of being assumed to be the schema owner.
+    # from the ACL entry instead of being assumed to be the schema owner. The
+    # delegated entry needs no hand-written REVOKE before the assertions:
+    # temp_role's teardown unwinds the chain itself (see
+    # test_temp_role_teardown_unwinds_a_delegated_grant).
     _ddl(pg_cursor, "SET ROLE {d}", d=delegate)
     _ddl(pg_cursor, "GRANT USAGE ON SCHEMA {s} TO {o}", s=sample_schema, o=onward)
     # Reset before the fixtures tear down: their DROP ROLE cannot run while
@@ -1340,15 +1343,6 @@ def test_schema_privileges_report_public_grantor_and_grant_option(
         (g.grantee, g.privilege): g
         for g in fetch_schema_privileges(pg_cursor, sample_schema, PG)
     }
-    # Undone before the assertions, not after: DROP OWNED BY cannot remove an
-    # ACL entry whose grantor is a different role, so leaving the onward grant
-    # in place would make the temp_role teardown fail and hide the real result.
-    _ddl(
-        pg_cursor,
-        "REVOKE USAGE ON SCHEMA {s} FROM {d} CASCADE",
-        s=sample_schema,
-        d=delegate,
-    )
 
     assert grants[(delegate, "USAGE")].with_grant_option is True
     assert grants[(delegate, "USAGE")].grantor == owner
@@ -1361,6 +1355,110 @@ def test_schema_privileges_report_public_grantor_and_grant_option(
     # Explicit grants materialise nspacl; the owner's defaults must survive it.
     assert (owner, "USAGE") in grants
     assert (owner, "CREATE") in grants
+
+
+def test_owner_grant_option_agrees_between_schema_and_relation_privileges(
+    pg_cursor: Cursor[TupleRow], sample_schema: str
+) -> None:
+    """One authority, one answer, whichever object the user asked about.
+
+    The two halves of the report read different catalogs and their raw bits
+    disagree about an owner: an ACL entry never records the owner's grant option
+    (``acldefault('n', owner)`` is ``owner=UC/owner``, no ``*``) while
+    ``information_schema.role_table_grants`` synthesises ``is_grantable='YES'``.
+    The server settles it -- an owner holds every grant option implicitly -- so
+    both halves must report it, and the ``has_*_privilege`` calls below are what
+    pins this test to PostgreSQL's behaviour rather than to either catalog.
+    """
+    owner = _scalar(pg_cursor, "SELECT current_user")
+    assert (
+        _scalar(
+            pg_cursor,
+            "SELECT has_schema_privilege(%s, %s, 'USAGE WITH GRANT OPTION')",
+            owner,
+            sample_schema,
+        )
+        is True
+    )
+    assert (
+        _scalar(
+            pg_cursor,
+            "SELECT has_table_privilege(%s, %s, 'SELECT WITH GRANT OPTION')",
+            owner,
+            f"{sample_schema}.customers",
+        )
+        is True
+    )
+
+    schema_grants = fetch_schema_privileges(pg_cursor, sample_schema, PG)
+    relation_grants = fetch_relation_privileges(pg_cursor, sample_schema, "customers")
+    schema_rows = [g for g in schema_grants if g.grantee == owner]
+    relation_rows = [
+        g for g in relation_grants if g.grantee == owner and g.privilege != "OWNER"
+    ]
+    assert {g.privilege for g in schema_rows} == {"USAGE", "CREATE"}
+    assert {g.privilege for g in relation_rows} >= {"SELECT", "INSERT"}
+    assert [g.with_grant_option for g in schema_rows] == [True] * len(schema_rows)
+    assert [g.with_grant_option for g in relation_rows] == [True] * len(relation_rows)
+
+    # The synthetic ownership marker keeps reporting False on purpose: OWNER is
+    # not a privilege anyone can delegate, and the CLI would render "OWNER *".
+    assert [g.with_grant_option for g in relation_grants if g.privilege == "OWNER"] == [
+        False
+    ]
+
+
+def test_schema_grant_option_follows_the_owners_privileges_not_the_acl_bit(
+    pg_cursor: Cursor[TupleRow], sample_schema: str, temp_role: TempRoleFactory
+) -> None:
+    """Exactly which roles inherit the owner's implicit grant option.
+
+    The rule is ``pg_has_role(grantee, owner, 'USAGE')`` -- has_privs_of_role --
+    so an INHERIT member of the owning role gets the owner's grant option and a
+    NOINHERIT one does not. Each row is compared against
+    ``has_schema_privilege(..., 'USAGE WITH GRANT OPTION')``, which applies that
+    same rule inside the server, so this pins PostgreSQL's behaviour rather than
+    agreeing with the expression that copies it.
+    """
+    owner = temp_role("aclowner")
+    member = temp_role("aclmember")
+    detached = temp_role("aclnoinherit", options=["NOINHERIT"])
+    outsider = temp_role("aclplain")
+    schema = _sibling_schema(sample_schema)
+    _ddl(
+        pg_cursor,
+        "CREATE SCHEMA {a} AUTHORIZATION {o}",
+        "GRANT {o} TO {m}",
+        "GRANT {o} TO {d}",
+        "GRANT USAGE ON SCHEMA {a} TO {m}",
+        "GRANT USAGE ON SCHEMA {a} TO {d}",
+        "GRANT USAGE ON SCHEMA {a} TO {p}",
+        a=schema,
+        o=owner,
+        m=member,
+        d=detached,
+        p=outsider,
+    )
+
+    grants = {
+        (g.grantee, g.privilege): g
+        for g in fetch_schema_privileges(pg_cursor, schema, PG)
+    }
+    for role in (owner, member, detached, outsider):
+        expected = _scalar(
+            pg_cursor,
+            "SELECT has_schema_privilege(%s, %s, 'USAGE WITH GRANT OPTION')",
+            role,
+            schema,
+        )
+        assert grants[(role, "USAGE")].with_grant_option is expected, role
+
+    # Spelled out too, so the loop above cannot pass by agreeing with itself on
+    # four identical answers.
+    assert grants[(owner, "USAGE")].with_grant_option is True
+    assert grants[(member, "USAGE")].with_grant_option is True
+    assert grants[(detached, "USAGE")].with_grant_option is False
+    assert grants[(outsider, "USAGE")].with_grant_option is False
 
 
 def test_schema_default_privileges_from_the_fixture(
