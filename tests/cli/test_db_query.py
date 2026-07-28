@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 import dataplat.cli.db as db_cli
 import dataplat.main as main_module
 from dataplat.cli.db import _classify_sql, _render_rows, _write_preview
+from dataplat.core import trace
 
 runner = CliRunner()
 
@@ -197,3 +198,134 @@ def test_pagination_wrapper_alias_is_dataplat_owned(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert "AS dp_query" in cursor.executed[0]
     assert "dna_sql" not in cursor.executed[0]
+
+
+def test_progress_spinner_never_captures_the_verbose_trace(monkeypatch) -> None:
+    """rich's Live redirects ``sys.stderr``; the SQL trace must escape it.
+
+    ``Progress`` paints into this module's console, which writes to *stdout*,
+    and rich's default ``redirect_stderr=True`` swaps ``sys.stderr`` for a proxy
+    onto that console for as long as the query runs. Every ``[dp:sql]`` line
+    therefore came out on stdout — for TTY users only, since the spinner is
+    skipped when output is piped — which is the one thing
+    :mod:`dataplat.core.trace` promises can never happen.
+    """
+    import io
+
+    from dataplat.core.trace import trace_sql
+
+    _disable_envrc(monkeypatch)
+    _pg_env(monkeypatch)
+
+    class _Cursor:
+        description = None
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, sql, params=None) -> None:
+            # Stands in for _TracingCursor: the point under test is where the
+            # line lands while the spinner owns the screen, not who wrote it.
+            trace_sql(str(sql), params=params)
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self):
+            return _Cursor()
+
+    # force_terminal, because rich only redirects when it believes it is on a
+    # terminal — which is exactly the case that was broken.
+    spinner_screen = io.StringIO()
+    monkeypatch.setattr(
+        db_cli, "console", Console(file=spinner_screen, force_terminal=True)
+    )
+    monkeypatch.setattr(db_cli, "_supports_live_query_progress", lambda _console: True)
+
+    with (
+        trace.verbose(),
+        patch("dataplat.cli.db._common.psycopg.connect", lambda **kwargs: _Conn()),
+    ):
+        result = runner.invoke(
+            main_module.app, ["db", "query", "delete from t", "--write"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "[dp:sql] delete from t | no params" in result.stderr
+    assert "[dp:sql]" not in spinner_screen.getvalue()
+
+
+def test_spinner_follows_the_output_format_to_stderr(monkeypatch) -> None:
+    """The spinner must paint where the notices go, not always on stdout.
+
+    While Rich only claimed a terminal for real TTYs this was invisible: the
+    frames are erased. But FORCE_COLOR makes is_terminal true for a pipe as
+    well — plenty of people export it — and then
+    `dp db query --format json > file` collected the escape sequences and the
+    file stopped parsing. Verified by hand before the fix: 167 bytes of ANSI and
+    a JSONDecodeError.
+    """
+    consoles: list[Console] = []
+
+    class _SpyProgress:
+        def __init__(self, *columns, console=None, **kwargs):
+            consoles.append(console)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def add_task(self, *a, **k):
+            return None
+
+    class _Cursor:
+        description = None
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, sql, params=None) -> None:
+            return None
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self):
+            return _Cursor()
+
+    _disable_envrc(monkeypatch)
+    _pg_env(monkeypatch)
+    monkeypatch.setattr(db_cli, "Progress", _SpyProgress)
+    monkeypatch.setattr(db_cli, "_supports_live_query_progress", lambda _console: True)
+
+    for fmt, expect_stderr in (("json", True), ("csv", True), ("table", False)):
+        consoles.clear()
+        with patch("dataplat.cli.db._common.psycopg.connect", lambda **kwargs: _Conn()):
+            result = runner.invoke(
+                main_module.app,
+                ["db", "query", "select 1", "--format", fmt],
+            )
+        assert result.exit_code == 0, result.output
+        assert consoles, f"no Progress built for --format {fmt}"
+        assert consoles[0].stderr is expect_stderr, (
+            f"--format {fmt}: spinner painted to "
+            f"{'stderr' if consoles[0].stderr else 'stdout'}"
+        )

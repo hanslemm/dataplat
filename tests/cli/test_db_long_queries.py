@@ -7,6 +7,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from dataplat.cli.db import app as db_app
+from dataplat.core.errors import ExitCode
 from dataplat.services.db.long_queries import LongQueryRow
 from dataplat.services.db.targets import resolve_target
 
@@ -106,16 +107,30 @@ def test_long_queries_json_output() -> None:
 
 
 def test_long_queries_unknown_target() -> None:
+    """A bad --target is invalid input, not a generic failure."""
     result = runner.invoke(db_app, ["long-queries", "-t", "nope"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Unknown target" in result.output
+
+
+def test_kill_unknown_target_exits_invalid_input() -> None:
+    result = runner.invoke(db_app, ["kill", "123", "-t", "nope"])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
     assert "Unknown target" in result.output
 
 
 def test_kill_requires_confirmation_non_interactive() -> None:
+    """A refusal is not a failure of the warehouse: it stays 1.
+
+    Deliberate, and pinned: routing the confirmation gate through the error
+    codes would make "the user said no" indistinguishable from "the tool could
+    not do it", which is the one thing a wrapper script must be able to tell.
+    """
     result = runner.invoke(db_app, ["kill", "123"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == ExitCode.FAILURE
     assert "--yes" in result.output
 
 

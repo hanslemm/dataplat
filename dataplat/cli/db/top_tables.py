@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from dataplat.cli._exit import fail
 from dataplat.cli._options import json_option, yes_option
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
@@ -35,8 +36,7 @@ def _targets_for(name: str, console: Console) -> list[DbTarget]:
     try:
         return resolve_targets(name)
     except ValidationError as exc:
-        console.print(f"[red]Error: {esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
 
 def _split_prefixes(raw: list[str]) -> list[str]:
