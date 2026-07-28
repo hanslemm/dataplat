@@ -22,6 +22,7 @@ from dataplat.cli.cloud.aws._common import (
     make_table,
     profile_option,
     region_option,
+    trace_aws,
 )
 
 app = typer.Typer(
@@ -236,6 +237,18 @@ def metrics(
     now = datetime.now(UTC)
     start = now - timedelta(hours=hours)
 
+    # One batched call, so one trace: the window and period are what a reader
+    # checks first when a metric comes back empty.
+    trace_aws(
+        "cloudwatch",
+        "get_metric_data",
+        profile=profile,
+        region=region,
+        instance=instance,
+        metrics=len(_CW_METRICS),
+        window=f"{hours}h",
+        period=f"{period}s",
+    )
     try:
         with console.status("[bold blue]Fetching CloudWatch metrics…[/bold blue]"):
             summaries = _fetch_metric_summaries(cw, instance, start, now, period)
@@ -354,6 +367,19 @@ def plot(
 
     with console.status("[bold blue]Fetching CloudWatch metrics…[/bold blue]"):
         for metric_name, unit, _suffix in cw_metrics:
+            # One call per metric here (unlike `metrics`, which batches), so the
+            # trace is per metric too — that is how a single slow or denied
+            # metric is told apart from all six failing.
+            trace_aws(
+                "cloudwatch",
+                "get_metric_statistics",
+                profile=profile,
+                region=region,
+                instance=instance,
+                metric=metric_name,
+                window=f"{hours}h",
+                period=f"{period}s",
+            )
             try:
                 resp = cw.get_metric_statistics(
                     Namespace="AWS/RDS",
@@ -623,6 +649,7 @@ def list_instances(
     session = _get_session(profile, region)
     rds = session.client("rds")
 
+    trace_aws("rds", "describe_db_instances", profile=profile, region=region)
     try:
         with console.status("[bold blue]Fetching RDS instances…[/bold blue]"):
             paginator = rds.get_paginator("describe_db_instances")

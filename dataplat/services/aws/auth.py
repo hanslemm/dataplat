@@ -7,8 +7,19 @@ from collections.abc import Callable
 from typing import Any
 
 from dataplat.core.errors import AuthError, ServiceError
+from dataplat.core.trace import trace
 
 Notifier = Callable[[str], None]
+
+# The trace category for everything the aws group does, declared here because
+# this is the lowest AWS module: the CLI helpers import it, and a service module
+# must not import back out of dataplat.cli to reach a constant.
+CATEGORY_AWS = "aws"
+
+# What a region reads as when we pass none: boto3 then resolves it from the
+# profile or the environment, and saying "unset" is honest about which of the
+# two the trace can attest to. A blank there would look like a bug in the tracer.
+UNSET = "unset"
 
 
 def _import_boto() -> tuple[Any, Any]:
@@ -29,6 +40,10 @@ def ensure_sso_login(profile: str, notify: Notifier | None = None) -> None:
     session = boto3.Session(profile_name=profile)
     sts = session.client("sts")
 
+    # The probe is a real API call and the first thing that fails when a token
+    # has expired, so it is the one line that explains a command that "did
+    # nothing but ask for a login".
+    trace(CATEGORY_AWS, f"sts.get_caller_identity | profile={profile} | sso probe")
     try:
         sts.get_caller_identity()
     except (
@@ -37,6 +52,13 @@ def ensure_sso_login(profile: str, notify: Notifier | None = None) -> None:
         botocore_exceptions.SSOTokenLoadError,
         botocore_exceptions.NoCredentialsError,
     ):
+        # Worded "session expired", not "token expired": redact() masks the value
+        # after a bare `token`, because `Authorization: token ghp_…` is exactly
+        # that shape — so the honest wording would have come out as `token ***`.
+        trace(
+            CATEGORY_AWS,
+            f"aws sso login | profile={profile} | session expired or missing",
+        )
         if notify:
             notify(
                 "SSO session expired or missing; running aws sso login "
@@ -57,6 +79,10 @@ def get_session(
     """Get a boto3 session with SSO readiness checks."""
     boto3, _ = _import_boto()
     ensure_sso_login(profile, notify=notify)
+    trace(
+        CATEGORY_AWS,
+        f"boto3.Session | profile={profile} | region={region or UNSET}",
+    )
     return boto3.Session(profile_name=profile, region_name=region)
 
 
@@ -73,6 +99,15 @@ def get_client(
     kwargs: dict[str, str] = {}
     if region:
         kwargs["region_name"] = region
+
+    # Traced before the branch, so the intent is on the record even when the SSO
+    # login below never returns one. `profile=unset` is the ambient credential
+    # chain, which is a different thing to debug than a named profile.
+    trace(
+        CATEGORY_AWS,
+        f"boto3.client | service={service_name} | profile={profile or UNSET} | "
+        f"region={region or UNSET}",
+    )
 
     if profile:
         ensure_sso_login(profile, notify=notify)

@@ -8,6 +8,8 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from dataplat.cli.cloud.aws import secrets as secrets_cli
+from dataplat.core.errors import AuthError, ExitCode
+from dataplat.core.trace import verbose
 
 runner = CliRunner()
 
@@ -586,6 +588,151 @@ def test_multi_profile_command_still_expands_all(monkeypatch, wide) -> None:
     # Each per-profile line reports the short alias back, not the full name.
     assert "[prod] Updated secret" in result.stdout
     assert "[qa] Updated secret" in result.stdout
+
+
+# ── authentication failures ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("seam", "argv"),
+    [
+        ("secretsmanager", ["get", "my/secret"]),
+        # `edit` reaches STS first, so its client builder is a second, separate
+        # place an expired session surfaces.
+        ("sts", ["edit", "--yes", "my/secret", "-k", "a", "-v", "2"]),
+    ],
+    ids=["secretsmanager-client", "sts-client"],
+)
+def test_expired_sso_exits_four_from_either_client_builder(
+    seam: str, argv: list[str], monkeypatch, wide
+) -> None:
+    """4, not 1: a rotation script must retry a login and stop on anything else.
+
+    It matters most here. ``secrets set -p all`` fans a write across accounts,
+    and "log in again" is the one failure a wrapper may safely retry — which it
+    cannot do if a bad config, a denied API call and an expired token all exit 1.
+    """
+    message = "SSO login failed for profile [/x] [bold]prod[/bold]"
+
+    def _boom(**kwargs: object):
+        raise AuthError(message)
+
+    monkeypatch.setattr(secrets_cli, "get_client", _boom)
+
+    result = runner.invoke(secrets_cli.app, argv)
+
+    assert result.exit_code == ExitCode.AUTH == 4
+    # Unescaped, "[/x]" raises MarkupError and nothing is printed at all.
+    assert message in result.stdout
+
+
+# ── --verbose ───────────────────────────────────────────────────────────────
+# This module reads secret values for a living, so the rule is not "redaction
+# will catch it": the trace records that a value was read and which secret it
+# was, and never the value or its length.
+
+
+def test_verbose_traces_the_fetch_but_never_the_value(monkeypatch, wide) -> None:
+    monkeypatch.setenv("DP_AWS_PROFILE_ALIASES", "prod=AdminAccess-Prod")
+    _patch_client(monkeypatch, _FakeClient({"password": "s3cr3t-value"}))
+
+    with verbose():
+        result = runner.invoke(
+            secrets_cli.app,
+            ["get", "my/app/config", "-p", "prod", "-r", "eu-central-1"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    assert (
+        "[dp:aws] secretsmanager.get_secret_value | profile=AdminAccess-Prod | "
+        "region=eu-central-1 | name=my/app/config" in result.stderr
+    )
+    # The value is on stdout because that is what the command is for. It must not
+    # also be on stderr, where a CI log keeps it next to the request that got it.
+    assert "s3cr3t-value" in result.stdout
+    assert "s3cr3t-value" not in result.stderr
+
+
+def test_verbose_keeps_a_credential_shaped_secret_name_legible(
+    monkeypatch, wide
+) -> None:
+    """The field is ``name=`` for a reason, and this is the reason.
+
+    redact() masks whatever follows a key called secret, token, api-key or
+    password — so ``secret=prod/db/password`` would be published as
+    ``secret=***``, and the one identifier that makes the trace worth reading
+    would be gone. Secrets in this tool are routinely *named* after credentials.
+    """
+    _patch_client(monkeypatch, _FakeClient({"a": "1"}))
+
+    with verbose():
+        result = runner.invoke(secrets_cli.app, ["get", "prod/db/password"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "name=prod/db/password" in result.stderr
+
+
+def test_verbose_leaves_raw_output_byte_identical(monkeypatch, wide) -> None:
+    """``--raw`` pipes a secret into another program; --verbose may not touch it."""
+    _patch_client(monkeypatch, _FakeClient("s3cr3t-value"))
+
+    with verbose():
+        result = runner.invoke(secrets_cli.app, ["get", "my/secret", "--raw"])
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout == "s3cr3t-value\n"
+    assert "[dp:aws]" in result.stderr
+
+
+def test_verbose_traces_a_write_by_key_name_not_by_value(monkeypatch, wide) -> None:
+    client = _FakeClient({"password": "old-s3cr3t"})
+    _patch_client(monkeypatch, client)
+
+    with verbose():
+        result = runner.invoke(
+            secrets_cli.app,
+            ["edit", "--yes", "my/secret", "-k", "password", "-v", "new-s3cr3t"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    err = result.stderr
+    assert "secretsmanager.put_secret_value" in err
+    assert "name=my/secret" in err
+    assert "keys=password" in err
+    # Neither the new value nor the old one, and no length either: "9 chars" is a
+    # real hint about a password.
+    assert "new-s3cr3t" not in err
+    assert "old-s3cr3t" not in err
+    # The identity check that precedes the read is traced as its own service.
+    assert "[dp:aws] sts.get_caller_identity | profile=prod-profile" in err
+
+
+def test_verbose_traces_every_profile_a_write_fans_out_to(monkeypatch, wide) -> None:
+    """The multi-account case: each line must say which account it belonged to."""
+    monkeypatch.setenv("DP_AWS_PROFILE_ALIASES", "prod=Admin-Prod,qa=Admin-QA")
+    monkeypatch.setattr(
+        secrets_cli, "_get_client", lambda profile=None, region=None: _FakeClient({})
+    )
+
+    with verbose():
+        result = runner.invoke(
+            secrets_cli.app, ["set", "--yes", "my/secret", "--value", "x", "-p", "all"]
+        )
+
+    assert result.exit_code == 0, result.stdout
+    traced = [line for line in result.stderr.splitlines() if "put_secret_value" in line]
+    assert len(traced) == 2
+    assert "profile=Admin-Prod" in traced[0]
+    assert "profile=Admin-QA" in traced[1]
+
+
+def test_nothing_is_traced_without_verbose(monkeypatch, wide) -> None:
+    _patch_client(monkeypatch, _FakeClient({"a": "1"}))
+
+    result = runner.invoke(secrets_cli.app, ["get", "my/secret"])
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stderr == ""
 
 
 def test_versions_renders_hostile_version_ids(monkeypatch, wide) -> None:

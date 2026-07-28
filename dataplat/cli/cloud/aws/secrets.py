@@ -13,6 +13,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from dataplat.cli._exit import fail
 from dataplat.cli._options import JsonOption, YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
@@ -23,6 +24,7 @@ from dataplat.cli.cloud.aws._common import (
     profile_option,
     region_option,
     resolve_profiles,
+    trace_aws,
 )
 from dataplat.core.errors import AuthError
 from dataplat.services.aws.auth import get_client
@@ -42,7 +44,13 @@ _resolve_profiles = resolve_profiles
 
 
 def _get_client(profile: str | None = None, region: str | None = None):
-    """Return a boto3 Secrets Manager client, triggering SSO login if needed."""
+    """Return a boto3 Secrets Manager client, triggering SSO login if needed.
+
+    Auth failures exit through :func:`dataplat.cli._exit.fail`, so an expired SSO
+    session exits 4 here exactly as it does from ``cli_session``. It matters most
+    on this command group: a rotation script that fans a write across accounts
+    needs to retry "log in again" and stop on "your config is wrong".
+    """
     resolved = effective_profile(profile)
     try:
         return get_client(
@@ -52,8 +60,7 @@ def _get_client(profile: str | None = None, region: str | None = None):
             notify=lambda msg: console.print(f"[yellow]{esc(msg)}[/yellow]"),
         )
     except AuthError as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
 
 
 def _get_sts_client(profile: str | None = None, region: str | None = None):
@@ -67,8 +74,29 @@ def _get_sts_client(profile: str | None = None, region: str | None = None):
             notify=lambda msg: console.print(f"[yellow]{esc(msg)}[/yellow]"),
         )
     except AuthError as exc:
-        console.print(f"[red]{esc(exc)}[/red]")
-        raise typer.Exit(code=1)
+        fail(exc, console=console)
+
+
+def _trace_call(
+    operation: str,
+    *,
+    profile: str | None = None,
+    region: str | None = None,
+    **fields: object,
+) -> None:
+    """Trace one Secrets Manager call — the secret's name, never its value.
+
+    This module reads secret values for a living, so the line has to be drawn
+    explicitly rather than left to the redactor: the trace records *that* a value
+    was fetched or written and *which* secret it belonged to. Not the contents,
+    and not their length either — for a password, a length is a real hint, and
+    "48 chars" would be a credential detail sitting in a CI log.
+
+    The name is passed as ``name=``, never ``secret=``: :func:`redact` masks the
+    value after any credential-shaped key, and would blank out the one field that
+    makes the trace worth reading.
+    """
+    trace_aws("secretsmanager", operation, profile=profile, region=region, **fields)
 
 
 # ── shared options ──────────────────────────────────────────────────────────
@@ -133,6 +161,9 @@ def list_secrets(
     filters = []
     if prefix:
         filters.append({"Key": "name", "Values": [prefix]})
+    _trace_call(
+        "list_secrets", profile=profile, region=region, prefix=prefix or "(none)"
+    )
 
     entries: list[dict] = []
     try:
@@ -186,6 +217,7 @@ def get_secret(
     """Retrieve and display a secret value."""
     client = _get_client(profile, region)
 
+    _trace_call("get_secret_value", profile=profile, region=region, name=name)
     try:
         resp = client.get_secret_value(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
@@ -250,6 +282,9 @@ def compare_secret(
     for prof in resolved:
         alias = _alias_for(prof)
         client = _get_client(prof, region)
+        # Per profile, because "compare" is exactly the command where knowing
+        # which account answered what is the point.
+        _trace_call("get_secret_value", profile=prof, region=region, name=name)
         try:
             resp = client.get_secret_value(SecretId=name)
             raw = resp.get("SecretString", "")
@@ -395,9 +430,11 @@ def set_secret(
     for prof in resolved:
         client = _get_client(prof, region)
         alias = _alias_for(prof)
+        _trace_call("put_secret_value", profile=prof, region=region, name=name)
         try:
             client.put_secret_value(SecretId=name, SecretString=secret_value)
             if description is not None:
+                _trace_call("update_secret", profile=prof, region=region, name=name)
                 client.update_secret(SecretId=name, Description=description)
             console.print(
                 f"[green]\\[{esc(alias)}] Updated secret:[/green] {esc(name)}"
@@ -406,6 +443,7 @@ def set_secret(
             kwargs: dict = {"Name": name, "SecretString": secret_value}
             if description is not None:
                 kwargs["Description"] = description
+            _trace_call("create_secret", profile=prof, region=region, name=name)
             client.create_secret(**kwargs)
             console.print(
                 f"[green]\\[{esc(alias)}] Created secret:[/green] {esc(name)}"
@@ -503,6 +541,7 @@ def edit_secret(
     for prof in resolved:
         alias = _alias_for(prof)
         sts = _get_sts_client(prof, region)
+        trace_aws("sts", "get_caller_identity", profile=prof, region=region)
         try:
             ident = sts.get_caller_identity()
             console.print(
@@ -520,6 +559,7 @@ def edit_secret(
         console.print(f"[dim]\\[{esc(alias)}] Fetching {esc(name)} …[/dim]")
         client = _get_client(prof, region)
 
+        _trace_call("get_secret_value", profile=prof, region=region, name=name)
         try:
             resp = client.get_secret_value(SecretId=name)
         except client.exceptions.ResourceNotFoundException:
@@ -562,6 +602,15 @@ def edit_secret(
             )
             continue
 
+        # Key names, not values: the same keys are already printed to stdout
+        # below, and they are what identifies the edit in a fan-out run.
+        _trace_call(
+            "put_secret_value",
+            profile=prof,
+            region=region,
+            name=name,
+            keys=",".join(patch),
+        )
         try:
             client.put_secret_value(SecretId=name, SecretString=json.dumps(data))
         except ClientError as exc:
@@ -613,6 +662,7 @@ def rename_key(
         client = _get_client(prof, region)
         alias = _alias_for(prof)
 
+        _trace_call("get_secret_value", profile=prof, region=region, name=name)
         try:
             resp = client.get_secret_value(SecretId=name)
         except client.exceptions.ResourceNotFoundException:
@@ -647,6 +697,13 @@ def rename_key(
         for k, v in data.items():
             renamed[new_key if k == old_key else k] = v
 
+        _trace_call(
+            "put_secret_value",
+            profile=prof,
+            region=region,
+            name=name,
+            keys=f"{old_key}->{new_key}",
+        )
         client.put_secret_value(SecretId=name, SecretString=json.dumps(renamed))
         console.print(
             f"[green]\\[{esc(alias)}] Renamed key[/green] in [cyan]{esc(name)}[/cyan]"
@@ -687,6 +744,14 @@ def delete_secret(
     else:
         kwargs["RecoveryWindowInDays"] = 30
 
+    _trace_call(
+        "delete_secret",
+        profile=profile,
+        region=region,
+        name=name,
+        # Which of the two deletions was sent is the whole question afterwards.
+        recovery="none" if force else "30d",
+    )
     try:
         client.delete_secret(**kwargs)
     except client.exceptions.ResourceNotFoundException:
@@ -715,6 +780,7 @@ def restore_secret(
 ) -> None:
     """Cancel a scheduled deletion, restoring the secret."""
     client = _get_client(profile, region)
+    _trace_call("restore_secret", profile=profile, region=region, name=name)
     try:
         client.restore_secret(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
@@ -734,6 +800,7 @@ def describe_secret(
 ) -> None:
     """Show a secret's metadata: ARN, rotation, timestamps, tags."""
     client = _get_client(profile, region)
+    _trace_call("describe_secret", profile=profile, region=region, name=name)
     try:
         resp = client.describe_secret(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
@@ -783,6 +850,13 @@ def list_versions(
 ) -> None:
     """List a secret's versions with their stages (AWSCURRENT/AWSPREVIOUS)."""
     client = _get_client(profile, region)
+    _trace_call(
+        "list_secret_version_ids",
+        profile=profile,
+        region=region,
+        name=name,
+        deprecated="included",
+    )
     try:
         resp = client.list_secret_version_ids(SecretId=name, IncludeDeprecated=True)
     except client.exceptions.ResourceNotFoundException:
@@ -830,6 +904,7 @@ def rollback_secret(
 ) -> None:
     """Roll back to the previous version (move AWSCURRENT to AWSPREVIOUS)."""
     client = _get_client(profile, region)
+    _trace_call("list_secret_version_ids", profile=profile, region=region, name=name)
     try:
         resp = client.list_secret_version_ids(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
@@ -860,6 +935,16 @@ def rollback_secret(
         yes,
     )
 
+    _trace_call(
+        "update_secret_version_stage",
+        profile=profile,
+        region=region,
+        name=name,
+        stage="AWSCURRENT",
+        # Version ids are opaque handles, not values; which two were swapped is
+        # the only thing that makes a rollback reviewable after the fact.
+        moved=f"{current_id}->{previous_id}",
+    )
     try:
         client.update_secret_version_stage(
             SecretId=name,
