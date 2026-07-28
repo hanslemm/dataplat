@@ -40,7 +40,7 @@ from dataplat.cli.db._common import (
     TargetOption,
     UserOption,
     db_session,
-    resolve_params_or_exit,
+    resolve_any_params_or_exit,
 )
 from dataplat.cli.db._report import (
     DASH as _DASH,
@@ -72,9 +72,11 @@ from dataplat.cli.db._report import (
 from dataplat.cli.db._report import (
     title_card as _title_card,
 )
+from dataplat.services.db.capabilities import capabilities_for
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.describe import (
     DefaultPrivilegeGrant,
+    NotApplicable,
     ObjectKind,
     PartitioningInfo,
     PrivilegeGrant,
@@ -116,6 +118,13 @@ _CAPTION_SCHEMA_DEFAULT_PRIVILEGES = (
 _CAPTION_SCHEMA_HIGHLIGHTS = "Largest objects by total size."
 _CAPTION_DISTRIBUTION = "Redshift distribution style and sort keys."
 _CAPTION_TABLE_STATS = "Redshift storage statistics."
+# The one caption that has to argue rather than label: the whole reason this
+# section exists is that a *missing* section and an *empty* one say different
+# things, and a reader cannot tell them apart without being told.
+_CAPTION_NOT_APPLICABLE = (
+    "Sections this engine has no concept of. Absent here means the concept does "
+    "not exist — not that nothing is configured."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +636,45 @@ def _render_redshift_extras(
 
 
 # ---------------------------------------------------------------------------
+# Sections the engine has no concept of
+# ---------------------------------------------------------------------------
+
+
+def _render_not_applicable(
+    console: Console,
+    counter: _SectionCounter,
+    items: list[NotApplicable],
+    engine: SqlEngine,
+) -> None:
+    """List the sections this engine cannot have, and why.
+
+    Rendered as a real numbered section rather than a footnote, because it
+    carries the same weight as the data sections: on DuckDB, "no Privileges
+    section" is the answer to "who can read this table", and the reader has to
+    be able to see that they were told rather than that something failed.
+
+    Empty for PostgreSQL and Redshift today, which is why nothing about the
+    existing reports moves.
+    """
+    if not items:
+        return
+    label = capabilities_for(engine).label
+    _print_section_heading(
+        console, counter, f"Not applicable on {label}", _CAPTION_NOT_APPLICABLE
+    )
+    table = _report_table(zebra=len(items) > 5)
+    table.add_column("Section")
+    table.add_column("Why", overflow="fold")
+    for item in items:
+        # cell() on both, though both strings are ours today: the reasons are
+        # sourced from capabilities.py and one may yet interpolate a catalog
+        # name, and a renderer that trusts *some* of its input is the one that
+        # breaks later. Same rule as every other cell in this module.
+        table.add_row(cell(item.section), cell(item.reason))
+    console.print(_indent(table))
+
+
+# ---------------------------------------------------------------------------
 # Top-level renderers
 # ---------------------------------------------------------------------------
 
@@ -667,6 +715,7 @@ def _render_table_description(
     _render_triggers(console, counter, desc, "Triggers")
     _render_rls(console, counter, desc)
     _render_redshift_extras(console, counter, desc, engine)
+    _render_not_applicable(console, counter, desc.not_applicable, engine)
 
     # Matview definition last (can be long).
     if desc.definition:
@@ -699,6 +748,7 @@ def _render_view_description(
     _render_view_dependencies(console, counter, desc)
     _render_privileges(console, counter, desc.privileges)
     _render_triggers(console, counter, desc, "Triggers (INSTEAD OF)")
+    _render_not_applicable(console, counter, desc.not_applicable, engine)
 
     # Definition LAST — it can be hundreds of lines.
     _print_section_heading(console, counter, "Definition", _CAPTION_DEFINITION)
@@ -789,9 +839,8 @@ def _render_schema_highlights(
 
 
 def _render_schema_description(
-    console: Console, desc: SchemaDescription, _engine: SqlEngine
+    console: Console, desc: SchemaDescription, engine: SqlEngine
 ) -> None:
-    del _engine  # unused; present for dispatcher interface symmetry
     _print_title_card_and_gap(
         console,
         title=esc(desc.header.name),
@@ -805,21 +854,25 @@ def _render_schema_description(
     _render_schema_highlights(console, counter, desc)
     if desc.contents:
         _print_section_heading(console, counter, "Contents", _CAPTION_SCHEMA_CONTENTS)
+        # An Owner column of blanks would invite the reader to wonder what went
+        # wrong. On an engine with no users nothing went wrong, and the
+        # Privileges note in _render_not_applicable is where that is explained.
+        has_owner = any(item.owner for item in desc.contents)
         table = _report_table(zebra=len(desc.contents) > 5)
         table.add_column("Name")
         table.add_column("Kind", style="dim")
-        table.add_column("Owner")
+        if has_owner:
+            table.add_column("Owner")
         table.add_column("Rows", justify="right")
         table.add_column("Size", justify="right")
         for item in desc.contents:
-            table.add_row(
-                cell(item.name),
-                cell(item.kind),
-                cell(item.owner),
-                _fmt_rows(item.row_estimate),
-                _fmt_size(item.size_bytes),
-            )
+            row: list[str | Text] = [cell(item.name), cell(item.kind)]
+            if has_owner:
+                row.append(cell(item.owner))
+            row += [_fmt_rows(item.row_estimate), _fmt_size(item.size_bytes)]
+            table.add_row(*row)
         console.print(_indent(table))
+    _render_not_applicable(console, counter, desc.not_applicable, engine)
 
 
 def render_description(
@@ -868,7 +921,14 @@ def describe(
     env_prefix: str | None = EnvPrefixOption,
     as_json: bool = JsonOption,
 ) -> None:
-    """Entry point for ``dp db describe <target>``."""
+    """Entry point for ``dp db describe <target>``.
+
+    One of the three commands that works on every engine, so it resolves through
+    :func:`resolve_any_params_or_exit` and receives whichever param shape the
+    target's engine needs. Nothing below has to know which: ``db_session``
+    dispatches the driver, ``params.engine`` picks the dialect, and the report
+    itself names the sections the engine has no concept of.
+    """
     console = Console()
     targets = _split_targets(target)
     if not targets:
@@ -877,7 +937,7 @@ def describe(
         )
         raise typer.Exit(code=1)
 
-    conn_params = resolve_params_or_exit(
+    conn_params = resolve_any_params_or_exit(
         ConnCliParams(
             target=db_target,
             engine=engine,
