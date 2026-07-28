@@ -477,6 +477,11 @@ def temp_role(
     through ``pg_cursor``: CREATE ROLE is transactional, so the rollback at the
     end of the test removes the role together with anything it came to own,
     which no explicit DROP could guarantee once the role had grants or objects.
+
+    A test may hand one role a grant option and re-grant from it under
+    ``SET ROLE``; teardown unwinds that chain, so a delegated grant needs no
+    hand-written REVOKE (see
+    ``test_harness.py::test_temp_role_teardown_unwinds_a_delegated_grant``).
     """
     created: list[str] = []
 
@@ -515,12 +520,24 @@ def temp_role(
         # with sample_schema, the rollback is what really guarantees cleanup;
         # skip the DROPs entirely once the transaction is already aborted.
         if _txn_usable(pg_cursor.connection):
+            # Two passes, not one interleaved loop, and the split is
+            # load-bearing for delegated grants. `DROP OWNED BY r CASCADE` is
+            # implemented as `REVOKE ALL ... FROM r CASCADE` attributed to *this
+            # session's* grantor, so it cannot touch an ACL entry some other
+            # temp role granted: given `GRANT ... TO delegate WITH GRANT
+            # OPTION` followed by `SET ROLE delegate; GRANT ... TO onward`, the
+            # entry `onward=U/delegate` outlives `DROP OWNED BY onward` and the
+            # DROP ROLE right after it fails with DependentObjectsStillExist.
+            # Draining every role first fixes it in any creation order: the
+            # CASCADE on the *delegate's* revoke removes the grants the
+            # delegate made, transitively, whenever that role's turn comes.
             for name in reversed(created):
                 pg_cursor.execute(
                     sql.SQL("DROP OWNED BY {role} CASCADE").format(
                         role=sql.Identifier(name)
                     )
                 )
+            for name in reversed(created):
                 pg_cursor.execute(
                     sql.SQL("DROP ROLE IF EXISTS {role}").format(
                         role=sql.Identifier(name)

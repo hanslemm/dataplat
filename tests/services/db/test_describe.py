@@ -884,3 +884,38 @@ def test_fetch_schema_privileges_postgres_is_untouched_by_the_redshift_fix() -> 
     assert "aclexplode" in sql
     assert "has_schema_privilege" not in sql
     assert params == ("analytics",)
+
+
+def test_fetch_schema_privileges_postgres_derives_the_owners_grant_option() -> None:
+    """The grant option cannot come from the ACL bit alone.
+
+    An ACL never records an owner's grant option, but the owner has one; the
+    relation half of the report gets that from information_schema, so the schema
+    half applies the same rule with pg_has_role(). Live proof is in
+    tests/integration/test_describe_pg.py -- this only pins the emitted SQL, so
+    the expression cannot be dropped as redundant.
+    """
+    cursor = FakeCursor([[]])
+
+    fetch_schema_privileges(cursor, "analytics", SqlEngine.postgresql)
+
+    sql, _ = cursor.queries[0]
+    assert "pg_has_role((acl).grantee, n.nspowner, 'USAGE')" in sql
+
+
+def test_fetch_schema_privileges_redshift_keeps_the_raw_grant_option() -> None:
+    """The owner-grant-option fix must not have leaked onto the Redshift path.
+
+    Redshift has no aclexplode() and no cluster is reachable to test a
+    replacement, so that branch keeps its has_schema_privilege() scans and their
+    documented gap: a hardcoded false grant option, one per scan.
+    """
+    cursor = FakeCursor([[]])
+
+    fetch_schema_privileges(cursor, "analytics", SqlEngine.redshift)
+
+    sql, params = cursor.queries[0]
+    assert "pg_has_role" not in sql
+    assert "aclexplode" not in sql
+    assert sql.count("false") == 2
+    assert params == ("analytics", "analytics")
