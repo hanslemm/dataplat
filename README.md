@@ -49,7 +49,9 @@ dp
 
 ## Installation
 
-Requires Python 3.12 or newer.
+Requires Python 3.12 or newer, on Linux or macOS. Windows is untested and parts
+of it will not work: `dp config init` creates a symlink, the dependency
+self-install re-execs the process, and `dp ci github runner` drives `docker`.
 
 ```bash
 uv tool install "dataplat[all]"     # recommended: everything
@@ -95,6 +97,23 @@ Either path only ever *adds* to your install: the command is pinned to the
 `dataplat` version you already run, so installing an extra never upgrades the
 tool underneath you, and it carries your existing extras along, so adding
 `db` cannot drop an `ingest` you already had.
+
+## Shell completion
+
+```bash
+dp --install-completion    # detect the shell, write the script, hook it up
+dp --show-completion       # print it instead, and install it yourself
+```
+
+Completion takes effect in the next shell. bash, zsh and fish are supported;
+`--show-completion` is the escape hatch when your rc file is managed by
+something else (Nix, chezmoi, a dotfiles repo) or when shell detection fails.
+
+`dp <TAB>` is answered from the area names alone and imports nothing.
+Completing *inside* an area has to import it, because the subcommands it owes
+the shell are that area's own — so the first `dp db <TAB>` pays for psycopg, and
+an area whose extra is not installed completes to nothing rather than offering
+to install it mid-keystroke.
 
 ## Quick start
 
@@ -158,6 +177,7 @@ rely only on the global link you chose.
 | --- | --- |
 | `DP_ENVRC_PATH` | Explicit `.envrc` to load, ahead of every other candidate. |
 | `DP_ENVRC_ALLOW_CWD` | Set to `0` to stop picking up `.envrc` from the current directory. |
+| `DP_VERBOSE` | Set to `1` to trace every statement and request to stderr, for a whole session — same switch as `--verbose`. |
 | `DP_TARGETS` | Comma-separated DB target names (e.g. `warehouse,lake`). |
 | `DP_DEFAULT_TARGET` | Target used when `--target` is omitted (default: first of `DP_TARGETS`). |
 | `<NAME>_ENGINE` | `postgresql` (default) or `redshift`, per target. |
@@ -186,6 +206,89 @@ rely only on the global link you chose.
 - **`--limit/-n`** — row caps share one spelling everywhere.
 - **Secrets stay off argv** — prefer `--value-stdin` / hidden prompts; values
   are never echoed back.
+- **`--verbose`** — a root flag: show what the tool actually sent, on stderr.
+
+### Exit codes
+
+Exit codes are a contract, not an implementation detail — a wrapper script
+branches on them long after it has stopped reading our output:
+
+| Code | Meaning | Retry? |
+| --- | --- | --- |
+| `0` | Success. | — |
+| `1` | Unexpected or not-yet-classified failure. Also a declined confirmation: "no" is not an error, but it is not "done" either. | No — you don't know what happened. |
+| `2` | Invalid input: an unknown flag or target, a value that cannot be parsed, a combination of arguments that cannot work. | No — the command itself is wrong. |
+| `3` | Configuration problem: missing connection settings, an unknown engine, an unset `AIRBYTE_BASE_URL` or `DP_DBT_PROJECT`. | No — a human has to fix the config. |
+| `4` | Authentication failure: credentials rejected, a login endpoint that would not authenticate, `aws sso login` failed. | No — a new credential is needed. |
+| `5` | External service failure: a call to Airbyte, Superset or AWS failed, timed out or returned something unusable; a warehouse that refused the operation. | **Yes** — the only class where a retry can help. |
+
+`0`, `1` and `2` keep their conventional meanings. `2` is Click's own code for a
+usage error, which is why invalid input shares it: `dp db query --format nope`
+(Click's complaint) and `-t nosuchtarget` (ours) are one condition to the
+caller — "you passed something I cannot use" — and splitting them by who noticed
+would be a distinction with no use.
+
+The point of the codes above `2` is that `5` is the one worth retrying, and `3`
+and `4` are the ones you must never retry: no amount of sleeping and trying
+again creates a missing config file or repairs a rejected password. Cap the
+retries anyway — `5` means "the other end failed", which covers a warehouse
+that was restarting *and* a `DROP` the server refused because something still
+depends on it, and only the first of those gets better on its own.
+
+```bash
+dp db long-queries -t warehouse --json > queries.json
+case $? in
+  0) ;;
+  5) echo "service unavailable; will retry" >&2; exit 75 ;;   # EX_TEMPFAIL
+  *) echo "not retryable; fix and re-run" >&2; exit 1 ;;
+esac
+```
+
+Treat `1` as "unknown", never as "retryable": it is the code for a failure
+dataplat has not classified, so retrying it is a guess.
+
+### Verbose tracing
+
+`--verbose` (or `DP_VERBOSE=1`) answers the one question logs cannot: what did
+`dp` actually send?
+
+```bash
+dp --verbose db query 'SELECT 1'              # root flag, before the subcommand
+DP_VERBOSE=1 dp db long-queries 2> trace.log  # or for a whole session
+dp --verbose db describe public 2>&1 >/dev/null | grep '\[dp:sql\]'
+```
+
+Every line is prefixed with its category — `[dp:sql]` or `[dp:http]` — and
+collapsed onto one line, so the output greps cleanly:
+
+```text
+[dp:sql] connect me@db.example.com:5432/analytics engine=postgresql
+[dp:sql] SELECT 1 FROM pg_namespace WHERE nspname = %s | 1 params bound
+[dp:http] GET https://api.airbyte.com/v1/jobs?limit=20
+[dp:http] GET https://api.airbyte.com/v1/jobs?limit=20 -> 200 143.8ms
+```
+
+SQL is traced *before* the statement runs, which is the point: the trace you
+need is the one for the query that never came back, and a line written afterwards
+would never be written at all. That is also why there is no duration on it — use
+`dp db long-queries` for how long. HTTP gets two lines for the same reason, one
+on the way out and one on the response; a line with no `-> status` partner *is*
+the signal that a request hung, was refused, or never connected.
+
+**It writes to stderr and never to stdout**, so `--json` and `--format csv` stay
+machine-readable with tracing on. Piping into `jq` is still valid, and
+`2>/dev/null` drops the trace without touching the data:
+
+```bash
+dp --verbose db query --format json 'SELECT 1' 2>/dev/null | jq
+```
+
+**Secrets are never traced.** Every message is redacted on the way out —
+passwords (including the SQL `PASSWORD '…'` literal that role creation sends),
+tokens, API keys, `Authorization` headers and credentials embedded in a URL all
+become `***`. Parameter values, result rows and response bodies are not traced
+at all: they are your warehouse's data, and a trace that scrolls the answer past
+you has hidden the request it exists to show.
 
 ## Examples
 

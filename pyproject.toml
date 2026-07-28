@@ -21,7 +21,19 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "Operating System :: OS Independent",
+    # Not "OS Independent": that was a claim nothing backed. `dp config init`
+    # calls Path.symlink_to (core/envrc.py), which on Windows needs Developer
+    # Mode or elevation; the dependency self-install re-execs via os.execvp
+    # (cli/_missing.py), which on Windows returns to the shell before the child
+    # finishes, so the re-run's exit code is lost; `dp ci github runner` shells
+    # out to docker; and role_create.py creates the credentials CSV with mode
+    # 0600, which Windows ignores -- the file it just wrote would then be
+    # reported insecure by its own permission check. CI is ubuntu-latest only
+    # and macOS is the author's daily driver, so these two are what is actually
+    # exercised. A classifier is a claim about what was tested; add Windows when
+    # something tests Windows.
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Database",
