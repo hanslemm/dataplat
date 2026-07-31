@@ -474,10 +474,16 @@ def role_exists(cursor: Any, name: str) -> bool:
 # GRANT plan
 # ---------------------------------------------------------------------------
 
-#: Grantee meaning "every principal". A keyword, not a catalog object — and not
-#: a legal recipient of role membership on either engine, which is why
-#: :func:`resolve_grantee_kinds` refuses it by name.
-PUBLIC = "PUBLIC"
+
+def _public() -> str:
+    """``PUBLIC``, imported lazily to keep ``grantees`` free of a cycle.
+
+    ``grantees`` imports ``role_dialects`` for :class:`ParentKind`, and
+    ``role_dialects`` is imported by this module at load time.
+    """
+    from dataplat.services.db.grantees import PUBLIC
+
+    return PUBLIC
 
 
 @dataclass(frozen=True)
@@ -516,6 +522,7 @@ def resolve_grantee_kinds(
     forced: ParentKind | None = None,
     *,
     flag: str,
+    allow_public: bool = False,
 ) -> dict[str, ParentKind]:
     """Map each name to a single kind, refusing to guess when ambiguous.
 
@@ -527,17 +534,28 @@ def resolve_grantee_kinds(
     where users, groups and roles are three catalogs sharing no namespace.
     Picking one silently would grant a different set of privileges than the
     operator asked for, so this raises instead.
+
+    ``allow_public`` admits the ``PUBLIC`` keyword, which is legal for *object*
+    privileges and not for role membership — so the schema commands pass it and
+    ``role grant`` does not. The kind returned for it is a placeholder:
+    :func:`~dataplat.services.db.grantees.render_grantee` special-cases PUBLIC by
+    name and never reads the kind. Callers that branch on kind must therefore
+    exclude PUBLIC explicitly — the Redshift default-privileges skip does.
     """
+    public = _public()
     out: dict[str, ParentKind] = {}
     for name in names:
-        if name.upper() == PUBLIC:
+        if name.upper() == public:
+            if allow_public:
+                out[name] = ParentKind.role  # placeholder; see the docstring
+                continue
             # Verified on PostgreSQL 16: `GRANT <role> TO PUBLIC` fails with
             # 'role "public" does not exist'. PUBLIC is a grantee for *object*
             # privileges, not for role membership, on either engine. Caught here
             # rather than at execution because --create-missing-users would
             # otherwise try to CREATE a user named PUBLIC first.
             raise ValidationError(
-                f"{PUBLIC} cannot receive or hold role membership. It is a "
+                f"{public} cannot receive or hold role membership. It is a "
                 "grantee for object privileges only (GRANT ... ON SCHEMA / "
                 "TABLE), not for GRANT <role> TO <target>."
             )
