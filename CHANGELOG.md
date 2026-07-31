@@ -21,8 +21,45 @@
   types in `other` — so nothing a future `schema drop` pre-flight cares about can
   go uncounted.
 
-  This is the first slice of a larger `dp db schema` group; `create`, `drop`,
-  `grant`, `revoke` and `alter` are not in this release.
+- **The rest of `dp db schema`: `create`, `drop`, `grant`, `revoke`, `alter`.**
+
+  `list`, `create` and `drop` work on all three engines. `grant`, `revoke` and
+  `alter` need a server, and DuckDB refuses them with the reason measured from the
+  engine: it has no `GRANT` statement at all (the keyword does not parse) and does
+  not implement `ALTER SCHEMA` ("Altering schemas is not yet supported").
+  `create --owner` is refused there too — `AUTHORIZATION` does not parse.
+
+  **Privileges** take `usage`, `create`, `all`, `select`, `insert`, `update`,
+  `delete`, `table-all`, `sequence-usage`, `function-execute`, `default-select`,
+  `default-all`, or the presets `read` / `readwrite`. Use
+  `--grant grantee:privileges` when two grantees need different things in one
+  invocation. `PUBLIC` is valid here, unlike in `role grant` — an object privilege
+  to PUBLIC is ordinary SQL, while role membership to it is not.
+
+  Three behaviours that exist to stop a grant that silently does nothing:
+
+  - Any table-level privilege implies `usage` on the containing schema.
+  - `default-*` privileges require a grantor. `ALTER DEFAULT PRIVILEGES` without
+    `FOR ROLE`/`FOR USER` binds to whoever is connected, so tables later created
+    by dbt or the schema owner inherit nothing. Each schema's own owner is the
+    default; `--default-for` overrides. An integration test creates a table *as*
+    the grantor and asserts the grantee can actually select from it.
+  - Grants already in effect are reported, not re-issued, so re-running converges.
+
+  **Destructive paths.** `drop` prints owner and object counts before the
+  confirmation, so `--cascade`'s blast radius is visible rather than implied, and
+  warns up front when `RESTRICT` will refuse. `RESTRICT` is emitted explicitly
+  rather than left to the server default. `drop` and `alter` refuse `public`,
+  `main`, `information_schema`, `catalog_history` and anything `pg_*` — matched
+  with `casefold()`, and re-checked after `--like` expansion, because
+  `list_schemas` hides `pg_*` but not `public`.
+
+  A quota is neither an identifier nor a bindable parameter, so it is interpolated
+  into DDL text; `parse_quota` rebuilds it from parsed regex groups, and
+  `CreateSchemaSpec` re-normalizes so that holds for library callers too.
+
+  Every one of the twelve privilege statements, plus create/drop/alter, is
+  executed against a live PostgreSQL 16 rather than asserted against a fake.
 
 - **`dp db role grant` — grant existing roles to users/roles in one pass.**
   `role create` can wire up membership for a role it is creating; this is the

@@ -17,7 +17,8 @@ dp
 │   ├── describe           # schema/table/view report (--json)
 │   ├── long-queries       # triage per target (--history, --json)      [1]
 │   ├── kill               # cancel/terminate queries by PID            [1]
-│   ├── role               # list | show | create | drop                [1]
+│   ├── role               # list | show | create | grant | drop        [1]
+│   ├── schema             # list | create | drop | grant | revoke | alter [2]
 │   ├── top-tables         # rank big tables (--drop-sql, --drop)
 │   └── dbt-orphans        # scan/rename | revert | purge (--older-than) [1]
 ├── ingest                 # data ingestion
@@ -50,6 +51,10 @@ dp
 [1] Cannot apply to a `duckdb` target: an in-process, single-user database has no
 roles, no other sessions, and no rename that survives a dependent view. See
 [Engines](#engines) for the matrix and the reason per command.
+
+[2] `list`, `create` and `drop` work on every engine; `grant`, `revoke` and
+`alter` need a server — DuckDB has no `GRANT` statement and does not implement
+`ALTER SCHEMA`.
 
 ## Installation
 
@@ -228,7 +233,9 @@ all — every connection is the same implicit user, `duckdb`.
 | `query` | ✓ | ✓ | ✓ | — |
 | `describe` | ✓ | ✓ | ✓ | — |
 | `top-tables` | ✓ | ✓ | ✓ | works, but ranks by estimated rows and shows no sizes — [see below](#duckdb-top-tables-sizes-are-estimates) |
-| `schema list` | ✓ | ✓ ³ | ✓ ⁴ | — |
+| `schema list` / `create` / `drop` | ✓ | ✓ ³ | ✓ ⁴ | — |
+| `schema grant` / `revoke` | ✓ | ✓ | ✗ | it has no `GRANT` statement at all — the keyword does not parse, because there are no users or roles to grant anything to |
+| `schema alter` | ✓ | ✓ ⁵ | ✗ | it does not implement `ALTER SCHEMA` ("Altering schemas is not yet supported"), and has neither owners nor quotas to alter |
 | `role list` / `show` / `create` / `grant` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
 | `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
 | `kill` | ✓ | ✓ | ✗ | the same — there is no other session to cancel |
@@ -245,7 +252,12 @@ view renders every quota as `?` rather than failing the listing.
 ⁴ `dp db schema list` reports `duckdb` as every schema's owner — there is no
 `pg_roles` and every connection is the same implicit user — and
 `--include-system` reveals nothing extra, because DuckDB keeps its catalog
-schemas out of `pg_namespace` entirely.
+schemas out of `pg_namespace` entirely. `dp db schema create` works but rejects
+`--owner`: `CREATE SCHEMA ... AUTHORIZATION` does not parse there.
+⁵ `dp db schema alter --quota` is Redshift-only, and so is `create --quota`. Off
+Redshift the flag warns and is skipped when there is other work to do, and is an
+error when it is the only change requested — a silent skip there would report
+success having done nothing.
 
 A refused command **exits 2** — "a combination of arguments that cannot work",
 the same code as an unknown flag or an unknown target — and says which engine
@@ -557,13 +569,46 @@ command is safe to re-run.
 dp db schema list                        # schemas with owner and object counts
 dp db schema list --like 'dev_*'         # glob `*` or SQL `%`, either works
 dp db schema list --include-system       # add pg_catalog, information_schema, …
-dp db schema list -t local --json
+dp db schema create analytics --owner svc_etl --quota 50GB
+dp db schema drop dev_old --cascade --dry-run
+dp db schema grant --schemas analytics --to readers --privileges read
+dp db schema grant --grant readers:read --grant etl:readwrite --schemas analytics
+dp db schema revoke --schemas analytics --from contractor --privileges all --cascade
+dp db schema alter analytics --owner svc_new --quota UNLIMITED
+dp db schema alter dev_a --rename-to dev_b
 ```
 
-Works on all three engines, because all three have schemas — no refusal here (see
-[Engines](#engines)). What differs is where the answer comes from: PostgreSQL
-resolves the owner through `pg_roles`, Redshift through `pg_user`, and DuckDB has
-no `pg_roles` at all, so it reports its single implicit user, `duckdb`.
+`list`, `create` and `drop` work on all three engines. `grant`, `revoke` and
+`alter` need a server: DuckDB has no `GRANT` statement at all and does not
+implement `ALTER SCHEMA` (see [Engines](#engines)). What differs on `list` is
+where the answer comes from: PostgreSQL resolves the owner through `pg_roles`,
+Redshift through `pg_user`, and DuckDB has no `pg_roles` at all, so it reports its
+single implicit user, `duckdb`.
+
+**Privileges.** `--privileges` takes any of `usage`, `create`, `all`, `select`,
+`insert`, `update`, `delete`, `table-all`, `sequence-usage`, `function-execute`,
+`default-select`, `default-all`, or the presets `read` and `readwrite`. Use
+`--grant grantee:privileges` when two grantees need different things in one
+invocation. `PUBLIC` is a valid grantee here — unlike `dp db role grant`, where
+role membership cannot be granted to it.
+
+Three behaviours worth knowing:
+
+- **Any table-level privilege implies `usage`** on the containing schema, because
+  an object cannot be reached without it.
+- **`default-*` privileges require a grantor.** `ALTER DEFAULT PRIVILEGES`
+  without `FOR ROLE`/`FOR USER` binds to whoever is connected, so tables later
+  created by dbt or the schema owner inherit nothing — the most common way
+  default privileges silently fail. Each schema's own owner is used by default;
+  `--default-for` overrides it.
+- **Grants already in effect are reported, not re-issued**, so re-running
+  converges and the plan shows only what changes.
+
+**Destructive paths.** `drop` prints owner and object counts *before* the
+confirmation, so `--cascade`'s blast radius is visible rather than implied, and
+`RESTRICT` is emitted explicitly rather than left to the server default. `drop`
+and `alter` both refuse `public`, `main`, `information_schema`, `catalog_history`
+and anything `pg_*` — including via `--like`, which is re-checked after matching.
 
 Redshift adds schema quotas, shown as two extra columns when the cluster reports
 them. An unknown quota renders as `?`, never `0` — `svv_schema_quota_state` is
