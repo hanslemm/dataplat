@@ -99,6 +99,8 @@ class Capability(str, Enum):
     acl_introspection = "acl_introspection"
     relation_size_functions = "relation_size_functions"
     rename_with_dependents = "rename_with_dependents"
+    schema_privileges = "schema_privileges"
+    schema_alter = "schema_alter"
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,11 @@ class EngineCapabilities:
     # ALTER ... RENAME TO succeeds when a view depends on the relation, which is
     # the premise of quarantining an orphan by renaming it out of the way.
     rename_with_dependents: Support
+    # A GRANT statement exists at all — the premise of granting or revoking
+    # privileges on a schema.
+    schema_privileges: Support
+    # ALTER SCHEMA is implemented, for an owner, a quota or a rename.
+    schema_alter: Support
 
     def support(self, capability: Capability) -> Support:
         """This engine's :class:`Support` for ``capability``."""
@@ -177,6 +184,8 @@ _POSTGRESQL = EngineCapabilities(
     acl_introspection=_HAS,
     relation_size_functions=_HAS,
     rename_with_dependents=_HAS,
+    schema_privileges=_HAS,
+    schema_alter=_HAS,
 )
 
 # Redshift is not "PostgreSQL with everything true". Each False below is a
@@ -220,6 +229,10 @@ _REDSHIFT = EngineCapabilities(
     # fact — there is no cluster in CI — and if a conformance run refutes it,
     # this is the line to change.
     rename_with_dependents=_HAS,
+    # GRANT/REVOKE ON SCHEMA, and ALTER SCHEMA for owner, rename and QUOTA --
+    # the last of which is Redshift-only and is why alter_quota exists.
+    schema_privileges=_HAS,
+    schema_alter=_HAS,
 )
 
 # Everything False here was probed against duckdb 1.5.5 rather than read in a
@@ -251,6 +264,20 @@ _DUCKDB = EngineCapabilities(
     rename_with_dependents=_lacks(
         "ALTER TABLE ... RENAME TO fails with a DependencyException whenever a "
         "view depends on the table, and it has no CASCADE"
+    ),
+    # GRANT is not merely unsupported for schemas: the keyword does not parse.
+    # `GRANT USAGE ON SCHEMA s TO bob` raises ParserException at `GRANT`, which
+    # follows from having no principals to grant to.
+    schema_privileges=_lacks(
+        "it has no GRANT statement at all — the keyword does not parse, because "
+        "there are no users or roles to grant anything to"
+    ),
+    # `ALTER SCHEMA s RENAME TO t` raises NotImplementedException: "Altering
+    # schemas is not yet supported". Unlike the others this one is a gap rather
+    # than a consequence of the engine's design, so it may well change.
+    schema_alter=_lacks(
+        "it does not implement ALTER SCHEMA — the engine answers 'Altering "
+        "schemas is not yet supported' — and it has no owners or quotas to alter"
     ),
 )
 
