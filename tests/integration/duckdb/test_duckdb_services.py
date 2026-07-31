@@ -55,7 +55,7 @@ from dataplat.cli.db._common import (
     DuckDbSession,
     db_session,
 )
-from dataplat.core.errors import ExitCode
+from dataplat.core.errors import ExitCode, ValidationError
 from dataplat.services.db.capabilities import Capability, capabilities_for
 from dataplat.services.db.connection import (
     MEMORY_PATH,
@@ -88,7 +88,14 @@ from dataplat.services.db.describe import (
     table_not_applicable,
     view_not_applicable,
 )
-from dataplat.services.db.schema_admin import translate_like_pattern
+from dataplat.services.db.role_dialects import ParentKind
+from dataplat.services.db.schema_admin import (
+    CreateSchemaSpec,
+    SchemaPrivilege,
+    build_create_plan,
+    build_drop_plan,
+    translate_like_pattern,
+)
 from dataplat.services.db.schema_dialects import DuckDbSchemaDialect
 from dataplat.services.db.top_tables import (
     SIZE_BASIS,
@@ -1567,3 +1574,125 @@ class TestSchemaList:
 
         assert dialect.schema_exists(ddb_cursor, SAMPLE_SCHEMA) is True
         assert dialect.schema_exists(ddb_cursor, "dp_absent_schema") is False
+
+
+class TestSchemaDdl:
+    """What DuckDB can and cannot do to a schema, asked of DuckDB.
+
+    The capability matrix refuses ``schema grant/revoke/alter`` there and allows
+    ``create``/``drop``. Both halves are probed: a gate that refuses too much is
+    as wrong as one that refuses too little, and only the engine can settle it.
+    """
+
+    def test_create_and_drop_round_trip(self, ddb_cursor: DuckDbCursor) -> None:
+        dialect = DuckDbSchemaDialect()
+        create = build_create_plan([CreateSchemaSpec("made")], dialect)
+        for op in create.ops:
+            ddb_cursor.execute(op.statement)
+        assert dialect.schema_exists(ddb_cursor, "made") is True
+
+        for op in build_drop_plan(["made"]).ops:
+            ddb_cursor.execute(op.statement)
+        assert dialect.schema_exists(ddb_cursor, "made") is False
+
+    def test_if_not_exists_is_idempotent(self, ddb_cursor: DuckDbCursor) -> None:
+        plan = build_create_plan(
+            [CreateSchemaSpec("twice", if_not_exists=True)], DuckDbSchemaDialect()
+        )
+        for _ in range(2):
+            for op in plan.ops:
+                ddb_cursor.execute(op.statement)
+
+        assert DuckDbSchemaDialect().schema_exists(ddb_cursor, "twice") is True
+
+    def test_restrict_refuses_a_non_empty_schema(
+        self, ddb_cursor: DuckDbCursor, ddb_module: ModuleType
+    ) -> None:
+        """Same semantics as Postgres, and worth proving rather than assuming."""
+        ddb_cursor.execute("CREATE SCHEMA full_one")
+        ddb_cursor.execute("CREATE TABLE full_one.t(i INTEGER)")
+
+        with pytest.raises(ddb_module.Error):
+            for op in build_drop_plan(["full_one"]).ops:
+                ddb_cursor.execute(op.statement)
+
+    def test_cascade_destroys_the_contents(self, ddb_cursor: DuckDbCursor) -> None:
+        ddb_cursor.execute("CREATE SCHEMA doomed")
+        ddb_cursor.execute("CREATE TABLE doomed.t(i INTEGER)")
+
+        for op in build_drop_plan(["doomed"], cascade=True).ops:
+            ddb_cursor.execute(op.statement)
+
+        assert DuckDbSchemaDialect().schema_exists(ddb_cursor, "doomed") is False
+
+    def test_authorization_does_not_parse_here(
+        self, ddb_cursor: DuckDbCursor, ddb_module: ModuleType
+    ) -> None:
+        """Why the dialect drops --owner and the CLI refuses it.
+
+        Built by hand rather than through the plan builder, precisely because the
+        builder will not emit it — this is the statement that would run if it did.
+        """
+        with pytest.raises(ddb_module.ParserException):
+            ddb_cursor.execute("CREATE SCHEMA authorized AUTHORIZATION bob")
+
+    def test_grant_does_not_parse_here(
+        self, ddb_cursor: DuckDbCursor, ddb_module: ModuleType
+    ) -> None:
+        """The measured fact behind the schema_privileges refusal."""
+        ddb_cursor.execute("CREATE SCHEMA grantable")
+
+        with pytest.raises(ddb_module.ParserException):
+            ddb_cursor.execute("GRANT USAGE ON SCHEMA grantable TO bob")
+
+    def test_alter_schema_is_not_implemented_here(
+        self, ddb_cursor: DuckDbCursor, ddb_module: ModuleType
+    ) -> None:
+        """The measured fact behind the schema_alter refusal.
+
+        A NotImplementedException rather than a parser error, which is why that
+        capability's reason says "does not implement" — this one may well change
+        in a future DuckDB, unlike having no users at all.
+        """
+        ddb_cursor.execute("CREATE SCHEMA renamable")
+
+        with pytest.raises(ddb_module.NotImplementedException):
+            ddb_cursor.execute("ALTER SCHEMA renamable RENAME TO renamed")
+
+    def test_the_capability_declarations_match_those_probes(self) -> None:
+        """Pair the engine facts above with what capabilities.py claims.
+
+        Neither half alone is enough: the declaration without the probe is a
+        memory of a doc, and the probe without the declaration is a fact nothing
+        consumes.
+        """
+        caps = capabilities_for(DDB)
+
+        assert not caps.support(Capability.schema_privileges)
+        assert not caps.support(Capability.schema_alter)
+        # And the two that are allowed, so the gate cannot quietly widen.
+        assert "GRANT" in caps.support(Capability.schema_privileges).reason
+        assert "ALTER SCHEMA" in caps.support(Capability.schema_alter).reason
+
+    def test_the_dialect_refuses_before_any_sql_is_built(self) -> None:
+        """The service-layer half of the CLI's gate.
+
+        A library caller bypassing the CLI must not be able to construct a
+        statement this engine cannot parse.
+        """
+        dialect = DuckDbSchemaDialect()
+
+        with pytest.raises(ValidationError, match="GRANT"):
+            dialect.privilege_op(SchemaPrivilege.usage, "s", "bob", ParentKind.user)
+        with pytest.raises(ValidationError, match="ALTER SCHEMA"):
+            dialect.rename_schema("s", "t")
+        with pytest.raises(ValidationError, match="owner"):
+            dialect.alter_owner("s", "bob")
+
+    def test_nothing_can_be_held_where_nothing_can_be_granted(
+        self, ddb_cursor: DuckDbCursor
+    ) -> None:
+        assert (
+            DuckDbSchemaDialect().held_schema_privileges(ddb_cursor, ["main"], ["bob"])
+            == set()
+        )
