@@ -19,8 +19,6 @@ written at all.
 from __future__ import annotations
 
 import csv
-import os
-import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,7 +46,11 @@ from dataplat.cli.db._common import (
     engine_or_exit,
     resolve_params_or_exit,
 )
-from dataplat.core.envrc import CONFIG_DIR
+from dataplat.cli.db._credentials import (
+    credentials_default_path,
+    file_mode_secure,
+    open_credentials_file,
+)
 from dataplat.core.errors import ValidationError
 from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
@@ -62,52 +64,6 @@ from dataplat.services.db.role_admin import (
     parse_csv_flag,
 )
 from dataplat.services.db.role_dialects import ParentKind, dialect_for
-
-# Generated credentials belong with dataplat's other state, not in whatever
-# directory the command happened to run from. A checkout is the likeliest cwd for
-# a data engineer, nothing gitignores dp-credentials-*.csv, and the file holds a
-# real password — so the old default could drop one inside a repo and wait to be
-# committed. Derived from envrc.CONFIG_DIR rather than rebuilt, so the config
-# location stays defined in one place.
-CREDENTIALS_DIR = CONFIG_DIR / "credentials"
-
-
-def _credentials_default_path() -> Path:
-    """A timestamped credentials CSV under the shared config directory.
-
-    The directory is created 0700 on first use: its listing alone leaks which
-    roles were created and when, even before anyone reads a file. The file itself
-    is opened 0600 by :func:`_open_credentials_file`.
-    """
-    CREDENTIALS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return CREDENTIALS_DIR / f"dp-credentials-{stamp}.csv"
-
-
-def _open_credentials_file(path: Path) -> tuple[Any, bool]:
-    """Open the credentials CSV in append mode with secure permissions.
-
-    Returns ``(file, is_new)``. New files are created with mode 0600. If
-    the file already exists, we leave its mode alone but warn the caller
-    so they can flag insecure permissions in the rendered output.
-    """
-    is_new = not path.exists()
-    if is_new:
-        # Create with 0600 atomically via os.open; otherwise there's a window
-        # where the file is readable before we chmod it.
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
-        file = os.fdopen(fd, "a", newline="")
-    else:
-        file = open(path, "a", newline="")  # noqa: SIM115
-    return file, is_new
-
-
-def _file_mode_secure(path: Path) -> bool:
-    try:
-        mode = path.stat().st_mode
-    except OSError:
-        return True  # don't block on a missing file we just created
-    return not bool(mode & (stat.S_IRWXG | stat.S_IRWXO))
 
 
 def _resolve_databases(
@@ -435,13 +391,17 @@ def create_command(
     # Open credentials file before executing — fail fast on permission issues.
     # --no-login generates no passwords, so no credentials file is touched.
     needs_credentials = any(s.password is not None for s in specs)
-    creds_path = credentials_out or _credentials_default_path()
+    # Resolved inside the branch: the default path creates
+    # ~/.config/dataplat/credentials/ as a side effect, and --no-login has no
+    # password to put in it.
+    creds_path: Path | None = None
     creds_file = None
     writer = None
     secure = True
     if needs_credentials:
-        creds_file, is_new_file = _open_credentials_file(creds_path)
-        secure = _file_mode_secure(creds_path)
+        creds_path = credentials_out or credentials_default_path()
+        creds_file, is_new_file = open_credentials_file(creds_path)
+        secure = file_mode_secure(creds_path)
         writer = csv.writer(creds_file)
         if is_new_file:
             writer.writerow(["username", "password", "created_at", "databases"])
