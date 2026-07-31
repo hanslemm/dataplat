@@ -2,7 +2,43 @@
 
 ## Unreleased
 
+### Added
+
+- **`dp db role grant` — grant existing roles to users/roles in one pass.**
+  `role create` can wire up membership for a role it is creating; this is the
+  command for every day after that. It takes the cross product of `--roles` and
+  `--to`, so onboarding three people to two roles is one invocation.
+
+  It validates the whole plan before executing any of it, so a typo in the last
+  `--to` fails before the first user is created. Grants already in effect are
+  reported and skipped rather than re-issued, which makes the command safe to
+  re-run after a partial failure. `--create-missing-users` creates any `--to`
+  name that does not exist yet as a login user, writing generated passwords to
+  the same `0600` CSV `role create` uses; creates and grants share one
+  transaction, so a failed grant leaves no half-onboarded user behind.
+
+  Three combinations are refused by name instead of surfacing as a raw SQL error
+  partway through a batch: adding a role to a Redshift group, granting a role
+  *to* a Redshift group (there is no `GRANT ROLE ... TO GROUP` form), and
+  granting a Redshift login user to anything (only roles and groups hold
+  members). On Redshift one name can be a user *and* a group *and* a role at
+  once — `--kind` / `--to-kind` disambiguate, and an ambiguous name is refused
+  rather than guessed. `PUBLIC` is refused too: verified on PostgreSQL 16,
+  `GRANT <role> TO PUBLIC` fails with `role "public" does not exist`, and
+  catching it early matters because `--create-missing-users` would otherwise try
+  to create a user called `PUBLIC`.
+
+  Ported from the upstream `dna-hq-cli`, with the Redshift-user refusal and the
+  `PUBLIC` refusal added here. The two catalog reads it needs — "what kind of
+  object is this name" and "which grants are already held" — are covered against
+  a live PostgreSQL server, not just fakes.
+
 ### Fixed
+
+- **`dp db role create --no-login` created `~/.config/dataplat/credentials/`
+  even though it generates no passwords.** The default credentials path is now
+  resolved inside the branch that needs it, so a command with no secret to write
+  no longer creates a directory to write it to. Same for `role grant --dry-run`.
 
 - **`dp db top-tables` and `dp db dbt-orphans` were broken on every Redshift
   target.** Both build a `LIKE` pattern and declare `ESCAPE '\'`, but Redshift

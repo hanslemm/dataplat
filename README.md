@@ -228,7 +228,7 @@ all — every connection is the same implicit user, `duckdb`.
 | `query` | ✓ | ✓ | ✓ | — |
 | `describe` | ✓ | ✓ | ✓ | — |
 | `top-tables` | ✓ | ✓ | ✓ | works, but ranks by estimated rows and shows no sizes — [see below](#duckdb-top-tables-sizes-are-estimates) |
-| `role list` / `show` / `create` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
+| `role list` / `show` / `create` / `grant` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
 | `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
 | `kill` | ✓ | ✓ | ✗ | the same — there is no other session to cancel |
 | `dbt-orphans` | ✓ | ✓ ² | ✗ | it quarantines an orphan by renaming it, and `ALTER TABLE … RENAME TO` fails with a `DependencyException` whenever a view depends on the table, which in a dbt project is the normal case. DuckDB has no `CASCADE` |
@@ -515,15 +515,33 @@ dp db role show alice -t lake --json
 dp db role create svc_reporting --table-select reporting --databases analytics
 dp db role create readers --no-login --table-select reporting   # passwordless group role
 dp db role create readers --no-login --grant-to alice,bob
+dp db role grant --roles readers,analyst --to alice,bob --dry-run
+dp db role grant --roles analyst --to newhire --create-missing-users
 dp db role drop old_user --all-databases --dry-run
 ```
 
-`list`, `create`, and `drop` work against both Postgres and Redshift targets —
-and against no DuckDB target, which has no users to manage at all (see
+`list`, `create`, `grant`, and `drop` work against both Postgres and Redshift
+targets — and against no DuckDB target, which has no users to manage at all (see
 [Engines](#engines)). `create` makes login roles with generated passwords by
 default; `--no-login` creates a passwordless group-style role instead. `drop`
 transfers owned objects to the target's `<NAME>_REASSIGN_OWNER` before
 `DROP USER`.
+
+`grant` is for the day after `create`: the role already exists and someone new
+needs it. It takes the cross product of `--roles` and `--to`, so two roles and
+three people is one invocation. It validates the whole plan before executing any
+of it, reports grants already in effect instead of re-issuing them, and refuses
+combinations the engine cannot express — a Redshift group holds login users
+only, and there is no `GRANT ROLE ... TO GROUP` form — rather than letting those
+surface as a raw SQL error partway through. On Redshift a name can be a user
+*and* a group *and* a role at once; `--kind` / `--to-kind` disambiguate, and an
+ambiguous name is refused rather than guessed.
+
+`--create-missing-users` creates any `--to` name that does not exist yet as a
+login user, writing generated passwords to the same CSV `create` uses
+(`~/.config/dataplat/credentials/`, mode `0600`). Creates and grants share one
+transaction, so a failed grant leaves no half-onboarded user behind and the
+command is safe to re-run.
 
 ### Cleanup
 
