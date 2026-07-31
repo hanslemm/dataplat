@@ -413,3 +413,45 @@ def test_guarded_cursor_still_reads_against_a_real_server() -> None:
             )
             assert cursor.fetchone() == ("public",)
     conn.close()
+
+
+def test_setup_hint_dsn_example_is_actually_parseable() -> None:
+    """The hint is the only instruction a stuck user gets; it must be runnable.
+
+    It advertised a redshift:// URL, which libpq rejects outright as an invalid
+    connection option — so following the harness's own guidance produced a
+    parse error rather than a connection. Redshift speaks the PostgreSQL wire
+    protocol and libpq knows only postgresql:// and postgres://.
+    """
+    import re
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    from tests.integration.redshift.conftest import _SETUP_HINT
+
+    # Only quoted URLs: the hint also mentions schemes in prose, and a sentence
+    # is not a connection string.
+    examples = re.findall(r"'([a-z][a-z0-9+.-]*://[^']+)'", _SETUP_HINT)
+    assert examples, f"no quoted DSN example found in the hint:\n{_SETUP_HINT}"
+    for dsn in examples:
+        # Raises psycopg.ProgrammingError if the scheme is one libpq refuses.
+        assert conninfo_to_dict(dsn), dsn
+
+
+def test_a_named_redshift_target_survives_the_suite_isolation() -> None:
+    """DP_TEST_RS_TARGET has to reach the target registry to mean anything.
+
+    tests/conftest.py assigns DP_TARGETS so the suite's fixtures cannot be
+    changed by a developer's shell, and that assignment silently erased a real
+    cluster's target name — making the target form the hint documents impossible
+    under pytest. It now appends instead.
+    """
+    import os
+
+    declared = os.environ.get("DP_TARGETS", "").split(",")
+    assert "demo_pg" in declared and "demo_rs" in declared
+    named = os.environ.get("DP_TEST_RS_TARGET", "").strip()
+    if named:
+        assert named in declared, (
+            f"DP_TEST_RS_TARGET={named!r} was not appended to DP_TARGETS: {declared}"
+        )
