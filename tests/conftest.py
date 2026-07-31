@@ -22,7 +22,21 @@ os.environ["COLUMNS"] = "200"
 
 # Config-driven DB targets for the whole test suite. Set before any dataplat
 # import: the target registry and option defaults read the environment early.
-os.environ["DP_TARGETS"] = "demo_pg,demo_rs"
+#
+# Assigned rather than setdefault-ed on purpose: what the suite's fixtures see
+# must not depend on the developer's shell. The one exception is a real Redshift
+# target named by DP_TEST_RS_TARGET — the Redshift tier resolves it through
+# dataplat's own config, which is the point of that variable, and a plain
+# assignment here silently erased it, so the documented target form could never
+# work under pytest. Appending keeps the demo targets authoritative and lets a
+# named cluster resolve alongside them.
+_DEMO_TARGETS = "demo_pg,demo_rs"
+_RS_TARGET = os.environ.get("DP_TEST_RS_TARGET", "").strip()
+os.environ["DP_TARGETS"] = (
+    f"{_DEMO_TARGETS},{_RS_TARGET}"
+    if _RS_TARGET and _RS_TARGET not in _DEMO_TARGETS.split(",")
+    else _DEMO_TARGETS
+)
 os.environ["DEMO_PG_ENGINE"] = "postgresql"
 os.environ["DEMO_PG_REASSIGN_OWNER"] = "demo_pg_root"
 os.environ["DEMO_RS_ENGINE"] = "redshift"
