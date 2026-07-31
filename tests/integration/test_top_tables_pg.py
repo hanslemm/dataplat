@@ -4,7 +4,7 @@ Two things in this module are impossible to validate with a fake cursor. The
 first is the catalog read itself: ``pg_class``/``pg_total_relation_size``,
 ``reltuples``'s negative "never analyzed" sentinel, and the relkind filter
 only mean something when a real server answers. The second is the
-``LIKE ... ESCAPE '\\'`` clause built by ``_build_schema_where``: a fake can
+``LIKE ... ESCAPE '#'`` clause built by ``_build_schema_where``: a fake can
 confirm the string contains a backslash, but only PostgreSQL can say whether a
 schema whose name literally contains ``_``, ``%`` or ``\\`` still matches
 exactly one prefix.
@@ -17,8 +17,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE
 from dataplat.services.db.connection import SqlEngine
-from dataplat.services.db.top_tables import drop_statement, fetch_top_tables
+from dataplat.services.db.top_tables import (
+    _build_schema_where,
+    drop_statement,
+    fetch_top_tables,
+)
 from tests.integration.conftest import SAMPLE_RELATIONS
 
 if TYPE_CHECKING:
@@ -318,3 +323,62 @@ def test_generated_drop_is_idempotent_and_quotes_hostile_names(
     assert not _relation_exists(pg_cursor, sample_schema, hostile)
     # IF EXISTS is what makes a suggested statement safe to paste twice.
     pg_cursor.execute(statement)
+
+
+@pytest.mark.integration
+def test_like_escape_survives_redshift_string_literal_parsing(pg_dsn: str) -> None:
+    """The closest thing to Redshift coverage this suite can have.
+
+    Redshift runs with ``standard_conforming_strings`` off, and that single
+    setting is what made ``ESCAPE '\\'`` a syntax error there while every test
+    here passed: PostgreSQL has it on and parses the same text fine. A session
+    started with the Redshift setting reproduces the failure exactly, so the
+    engine nobody can reach in CI gets one real guard.
+
+    Proven before the fix::
+
+        ERROR:  unterminated quoted string at or near "'\\'"
+    """
+    psycopg = pytest.importorskip("psycopg")
+
+    # options= applies before the first statement is parsed. Setting it with a
+    # SET inside the same batch is too late -- the whole batch is parsed first,
+    # which is why an earlier attempt at this test wrongly passed.
+    with (
+        psycopg.connect(pg_dsn, options="-c standard_conforming_strings=off") as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SHOW standard_conforming_strings")
+        row = cursor.fetchone()
+        assert row is not None and row[0] == "off", "precondition: setting is off"
+
+        clause, params = _build_schema_where("n.nspname", ["dev_"])
+        # The production clause must carry the escape and must parse here.
+        assert LIKE_ESCAPE_CLAUSE in clause
+        cursor.execute(
+            f"SELECT 1 WHERE 'dev_x' LIKE %s {LIKE_ESCAPE_CLAUSE}", (params[0],)
+        )
+        assert cursor.fetchone() is not None, "the escaped pattern stopped matching"
+
+        # And the underscore must still be literal, not a wildcard.
+        cursor.execute(
+            f"SELECT 1 WHERE 'devXx' LIKE %s {LIKE_ESCAPE_CLAUSE}", (params[0],)
+        )
+        assert cursor.fetchone() is None, "the underscore behaved as a wildcard"
+
+
+@pytest.mark.integration
+def test_backslash_escape_would_fail_under_the_redshift_setting(pg_dsn: str) -> None:
+    """Why the escape character is ``#``: the old clause is a syntax error.
+
+    Pins the reason rather than the choice, so nobody "simplifies" it back.
+    """
+    psycopg = pytest.importorskip("psycopg")
+
+    with (
+        psycopg.connect(pg_dsn, options="-c standard_conforming_strings=off") as conn,
+        conn.cursor() as cursor,
+    ):
+        with pytest.raises(psycopg.errors.SyntaxError) as excinfo:
+            cursor.execute(r"SELECT 1 WHERE 'dev_x' LIKE 'dev\_%' ESCAPE '\'")
+        assert "unterminated quoted string" in str(excinfo.value)

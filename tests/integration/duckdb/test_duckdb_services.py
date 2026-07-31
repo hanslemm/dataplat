@@ -30,7 +30,7 @@ Five things are proved here, and they are different in kind:
    guarantees, or to DuckDB's own answer to the same question.
 
 5. **``dp db top-tables``** (``TestTopTables``), including the part a fake
-   cannot reach: whether ``LIKE ... ESCAPE '\\'`` really distinguishes
+   cannot reach: whether ``LIKE ... ESCAPE '#'`` really distinguishes
    ``analytics`` from ``analytics_stg`` on this engine, and whether the
    ``DROP`` statement the command prints is valid DuckDB SQL.
 
@@ -1257,7 +1257,7 @@ class TestTopTables:
 
         ``analytics_`` must match ``analytics_stg`` and *not* ``analytics``: an
         unescaped ``_`` is a single-character wildcard, so without
-        ``ESCAPE '\\'`` this prefix would match both and the caller would be told
+        ``ESCAPE '#'`` this prefix would match both and the caller would be told
         a schema it did not ask about is in the report.
         """
         prefix = f"{SAMPLE_SCHEMA}_"

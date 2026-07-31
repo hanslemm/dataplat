@@ -219,13 +219,24 @@ descending order of strength:
    that claim honestly, then go ahead. Aggregation bugs, error handling, and
    return-value shaping usually land here.
 
-2. **The construct is already in production on the Redshift path.** Cite the
-   file and line. `ESCAPE '\'` was safe to add to `orphans.py` because
-   `top_tables.py` had always sent it to both engines;
-   `has_schema_privilege(...)` is safe in `describe.py`'s Redshift branch
-   because that branch already calls it. Internal precedent beats
-   documentation: it is the same server, the same driver, and code someone is
-   already running.
+2. **The construct is already in production on the Redshift path, *and*
+   somebody has seen it work there.** Cite the file and line — and be honest
+   about whether anyone has actually run it. Internal precedent is the same
+   server and the same driver, which is why it ranks this high, but it only
+   proves the code *ships*.
+
+   That distinction is not hypothetical. `ESCAPE '\'` was added to `orphans.py`
+   on the grounds that `top_tables.py` had always sent it to both engines. It
+   had — and it had always been broken there: Redshift runs with
+   `standard_conforming_strings` off, so the backslash escapes its own closing
+   quote and the statement is a syntax error. The precedent existed, nobody had
+   ever run that command against Redshift, and citing it propagated the bug into
+   a second module. The escape character is now `#`, and
+   `tests/integration/test_top_tables_pg.py` reproduces the failure by opening a
+   PostgreSQL session with the Redshift setting.
+
+   So: precedent from a code path with *no* executing coverage is class 4, not
+   class 2. Ask "has anyone run this?" before you rely on it.
 
 3. **It withdraws a claim rather than making one.** Replacing a confidently
    wrong value with "unknown" cannot be more wrong than what it replaced. See

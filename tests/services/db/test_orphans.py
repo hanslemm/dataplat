@@ -383,10 +383,10 @@ def test_live_model_scan_escapes_both_patterns_for_both_dialects() -> None:
     statement, params = cur.queries[0]
     # One for invocation_args, one for node_id: the escape character is only
     # special where the statement says so.
-    assert statement.count("ESCAPE '\\'") == 2
-    assert params[0] == r'%"invocation_command": "dbt build --exclude tag:no\_ci"%'
+    assert statement.count("ESCAPE '#'") == 2
+    assert params[0] == '%"invocation_command": "dbt build --exclude tag:no#_ci"%'
     # The bracketing %% stay wildcards -- only the interpolated value is escaped.
-    assert params[2] == r"model.my\_project.%"
+    assert params[2] == "model.my#_project.%"
 
 
 def test_live_model_scan_leaves_a_wildcard_free_prefix_untouched() -> None:
@@ -407,7 +407,7 @@ def test_live_model_scan_leaves_a_wildcard_free_prefix_untouched() -> None:
     statement, params = cur.queries[0]
     assert params[1] == "model.acme.%"
     # No invocation filter was requested, so only node_id declares an escape.
-    assert statement.count("ESCAPE '\\'") == 1
+    assert statement.count("ESCAPE '#'") == 1
 
 
 def test_fetch_existing_relations_postgres_merges_tables_and_matviews() -> None:
@@ -716,6 +716,6 @@ def test_deprecated_scan_escapes_the_suffix_for_both_dialects() -> None:
         )
         assert cur.statements, "no statement was executed"
         for sql, params in cur.statements:
-            assert "ESCAPE '\\'" in sql, (is_redshift, sql)
+            assert "ESCAPE '#'" in sql, (is_redshift, sql)
             # The pattern itself carries the escape, not just the clause.
-            assert params == (r"%\_deprecated",), (is_redshift, params)
+            assert params == (r"%#_deprecated",), (is_redshift, params)

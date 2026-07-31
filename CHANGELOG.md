@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`dp db top-tables` and `dp db dbt-orphans` were broken on every Redshift
+  target.** Both build a `LIKE` pattern and declare `ESCAPE '\'`, but Redshift
+  runs with `standard_conforming_strings` off, so that backslash escapes its own
+  closing quote and the statement never parses. The escape character is now `#`,
+  which has no special meaning to either engine's string-literal parser.
+
+  This affected 0.2.1 through 0.4.0 and no test caught it, because PostgreSQL has
+  the setting on and parses the identical text happily. It is now pinned by a
+  test that opens a PostgreSQL session with the Redshift setting and asserts both
+  that the new clause parses and that the old one raises
+  `unterminated quoted string` — the closest thing to Redshift coverage available
+  without a cluster.
+
+  Credit where due: found by reading the upstream `dna-hq-cli`, which hit it for
+  real and fixed it first.
+
 ## 0.4.0
 
 ### Added
