@@ -4,6 +4,26 @@
 
 ### Added
 
+- **`dp db schema list` — schemas with owner and object counts**, on all three
+  engines, with `--like` (glob `*` or SQL `%`), `--include-system` and `--json`.
+  No refusal for DuckDB: it has schemas, so it gets an answer.
+
+  The three engines need three statements, not one with a flag. PostgreSQL
+  resolves the owner through `pg_roles`, Redshift through `pg_user`, and DuckDB
+  has no `pg_roles` at all — measured, not assumed, and pinned by a test that
+  fails if a future DuckDB grows one. Redshift adds quota columns from
+  `svv_schema_quota_state`; that view is version-dependent, so an unavailable one
+  degrades every quota to `?` rather than failing the listing, and never to `0`,
+  which would read as "no limit".
+
+  Object counts bucket every relkind a drop would destroy — tables, partitioned
+  and foreign tables, views and materialized views, and sequences and composite
+  types in `other` — so nothing a future `schema drop` pre-flight cares about can
+  go uncounted.
+
+  This is the first slice of a larger `dp db schema` group; `create`, `drop`,
+  `grant`, `revoke` and `alter` are not in this release.
+
 - **`dp db role grant` — grant existing roles to users/roles in one pass.**
   `role create` can wire up membership for a role it is creating; this is the
   command for every day after that. It takes the cross product of `--roles` and

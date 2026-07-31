@@ -88,6 +88,8 @@ from dataplat.services.db.describe import (
     table_not_applicable,
     view_not_applicable,
 )
+from dataplat.services.db.schema_admin import translate_like_pattern
+from dataplat.services.db.schema_dialects import DuckDbSchemaDialect
 from dataplat.services.db.top_tables import (
     SIZE_BASIS,
     drop_statement,
@@ -1409,3 +1411,159 @@ def test_the_sample_schema_builds_on_an_in_memory_database_too(
         )
     # The file-backed session is untouched by the in-memory one.
     assert scalar(ddb_session.cursor(), "SELECT count(*) FROM duckdb_tables()") == 0
+
+
+class TestSchemaList:
+    """``dp db schema list`` on DuckDB, which needed its own dialect.
+
+    Not a refusal like the role commands: DuckDB genuinely has schemas, and
+    listing them is a real answer. What it does not have is ``pg_roles`` — so the
+    Postgres statement fails on it outright rather than degrading, and the reason
+    for a third dialect is a probe rather than a preference.
+    """
+
+    def test_duckdb_has_no_pg_roles_to_join(self, ddb_cursor: DuckDbCursor) -> None:
+        """The measurement the DuckDB dialect exists because of.
+
+        Paired with the dialect's own statement below: if a future DuckDB grows
+        ``pg_roles``, this fails and the owner join becomes worth reconsidering,
+        rather than the workaround outliving its reason.
+        """
+        import duckdb
+
+        with pytest.raises(duckdb.CatalogException, match="pg_roles"):
+            ddb_cursor.execute("SELECT rolname FROM pg_roles LIMIT 1")
+
+    def test_the_duckdb_statement_joins_no_owner_catalog(self) -> None:
+        from dataplat.services.db.schema_dialects import _LIST_DUCKDB
+
+        assert "pg_roles" not in _LIST_DUCKDB
+        assert "pg_user" not in _LIST_DUCKDB
+
+    def test_the_sample_schemas_are_listed_with_their_counts(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """Counts compared against the fixture's own declared contents."""
+        rows = {r.name: r for r in DuckDbSchemaDialect().list_schemas(ddb_cursor)}
+
+        assert set(rows) >= {
+            SAMPLE_SCHEMA,
+            SAMPLE_STAGING_SCHEMA,
+            SAMPLE_OTHER_SCHEMA,
+        }
+        expected_tables = sum(
+            1
+            for name, relkind in SAMPLE_RELATIONS.items()
+            if relkind == "r" and name.startswith(f"{SAMPLE_SCHEMA}.")
+        )
+        expected_views = sum(
+            1
+            for name, relkind in SAMPLE_RELATIONS.items()
+            if relkind == "v" and name.startswith(f"{SAMPLE_SCHEMA}.")
+        )
+        assert rows[SAMPLE_SCHEMA].tables == expected_tables
+        assert rows[SAMPLE_SCHEMA].views == expected_views
+
+    def test_the_standalone_sequence_is_counted_as_other(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """Nothing a drop would destroy may go uncounted — sequences included."""
+        rows = {r.name: r for r in DuckDbSchemaDialect().list_schemas(ddb_cursor)}
+
+        assert rows[SAMPLE_SCHEMA].other >= 1
+
+    def test_owner_is_the_one_implicit_user(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """Every connection is the same user, so ownership cannot differ by row.
+
+        Reported as `duckdb` rather than blank or `?`: it is a true statement
+        about this engine, not missing information.
+        """
+        rows = DuckDbSchemaDialect().list_schemas(ddb_cursor)
+
+        assert {r.owner for r in rows} == {"duckdb"}
+
+    def test_the_default_schema_is_visible(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """`main` is DuckDB's default schema, not a system one.
+
+        It is the analogue of Postgres's `public`, which the listing also shows.
+        Hiding it was a real bug: a database whose tables all live in `main` —
+        the common case for a file nobody bothered to organise — listed as empty.
+        """
+        names = {r.name for r in DuckDbSchemaDialect().list_schemas(ddb_cursor)}
+
+        assert "main" in names
+
+    def test_duckdbs_catalog_schemas_never_reach_pg_namespace(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """Which is why --include-system has nothing extra to show here.
+
+        DuckDB flags `information_schema` and `pg_catalog` as `internal` in
+        `duckdb_schemas()` and omits them from `pg_namespace` altogether — unlike
+        Postgres, where they are ordinary rows that a predicate has to exclude.
+        Asserted from both sides so the asymmetry is recorded rather than
+        rediscovered.
+        """
+        dialect = DuckDbSchemaDialect()
+
+        ddb_cursor.execute("SELECT nspname FROM pg_namespace")
+        exposed = {name for (name,) in ddb_cursor.fetchall()}
+        assert "pg_catalog" not in exposed
+        assert "information_schema" not in exposed
+
+        ddb_cursor.execute(
+            "SELECT DISTINCT schema_name FROM duckdb_schemas() WHERE internal"
+        )
+        internal = {name for (name,) in ddb_cursor.fetchall()}
+        assert {"pg_catalog", "information_schema"} <= internal
+
+        with_system = {
+            r.name for r in dialect.list_schemas(ddb_cursor, include_system=True)
+        }
+        without = {r.name for r in dialect.list_schemas(ddb_cursor)}
+        assert with_system == without
+
+    def test_a_like_pattern_filters_and_the_underscore_stays_a_wildcard(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """`analytics_%` matches `analytics_stg` but not `analytics` itself.
+
+        The same distinction top-tables needed ESCAPE '#' for, from the other
+        side: here the wildcard is wanted, so the pattern is passed through
+        unescaped and `_` does its LIKE job.
+        """
+        rows = DuckDbSchemaDialect().list_schemas(ddb_cursor, like="analytics_%")
+
+        names = {r.name for r in rows}
+        assert SAMPLE_STAGING_SCHEMA in names
+        assert SAMPLE_SCHEMA not in names
+
+    def test_a_glob_pattern_reaches_both(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        rows = DuckDbSchemaDialect().list_schemas(
+            ddb_cursor, like=translate_like_pattern("analytics*")
+        )
+
+        names = {r.name for r in rows}
+        assert {SAMPLE_SCHEMA, SAMPLE_STAGING_SCHEMA} <= names
+
+    def test_quotas_are_never_invented(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """DuckDB has no schema quotas, so the values stay unknown, not zero."""
+        rows = DuckDbSchemaDialect().list_schemas(ddb_cursor)
+
+        assert all(r.quota_mb is None and r.used_mb is None for r in rows)
+
+    def test_schema_exists_agrees_with_the_catalog(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        dialect = DuckDbSchemaDialect()
+
+        assert dialect.schema_exists(ddb_cursor, SAMPLE_SCHEMA) is True
+        assert dialect.schema_exists(ddb_cursor, "dp_absent_schema") is False
