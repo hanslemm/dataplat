@@ -20,6 +20,7 @@ from typing import Any
 
 from psycopg import sql  # noqa: I001
 
+from dataplat.core.errors import ValidationError
 from dataplat.services.db.role_dialects import (  # noqa: F401  (re-export)
     OwnedForDrop,
     ParentKind,
@@ -467,6 +468,202 @@ def role_exists(cursor: Any, name: str) -> bool:
     """Check whether a login role / group with ``name`` exists."""
     cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,))
     return cursor.fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
+# GRANT plan
+# ---------------------------------------------------------------------------
+
+#: Grantee meaning "every principal". A keyword, not a catalog object — and not
+#: a legal recipient of role membership on either engine, which is why
+#: :func:`resolve_grantee_kinds` refuses it by name.
+PUBLIC = "PUBLIC"
+
+
+@dataclass(frozen=True)
+class GrantPair:
+    """One ``role -> target`` edge, with each side's resolved kind.
+
+    Both kinds are carried because the SQL depends on both: the role's kind
+    picks the statement (``ALTER GROUP`` vs ``GRANT ROLE``) and the target's
+    kind picks how the grantee is spelled (``ROLE x`` vs bare ``x``).
+    """
+
+    role: str
+    role_kind: ParentKind
+    target: str
+    target_kind: ParentKind
+
+
+@dataclass(frozen=True)
+class GrantPlan:
+    """What ``dp db role grant`` will do.
+
+    ``already_held`` is reported rather than executed. Re-granting is harmless
+    on both engines, so the value of separating it is that the operator reading
+    the plan can see what actually changes.
+    """
+
+    creates: tuple[str, ...] = ()  # users to create first
+    grants: tuple[GrantPair, ...] = ()  # pairs to issue
+    already_held: tuple[GrantPair, ...] = ()  # pairs skipped as redundant
+
+
+def resolve_grantee_kinds(
+    dialect: RoleDialect,
+    cursor: Any,
+    names: Sequence[str],
+    forced: ParentKind | None = None,
+    *,
+    flag: str,
+) -> dict[str, ParentKind]:
+    """Map each name to a single kind, refusing to guess when ambiguous.
+
+    ``flag`` names the CLI option that disambiguates this side of the grant
+    (``--kind`` for ``--roles``, ``--to-kind`` for ``--to``), so the error
+    always points at an option that actually resolves what went wrong.
+
+    A name that exists as more than one object is only possible on Redshift,
+    where users, groups and roles are three catalogs sharing no namespace.
+    Picking one silently would grant a different set of privileges than the
+    operator asked for, so this raises instead.
+    """
+    out: dict[str, ParentKind] = {}
+    for name in names:
+        if name.upper() == PUBLIC:
+            # Verified on PostgreSQL 16: `GRANT <role> TO PUBLIC` fails with
+            # 'role "public" does not exist'. PUBLIC is a grantee for *object*
+            # privileges, not for role membership, on either engine. Caught here
+            # rather than at execution because --create-missing-users would
+            # otherwise try to CREATE a user named PUBLIC first.
+            raise ValidationError(
+                f"{PUBLIC} cannot receive or hold role membership. It is a "
+                "grantee for object privileges only (GRANT ... ON SCHEMA / "
+                "TABLE), not for GRANT <role> TO <target>."
+            )
+        kinds = dialect.grantable_kinds(cursor, name)
+        if not kinds:
+            out[name] = ParentKind.absent
+        elif forced is not None:
+            if forced not in kinds:
+                found = ", ".join(k.value for k in kinds)
+                raise ValidationError(
+                    f'"{name}" is not a {forced.value} (found: {found})'
+                )
+            out[name] = forced
+        elif len(kinds) == 1:
+            out[name] = kinds[0]
+        else:
+            listed = ", ".join(k.value for k in kinds)
+            raise ValidationError(
+                f'"{name}" exists as more than one object ({listed}). '
+                f"Disambiguate with {flag}."
+            )
+    return out
+
+
+def build_grant_plan(
+    *,
+    roles: Mapping[str, ParentKind],
+    targets: Mapping[str, ParentKind],
+    held: set[tuple[str, str]],
+    create_missing_users: bool,
+    dialect: RoleDialect | None = None,
+) -> GrantPlan:
+    """Cross-product plan: every role in ``roles`` to every target.
+
+    Validates fully before returning anything, so a typo in the last ``--to``
+    fails before the first user is created. ``held`` holds ``(role, target)``
+    pairs already in effect; those are reported, not re-issued.
+
+    The engine-specific refusals below exist so an impossible grant is named as
+    such here, instead of surfacing as a raw SQL error halfway through a batch
+    that has already created users.
+    """
+    dialect = dialect or PostgresDialect()
+    redshift = isinstance(dialect, RedshiftDialect)
+
+    missing_roles = sorted(n for n, k in roles.items() if k is ParentKind.absent)
+    if missing_roles:
+        raise ValidationError(
+            f"role(s) not found: {', '.join(missing_roles)}. "
+            "Create one with: dp db role create <name> --no-login"
+        )
+
+    absent_targets = sorted(n for n, k in targets.items() if k is ParentKind.absent)
+    if absent_targets and not create_missing_users:
+        raise ValidationError(
+            f"target(s) not found: {', '.join(absent_targets)}. "
+            "Pass --create-missing-users to create them."
+        )
+
+    # Anything we create is a login user, so fix its kind now and let the
+    # checks below see the real value rather than `absent`.
+    resolved_targets = {
+        name: (ParentKind.user if kind is ParentKind.absent else kind)
+        for name, kind in targets.items()
+    }
+
+    # A login user is not a grantable object on Redshift — only RBAC roles and
+    # legacy groups hold members. Postgres keeps users and roles in one
+    # namespace and grants either happily, so this one is engine-gated where
+    # the two group checks below are not: a `group` kind cannot arise on
+    # Postgres in the first place.
+    if redshift:
+        user_roles = sorted(n for n, k in roles.items() if k is ParentKind.user)
+        if user_roles:
+            raise ValidationError(
+                f"cannot grant login user(s) {', '.join(user_roles)} to "
+                "anything on Redshift: only RBAC roles and legacy groups hold "
+                "members. Pass --kind role if these names are also roles."
+            )
+
+    group_roles = sorted(n for n, k in roles.items() if k is ParentKind.group)
+    role_targets = sorted(
+        n for n, k in resolved_targets.items() if k is ParentKind.role
+    )
+    if group_roles and role_targets:
+        raise ValidationError(
+            f"cannot add role(s) {', '.join(role_targets)} to "
+            f"group(s) {', '.join(group_roles)}: a Redshift group holds "
+            "login users only. Grant an RBAC role instead."
+        )
+
+    # The reverse direction: granting an RBAC role TO a group. Redshift has no
+    # `GRANT ROLE ... TO GROUP` form — only users and roles can receive a role
+    # grant — so this must be rejected here rather than failing at execution
+    # with a raw SQL error.
+    role_roles = sorted(n for n, k in roles.items() if k is ParentKind.role)
+    group_targets = sorted(
+        n for n, k in resolved_targets.items() if k is ParentKind.group
+    )
+    if role_roles and group_targets:
+        raise ValidationError(
+            f"cannot grant role(s) {', '.join(role_roles)} to "
+            f"group(s) {', '.join(group_targets)}: a Redshift group holds "
+            "login users only. Grant to a user or an RBAC role instead."
+        )
+
+    grants: list[GrantPair] = []
+    skipped: list[GrantPair] = []
+    for role in sorted(roles):
+        for target in sorted(resolved_targets):
+            pair = GrantPair(
+                role=role,
+                role_kind=roles[role],
+                target=target,
+                target_kind=resolved_targets[target],
+            )
+            if (role, target) in held:
+                skipped.append(pair)
+            else:
+                grants.append(pair)
+
+    return GrantPlan(
+        creates=tuple(absent_targets),
+        grants=tuple(grants),
+        already_held=tuple(skipped),
+    )
 
 
 def parse_csv_flag(values: Iterable[str] | None) -> tuple[str, ...]:

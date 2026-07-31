@@ -496,11 +496,12 @@ def show_command(
 # Imports for create/drop subcommands kept here so the file order reads top-down.
 from dataplat.cli.db.role_create import create_command  # noqa: E402
 from dataplat.cli.db.role_drop import drop_command  # noqa: E402
+from dataplat.cli.db.role_grant import grant_command  # noqa: E402
 from dataplat.cli.db.role_list import list_command  # noqa: E402
 
 app = typer.Typer(
     name="role",
-    help="Inspect, list, create, or drop a role / user / group.",
+    help="Inspect, list, create, grant, or drop a role / user / group.",
     no_args_is_help=True,
 )
 app.command(
@@ -520,3 +521,7 @@ app.command(
     "drop",
     help="Drop one or more roles, reassigning ownership across databases.",
 )(drop_command)
+app.command(
+    "grant",
+    help="Grant existing roles to users/roles, optionally creating missing users.",
+)(grant_command)

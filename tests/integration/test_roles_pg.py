@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, LiteralString
 
 import pytest
 
+from dataplat.core.errors import ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role import (
     EffectivePrivilege,
@@ -49,12 +50,14 @@ from dataplat.services.db.role_admin import (
     DropPlan,
     build_create_plan,
     build_drop_plan,
+    build_grant_plan,
     generate_password,
     list_databases,
     list_roles,
+    resolve_grantee_kinds,
     role_exists,
 )
-from dataplat.services.db.role_dialects import PostgresDialect, SqlOp
+from dataplat.services.db.role_dialects import ParentKind, PostgresDialect, SqlOp
 from tests.integration.conftest import TempRoleFactory, _slug
 
 if TYPE_CHECKING:
@@ -1355,3 +1358,208 @@ def test_hostile_names_are_never_executed_as_sql(
         )
         == 0
     ), "the hostile role should be gone and nothing else created in its name"
+
+
+# ---------------------------------------------------------------------------
+# role grant: the two catalog reads, against the catalog itself
+# ---------------------------------------------------------------------------
+
+
+def test_grantable_kinds_tells_a_login_role_from_a_group(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """The distinction --create-missing-users depends on, judged by pg_roles.
+
+    A fake can return whatever tuple the test wants; only the server can say
+    that rolcanlogin is the column that carries this, and that it is a boolean
+    rather than a char.
+    """
+    login = temp_role("login", login=True, password="x")
+    nologin = temp_role("nologin", login=False)
+    dialect = PostgresDialect()
+
+    assert dialect.grantable_kinds(pg_cursor, login) == (ParentKind.user,)
+    assert dialect.grantable_kinds(pg_cursor, nologin) == (ParentKind.role,)
+
+
+def test_grantable_kinds_is_empty_for_a_name_the_cluster_does_not_have(
+    pg_cursor: Cursor[TupleRow],
+) -> None:
+    assert PostgresDialect().grantable_kinds(pg_cursor, "dp_absent_role") == ()
+
+
+def test_grantable_kinds_never_reports_two_kinds_on_postgres(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """One namespace means one kind — which is why --kind is Redshift-shaped.
+
+    Pins the assumption build_grant_plan leans on when it gates the
+    "a login user is not grantable" refusal on the engine.
+    """
+    name = temp_role("single", login=True, password="x")
+
+    assert len(PostgresDialect().grantable_kinds(pg_cursor, name)) == 1
+
+
+def test_held_grants_reads_back_a_grant_the_server_made(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """Round trip: GRANT, then ask the dialect what is held.
+
+    The pair order is the part worth proving — pg_auth_members stores OIDs, and
+    swapping roleid for member yields a plan that skips exactly the grants it
+    should issue and issues the ones it should skip.
+    """
+    from psycopg import sql
+
+    parent = temp_role("parent", login=False)
+    member = temp_role("member", login=True, password="x")
+    other = temp_role("other", login=True, password="x")
+    pg_cursor.execute(
+        sql.SQL("GRANT {p} TO {m}").format(
+            p=sql.Identifier(parent), m=sql.Identifier(member)
+        )
+    )
+
+    held = PostgresDialect().held_grants(pg_cursor, (parent,))
+
+    assert (parent, member) in held
+    assert (member, parent) not in held  # not the reverse edge
+    assert (parent, other) not in held
+
+
+def test_held_grants_answers_for_several_roles_in_one_query(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """`= ANY(%s)` with a list, so a plan over N roles is one round trip."""
+    from psycopg import sql
+
+    first = temp_role("first", login=False)
+    second = temp_role("second", login=False)
+    member = temp_role("shared", login=True, password="x")
+    for parent in (first, second):
+        pg_cursor.execute(
+            sql.SQL("GRANT {p} TO {m}").format(
+                p=sql.Identifier(parent), m=sql.Identifier(member)
+            )
+        )
+
+    held = PostgresDialect().held_grants(pg_cursor, (first, second))
+
+    assert {(first, member), (second, member)} <= held
+
+
+def test_held_grants_ignores_roles_it_was_not_asked_about(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """A cluster has grants of its own; the filter must actually filter."""
+    from psycopg import sql
+
+    asked = temp_role("asked", login=False)
+    unasked = temp_role("unasked", login=False)
+    member = temp_role("member", login=True, password="x")
+    pg_cursor.execute(
+        sql.SQL("GRANT {p} TO {m}").format(
+            p=sql.Identifier(unasked), m=sql.Identifier(member)
+        )
+    )
+
+    held = PostgresDialect().held_grants(pg_cursor, (asked,))
+
+    assert held == set()
+
+
+def test_the_grant_plan_statements_execute_on_a_real_server(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """End to end through the plan: build it, run it, read it back.
+
+    This is the assertion the fakes cannot make. Every unit test above proves
+    the plan *says* the right thing; this proves PostgreSQL accepts it and that
+    the membership it creates is the one the plan described.
+    """
+    role = temp_role("plan_role", login=False)
+    ana = temp_role("plan_ana", login=True, password="x")
+    bo = temp_role("plan_bo", login=True, password="x")
+    dialect = PostgresDialect()
+
+    plan = build_grant_plan(
+        roles=resolve_grantee_kinds(dialect, pg_cursor, [role], flag="--kind"),
+        targets=resolve_grantee_kinds(dialect, pg_cursor, [ana, bo], flag="--to-kind"),
+        held=dialect.held_grants(pg_cursor, (role,)),
+        create_missing_users=False,
+        dialect=dialect,
+    )
+    assert len(plan.grants) == 2
+
+    for pair in plan.grants:
+        op = dialect.grant_membership(
+            pair.target,
+            pair.role,
+            pair.role_kind,
+            member_is_role=pair.target_kind is ParentKind.role,
+        )
+        pg_cursor.execute(op.statement)
+
+    assert dialect.held_grants(pg_cursor, (role,)) == {(role, ana), (role, bo)}
+
+
+def test_a_second_run_of_the_same_plan_has_nothing_left_to_do(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """Re-running converges: the already-held read must see the first run.
+
+    The point of held_grants is that `role grant` is safe to re-run after a
+    partial failure. That only holds if what the previous run wrote is visible
+    to the next one's lookup.
+    """
+    role = temp_role("idem_role", login=False)
+    ana = temp_role("idem_ana", login=True, password="x")
+    dialect = PostgresDialect()
+    kinds = {role: ParentKind.role}
+    targets = {ana: ParentKind.user}
+
+    first = build_grant_plan(
+        roles=kinds,
+        targets=targets,
+        held=dialect.held_grants(pg_cursor, (role,)),
+        create_missing_users=False,
+    )
+    for pair in first.grants:
+        pg_cursor.execute(
+            dialect.grant_membership(pair.target, pair.role, pair.role_kind).statement
+        )
+
+    second = build_grant_plan(
+        roles=kinds,
+        targets=targets,
+        held=dialect.held_grants(pg_cursor, (role,)),
+        create_missing_users=False,
+    )
+
+    assert second.grants == ()
+    assert [(p.role, p.target) for p in second.already_held] == [(role, ana)]
+
+
+def test_granting_to_public_is_refused_before_postgres_rejects_it(
+    pg_cursor: Cursor[TupleRow], temp_role: TempRoleFactory
+) -> None:
+    """Proves the refusal is not merely taste: the server errors on this.
+
+    Both halves matter -- that resolve_grantee_kinds refuses PUBLIC, and that
+    PostgreSQL would have refused it too, which is why refusing early is right.
+    """
+    import psycopg
+    from psycopg import sql
+
+    role = temp_role("public_role", login=False)
+
+    with pytest.raises(ValidationError, match="PUBLIC"):
+        resolve_grantee_kinds(
+            PostgresDialect(), pg_cursor, ["PUBLIC"], flag="--to-kind"
+        )
+
+    pg_cursor.execute("SAVEPOINT before_public")
+    with pytest.raises(psycopg.errors.UndefinedObject):
+        pg_cursor.execute(sql.SQL("GRANT {r} TO PUBLIC").format(r=sql.Identifier(role)))
+    pg_cursor.execute("ROLLBACK TO SAVEPOINT before_public")
