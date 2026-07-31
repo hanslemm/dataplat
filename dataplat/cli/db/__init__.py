@@ -38,6 +38,7 @@ from dataplat.cli.db.dbt_orphans import app as dbt_orphans_app
 from dataplat.cli.db.describe import app as describe_app
 from dataplat.cli.db.long_queries import kill_command, long_queries_command
 from dataplat.cli.db.role import app as role_app
+from dataplat.cli.db.schema import app as schema_app
 from dataplat.cli.db.top_tables import top_tables_command
 from dataplat.services.db.connection import SqlEngine
 
@@ -49,6 +50,7 @@ app = typer.Typer(
 app.add_typer(dbt_orphans_app, name="dbt-orphans")
 app.add_typer(describe_app, name="describe")
 app.add_typer(role_app, name="role")
+app.add_typer(schema_app, name="schema")
 app.command(
     "top-tables",
     help="Rank largest tables in schemas matching a prefix (default: dev_*).",
