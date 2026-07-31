@@ -398,3 +398,142 @@ def test_redshift_groups_of_returns_membership() -> None:
 def test_redshift_groups_of_returns_empty_for_absent_user() -> None:
     cursor = _CatalogCursor()
     assert RedshiftDialect().groups_of(cursor, "ghost") == []
+
+
+class _EdgeCursor:
+    """Cursor for the grant-side reads: queued fetchall results per SQL needle.
+
+    ``failing`` names substrings whose queries raise, standing in for an
+    ``svv_*`` view a pre-RBAC cluster does not have.
+    """
+
+    def __init__(
+        self,
+        script: dict[str, list[tuple]] | None = None,
+        failing: tuple[str, ...] = (),
+    ) -> None:
+        self._script = script or {}
+        self._failing = failing
+        self._next: list[tuple] = []
+        self.executed: list[str] = []
+
+    def execute(self, sql_text, params=None) -> None:
+        text = str(sql_text)
+        self.executed.append(text)
+        if text.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE")):
+            return
+        for needle in self._failing:
+            if needle in text:
+                raise RuntimeError(f'relation "{needle}" does not exist')
+        self._next = []
+        for needle, rows in self._script.items():
+            if needle in text:
+                self._next = rows
+                return
+
+    def fetchall(self) -> list[tuple]:
+        return self._next
+
+    def fetchone(self):
+        return self._next[0] if self._next else None
+
+
+# --- grantable_kinds -------------------------------------------------------
+
+
+def test_postgres_grantable_kinds_splits_on_login() -> None:
+    """One namespace, so exactly one kind — told apart by rolcanlogin."""
+    assert PostgresDialect().grantable_kinds(
+        _EdgeCursor({"rolcanlogin": [(True,)]}), "ana"
+    ) == (ParentKind.user,)
+    assert PostgresDialect().grantable_kinds(
+        _EdgeCursor({"rolcanlogin": [(False,)]}), "analyst"
+    ) == (ParentKind.role,)
+
+
+def test_postgres_grantable_kinds_is_empty_for_an_absent_name() -> None:
+    """`()` rather than a kind, so --create-missing-users can tell absence apart.
+
+    resolve_grantee_kind cannot answer this: on Postgres it returns `role`
+    without looking, which is right for rendering a TO clause and useless here.
+    """
+    assert PostgresDialect().grantable_kinds(_EdgeCursor(), "ghost") == ()
+
+
+def test_redshift_grantable_kinds_reports_every_catalog_hit() -> None:
+    """Users, groups and roles are three catalogs sharing no namespace."""
+    cursor = _EdgeCursor({"pg_user": [(1,)], "pg_group": [(1,)], "svv_roles": [(1,)]})
+
+    assert RedshiftDialect().grantable_kinds(cursor, "finance") == (
+        ParentKind.user,
+        ParentKind.group,
+        ParentKind.role,
+    )
+
+
+def test_redshift_grantable_kinds_survives_a_cluster_without_rbac() -> None:
+    cursor = _EdgeCursor({"pg_group": [(1,)]}, failing=("svv_roles",))
+
+    assert RedshiftDialect().grantable_kinds(cursor, "legacy") == (ParentKind.group,)
+    assert any(q.startswith("ROLLBACK TO SAVEPOINT") for q in cursor.executed)
+
+
+# --- held_grants -----------------------------------------------------------
+
+
+def test_held_grants_is_empty_without_roles_and_issues_no_query() -> None:
+    """No roles means nothing to look up — and no wasted round trip."""
+    for dialect in (PostgresDialect(), RedshiftDialect()):
+        cursor = _EdgeCursor()
+        assert dialect.held_grants(cursor, ()) == set()
+        assert cursor.executed == []
+
+
+def test_postgres_held_grants_reads_pg_auth_members() -> None:
+    cursor = _EdgeCursor({"pg_auth_members": [("analyst", "ana")]})
+
+    assert PostgresDialect().held_grants(cursor, ("analyst",)) == {("analyst", "ana")}
+
+
+def test_redshift_held_grants_unions_all_three_edges() -> None:
+    """A grant can already be in effect in three different ways."""
+    cursor = _EdgeCursor(
+        {
+            "pg_group": [("legacy", "ana")],
+            "svv_user_grants": [("analyst", "bo")],
+            "svv_role_grants": [("analyst", "reader")],
+        }
+    )
+
+    assert RedshiftDialect().held_grants(cursor, ("legacy", "analyst")) == {
+        ("legacy", "ana"),
+        ("analyst", "bo"),
+        ("analyst", "reader"),
+    }
+
+
+def test_redshift_held_grants_keeps_the_group_edge_when_rbac_is_absent() -> None:
+    """A pre-RBAC cluster still answers for groups instead of failing outright."""
+    cursor = _EdgeCursor(
+        {"pg_group": [("legacy", "ana")]},
+        failing=("svv_user_grants", "svv_role_grants"),
+    )
+
+    assert RedshiftDialect().held_grants(cursor, ("legacy",)) == {("legacy", "ana")}
+    # Rolled back per failed view, so the caller's transaction stays usable.
+    assert sum(q.startswith("ROLLBACK TO SAVEPOINT") for q in cursor.executed) == 2
+
+
+def test_redshift_held_grants_bails_when_savepoints_are_unavailable() -> None:
+    """A connection-level failure must not be mistaken for "no grants held"
+    in a way that crashes: report the group edge and skip the guarded ones."""
+
+    class _NoSavepoints(_EdgeCursor):
+        def execute(self, sql_text, params=None) -> None:
+            if str(sql_text).startswith("SAVEPOINT"):
+                raise RuntimeError("connection is closed")
+            super().execute(sql_text, params)
+
+    cursor = _NoSavepoints({"pg_group": [("legacy", "ana")]})
+
+    assert RedshiftDialect().held_grants(cursor, ("legacy",)) == {("legacy", "ana")}
