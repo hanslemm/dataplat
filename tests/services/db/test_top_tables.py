@@ -37,16 +37,19 @@ class FakeCursor:
 
 
 def test_like_escape_preserves_literal_metacharacters() -> None:
-    assert like_escape("dev_") == "dev\\_"
-    assert like_escape("a%b") == "a\\%b"
-    assert like_escape("a\\b") == "a\\\\b"
+    assert like_escape("dev_") == "dev#_"
+    assert like_escape("a%b") == "a#%b"
+    assert like_escape("a#b") == "a##b"
+    # A backslash carries no meaning to LIKE once # is the escape, so it
+    # must pass through untouched rather than being doubled.
+    assert like_escape("a\\b") == "a\\b"
     assert like_escape("plain") == "plain"
 
 
 def test_build_schema_where_joins_with_or_and_adds_percent() -> None:
     clause, params = _build_schema_where("n.nspname", ["dev_", "sandbox_"])
-    assert clause == "n.nspname LIKE %s ESCAPE '\\' OR n.nspname LIKE %s ESCAPE '\\'"
-    assert params == ["dev\\_%", "sandbox\\_%"]
+    assert clause == "n.nspname LIKE %s ESCAPE '#' OR n.nspname LIKE %s ESCAPE '#'"
+    assert params == ["dev#_%", "sandbox#_%"]
 
 
 def test_fetch_top_tables_postgres_runs_totals_then_rows() -> None:
@@ -71,10 +74,10 @@ def test_fetch_top_tables_postgres_runs_totals_then_rows() -> None:
     totals_sql, totals_params = cur.executed[0]
     assert "pg_database_size(current_database())" in totals_sql
     assert "pg_total_relation_size" in totals_sql
-    assert totals_params == ("dev\\_%",)
+    assert totals_params == ("dev#_%",)
     rows_sql, rows_params = cur.executed[1]
     assert "ORDER BY size_bytes DESC" in rows_sql
-    assert rows_params == ("dev\\_%", 5)
+    assert rows_params == ("dev#_%", 5)
 
 
 def test_fetch_top_tables_redshift_uses_svv_table_info() -> None:
@@ -93,10 +96,10 @@ def test_fetch_top_tables_redshift_uses_svv_table_info() -> None:
     assert "svv_table_info" in totals_sql
     # schema filter appears once (WHERE); disk_bytes subquery has no filter.
     assert totals_sql.count('"schema" LIKE %s') == 2
-    assert totals_params == ("dev\\_%", "sandbox\\_%")
+    assert totals_params == ("dev#_%", "sandbox#_%")
 
     rows_sql, rows_params = cur.executed[1]
-    assert rows_params == ("dev\\_%", "sandbox\\_%", 10)
+    assert rows_params == ("dev#_%", "sandbox#_%", 10)
 
 
 def test_fetch_top_tables_skips_rows_query_when_no_matches() -> None:
@@ -258,7 +261,7 @@ def test_fetch_top_tables_duckdb_memory_database_has_no_disk() -> None:
 
 
 def test_fetch_top_tables_duckdb_underscore_in_prefix_stays_literal() -> None:
-    """ESCAPE '\\' works on DuckDB too — a `_` prefix must not match any char."""
+    """ESCAPE '#' works on DuckDB too — a `_` prefix must not match any char."""
     conn = _duckdb_warehouse()
     conn.execute("CREATE SCHEMA devXfake")
     conn.execute("CREATE TABLE devXfake.decoy(a INTEGER)")
@@ -317,8 +320,8 @@ def test_fetch_top_tables_duckdb_limit_caps_rows_not_totals() -> None:
 def test_duckdb_binds_question_marks_and_would_reject_psycopg_style() -> None:
     """Why the marker is a dialect split rather than a shared constant."""
     clause, params = _build_schema_where("t.schema_name", ["dev_"], marker="?")
-    assert clause == "t.schema_name LIKE ? ESCAPE '\\'"
-    assert params == ["dev\\_%"]
+    assert clause == "t.schema_name LIKE ? ESCAPE '#'"
+    assert params == ["dev#_%"]
 
     conn = duckdb.connect(":memory:")
     try:
