@@ -21,11 +21,20 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
+from psycopg import sql
+
+from dataplat.core.errors import ValidationError
 from dataplat.services.db._savepoint import guarded_fetch
 from dataplat.services.db.connection import SqlEngine
+from dataplat.services.db.grantees import PUBLIC, render_grantee
+from dataplat.services.db.role_dialects import ParentKind, SqlOp
 from dataplat.services.db.schema_admin import SchemaSummary
+
+if TYPE_CHECKING:
+    from dataplat.services.db.schema_admin import SchemaPrivilege
 
 __all__ = [
     "DuckDbSchemaDialect",
@@ -136,6 +145,67 @@ SELECT schema_name, quota, disk_usage
 FROM svv_schema_quota_state
 """
 
+# Direct schema-level ACL entries. aclexplode unpacks nspacl into one row per
+# (grantee, privilege); a NULL nspacl simply yields no rows. Joined to pg_roles by
+# OID, which is why the Postgres path needs no identity pinning.
+_HELD_SCHEMA_POSTGRES = """
+SELECT n.nspname, r.rolname, a.privilege_type
+FROM pg_namespace n
+CROSS JOIN LATERAL aclexplode(n.nspacl) AS a
+JOIN pg_roles r ON r.oid = a.grantee
+WHERE n.nspname = ANY(%s) AND r.rolname = ANY(%s)
+"""
+
+# Availability varies by cluster: RBAC views are absent pre-RBAC and may be
+# permission-denied. Always guarded; absence means "no detection", which costs at
+# most a redundant idempotent GRANT. ``{pin}`` comes from _held_identity_pin.
+_HELD_SCHEMA_REDSHIFT = """
+SELECT namespace_name, identity_name, privilege_type
+FROM svv_schema_privileges
+WHERE namespace_name = ANY(%s) AND ({pin})
+"""
+
+# svv_schema_privileges's identity_type spelling for each ParentKind.
+_REDSHIFT_IDENTITY_TYPE_FOR_KIND: dict[ParentKind, str] = {
+    ParentKind.user: "user",
+    ParentKind.group: "group",
+    ParentKind.role: "role",
+}
+
+
+def _held_identity_pin(
+    grantees: Sequence[str], kinds: Mapping[str, ParentKind] | None
+) -> tuple[str, tuple[str, ...]]:
+    """Build the ``(identity_name, identity_type)`` predicate for ``grantees``.
+
+    Every arm pins the name and the type *together*. Redshift permits a group and
+    an RBAC role to share one name, and svv_schema_privileges matches on identity
+    name alone — so an unpinned match merges two different principals' privileges
+    into one answer and reports access nobody has. This is the schema-privilege
+    analogue of the same pin ``role.py`` carries for effective privileges.
+
+    ``PUBLIC`` needs its own arm: its rows carry ``identity_type = 'public'``, so a
+    name+type predicate alone would drop it.
+
+    A grantee whose kind is unknown matches nothing rather than falling back to a
+    name-only match: under-detecting "held" costs one redundant idempotent GRANT,
+    while matching on name alone is exactly the bug this pin exists to close.
+    """
+    known = kinds or {}
+    arms = ["identity_type = 'public'"]
+    params: list[str] = []
+    for name in grantees:
+        if name.upper() == PUBLIC:
+            continue  # covered by the identity_type = 'public' arm above
+        identity_type = _REDSHIFT_IDENTITY_TYPE_FOR_KIND.get(
+            known.get(name, ParentKind.absent), ""
+        )
+        if not identity_type:
+            continue  # unknown kind: never matches, so "held" defaults to no
+        arms.append("(identity_name = %s AND identity_type = %s)")
+        params.extend([name, identity_type])
+    return " OR ".join(arms), tuple(params)
+
 
 def _where_clause(
     *, include_system: bool, like: str | None, system_predicate: str, placeholder: str
@@ -162,6 +232,14 @@ class SchemaDialect(ABC):
     system_predicate: str = _HIDE_SYSTEM
     #: The engine's bound-parameter placeholder.
     placeholder: str = "%s"
+    #: Whether ``CREATE SCHEMA ... AUTHORIZATION`` parses at all.
+    supports_authorization: bool = True
+    #: Keyword introducing the grantor in ALTER DEFAULT PRIVILEGES. Postgres says
+    #: FOR ROLE; Redshift says FOR USER.
+    default_privileges_grantor_keyword = "ROLE"
+    #: privilege_type values held-detection recognises, lowered to the CLI
+    #: vocabulary. Schema-scoped only — see ``held_schema_privileges``.
+    _HELD_PRIVILEGES = {"USAGE": "usage", "CREATE": "create"}
 
     def schema_exists(self, cursor: Any, name: str) -> bool:
         """``pg_namespace`` is present and means the same thing on all three."""
@@ -174,6 +252,216 @@ class SchemaDialect(ABC):
     def list_schemas(
         self, cursor: Any, *, include_system: bool = False, like: str | None = None
     ) -> list[SchemaSummary]: ...
+
+    # --- op builders (pure) ---------------------------------------------
+
+    def create_schema(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        quota: str | None = None,
+        if_not_exists: bool = False,
+    ) -> SqlOp:
+        """``CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION owner]``.
+
+        ``quota`` is ignored here — only Redshift supports it, and the plan
+        builder has already warned. Redshift overrides this to append the clause.
+        """
+        parts = ["CREATE SCHEMA"]
+        label = ["CREATE SCHEMA"]
+        params: dict[str, sql.Composable] = {"s": sql.Identifier(name)}
+        if if_not_exists:
+            parts.append("IF NOT EXISTS")
+            label.append("IF NOT EXISTS")
+        parts.append("{s}")
+        label.append(name)
+        if owner:
+            parts.append("AUTHORIZATION {o}")
+            label.append(f"AUTHORIZATION {owner}")
+            params["o"] = sql.Identifier(owner)
+        return SqlOp(
+            description=" ".join(label),
+            statement=sql.SQL(" ".join(parts)).format(**params),
+        )
+
+    def alter_owner(self, name: str, owner: str) -> SqlOp:
+        return SqlOp(
+            description=f"ALTER SCHEMA {name} OWNER TO {owner}",
+            statement=sql.SQL("ALTER SCHEMA {s} OWNER TO {o}").format(
+                s=sql.Identifier(name), o=sql.Identifier(owner)
+            ),
+        )
+
+    def rename_schema(self, name: str, new_name: str) -> SqlOp:
+        return SqlOp(
+            description=f"ALTER SCHEMA {name} RENAME TO {new_name}",
+            statement=sql.SQL("ALTER SCHEMA {s} RENAME TO {n}").format(
+                s=sql.Identifier(name), n=sql.Identifier(new_name)
+            ),
+        )
+
+    def alter_quota(self, name: str, quota: str) -> SqlOp | None:
+        """``None`` — only Redshift has schema quotas."""
+        return None
+
+    def privilege_op(
+        self,
+        privilege: SchemaPrivilege,
+        schema: str,
+        grantee: str,
+        kind: ParentKind,
+        *,
+        revoke: bool = False,
+        grantor: str | None = None,
+        cascade: bool = False,
+    ) -> SqlOp | None:
+        """One GRANT/REVOKE statement, or ``None`` if the engine cannot express it.
+
+        ``None`` is the established "skip and warn" signal — the plan builder
+        turns it into a one-time warning rather than failing the whole run.
+        """
+        # Imported here, not at module top: schema_admin imports this module.
+        from dataplat.services.db.schema_admin import (
+            DEFAULT_LEVEL,
+            SCHEMA_LEVEL,
+            TABLE_LEVEL,
+        )
+        from dataplat.services.db.schema_admin import (
+            SchemaPrivilege as Priv,
+        )
+
+        grantee_sql, grantee_label = render_grantee(self.engine, grantee, kind)
+        verb = "REVOKE" if revoke else "GRANT"
+        preposition = "FROM" if revoke else "TO"
+        tail = " CASCADE" if (revoke and cascade) else ""
+
+        if privilege in SCHEMA_LEVEL:
+            keyword = privilege.value.upper()
+            target = "SCHEMA {s}"
+            target_label = f"SCHEMA {schema}"
+        elif privilege in TABLE_LEVEL:
+            keyword = "ALL" if privilege is Priv.table_all else privilege.value.upper()
+            target = "ALL TABLES IN SCHEMA {s}"
+            target_label = f"ALL TABLES IN SCHEMA {schema}"
+        elif privilege is Priv.sequence_usage:
+            keyword = "USAGE"
+            target = "ALL SEQUENCES IN SCHEMA {s}"
+            target_label = f"ALL SEQUENCES IN SCHEMA {schema}"
+        elif privilege is Priv.function_execute:
+            keyword = "EXECUTE"
+            target = "ALL FUNCTIONS IN SCHEMA {s}"
+            target_label = f"ALL FUNCTIONS IN SCHEMA {schema}"
+        elif privilege in DEFAULT_LEVEL:
+            return self._default_privileges_op(
+                privilege,
+                schema,
+                grantee_sql,
+                grantee_label,
+                verb=verb,
+                preposition=preposition,
+                grantor=grantor,
+                tail=tail,
+            )
+        else:  # pragma: no cover - the enum has no other members
+            raise ValidationError(f"unhandled privilege: {privilege}")
+
+        statement = sql.SQL(
+            f"{verb} {keyword} ON {target} {preposition} {{g}}{tail}"
+        ).format(s=sql.Identifier(schema), g=grantee_sql)
+        return SqlOp(
+            description=(
+                f"{verb} {keyword} ON {target_label} "
+                f"{preposition} {grantee_label}{tail}"
+            ),
+            statement=statement,
+        )
+
+    def _default_privileges_op(
+        self,
+        privilege: SchemaPrivilege,
+        schema: str,
+        grantee_sql: sql.Composable,
+        grantee_label: str,
+        *,
+        verb: str,
+        preposition: str,
+        grantor: str | None,
+        tail: str,
+    ) -> SqlOp | None:
+        """``ALTER DEFAULT PRIVILEGES`` with an explicit grantor.
+
+        The grantor clause is mandatory here by design. Without ``FOR ROLE`` /
+        ``FOR USER`` the statement binds to whoever is connected, so tables later
+        created by dbt or by the schema owner inherit nothing — the single most
+        common way default privileges silently fail. Refusing is the only honest
+        option: the statement would succeed and do nothing.
+        """
+        from dataplat.services.db.schema_admin import SchemaPrivilege as Priv
+
+        if not grantor:
+            raise ValidationError(
+                f'"{privilege.value}" needs a grantor: pass --default-for naming '
+                "the role that will create the tables. Without it the grant "
+                "would bind to the connecting user and silently do nothing."
+            )
+        keyword = "ALL" if privilege is Priv.default_all else "SELECT"
+        word = self.default_privileges_grantor_keyword
+        statement = sql.SQL(
+            f"ALTER DEFAULT PRIVILEGES FOR {word} {{o}} IN SCHEMA {{s}} "
+            f"{verb} {keyword} ON TABLES {preposition} {{g}}{tail}"
+        ).format(o=sql.Identifier(grantor), s=sql.Identifier(schema), g=grantee_sql)
+        return SqlOp(
+            description=(
+                f"ALTER DEFAULT PRIVILEGES FOR {word} {grantor} IN SCHEMA {schema} "
+                f"{verb} {keyword} ON TABLES {preposition} {grantee_label}{tail}"
+            ),
+            statement=statement,
+        )
+
+    # --- held detection -------------------------------------------------
+
+    def held_schema_privileges(
+        self,
+        cursor: Any,
+        schemas: Sequence[str],
+        grantees: Sequence[str],
+        kinds: Mapping[str, ParentKind] | None = None,
+    ) -> set[tuple[str, str, str]]:
+        """``(schema, grantee, privilege)`` triples already in effect.
+
+        Schema-scoped privileges only. Across a fan-out like ``ON ALL TABLES``
+        "held" has no single answer, and ``GRANT`` is idempotent, so re-issuing
+        those costs nothing but output noise.
+
+        ``kinds`` is unused on this Postgres path: ``aclexplode`` joins
+        ``pg_roles`` by OID, so a name shared by two kinds of principal cannot be
+        confused the way it can on Redshift's name-keyed SVV views — see the
+        Redshift override, which does need it.
+
+        Held-detection is cosmetic, never load-bearing (a missed "held" costs one
+        redundant, idempotent GRANT), so a failure here must not abort the
+        surrounding transaction — hence the savepoint.
+        """
+        if not schemas or not grantees:
+            return set()
+        rows = guarded_fetch(
+            cursor,
+            _HELD_SCHEMA_POSTGRES,
+            (list(schemas), list(grantees)),
+            savepoint="dp_schema_held_postgres",
+        )
+        if rows is None:
+            return set()  # degrade to "nothing held" rather than abort
+        return self._map_held(rows)
+
+    def _map_held(self, rows: Sequence[tuple[Any, ...]]) -> set[tuple[str, str, str]]:
+        out: set[tuple[str, str, str]] = set()
+        for schema, grantee, privilege_type in rows:
+            token = self._HELD_PRIVILEGES.get(privilege_type)
+            if token is not None:
+                out.add((schema, grantee, token))
+        return out
 
     def _roster(
         self, cursor: Any, query: str, *, include_system: bool, like: str | None
@@ -210,6 +498,103 @@ class PostgresSchemaDialect(SchemaDialect):
 
 class RedshiftSchemaDialect(SchemaDialect):
     engine = SqlEngine.redshift
+    default_privileges_grantor_keyword = "USER"
+
+    def create_schema(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        quota: str | None = None,
+        if_not_exists: bool = False,
+    ) -> SqlOp:
+        op = super().create_schema(
+            name, owner=owner, quota=quota, if_not_exists=if_not_exists
+        )
+        if not quota:
+            return op
+        # A quota is neither an identifier nor a bindable parameter in DDL, so it
+        # is interpolated as text. schema_admin.parse_quota has already reduced it
+        # to digits + one space + MB/GB/TB, or the single keyword UNLIMITED, and
+        # rebuilds the string from parsed groups — there is nothing else it can
+        # contain. CreateSchemaSpec re-normalizes so that holds by construction.
+        return SqlOp(
+            description=f"{op.description} QUOTA {quota}",
+            statement=op.statement + sql.SQL(f" QUOTA {quota}"),
+        )
+
+    def alter_quota(self, name: str, quota: str) -> SqlOp | None:
+        # Pre-normalized by schema_admin.parse_quota — see create_schema above.
+        return SqlOp(
+            description=f"ALTER SCHEMA {name} QUOTA {quota}",
+            statement=sql.SQL("ALTER SCHEMA {s} ").format(s=sql.Identifier(name))
+            + sql.SQL(f"QUOTA {quota}"),
+        )
+
+    def privilege_op(
+        self,
+        privilege: SchemaPrivilege,
+        schema: str,
+        grantee: str,
+        kind: ParentKind,
+        *,
+        revoke: bool = False,
+        grantor: str | None = None,
+        cascade: bool = False,
+    ) -> SqlOp | None:
+        from dataplat.services.db.schema_admin import (
+            DEFAULT_LEVEL,
+        )
+        from dataplat.services.db.schema_admin import (
+            SchemaPrivilege as Priv,
+        )
+
+        if privilege is Priv.sequence_usage:
+            return None  # Redshift has no sequences at all
+        if (
+            privilege in DEFAULT_LEVEL
+            and kind is ParentKind.role
+            and grantee.upper() != PUBLIC
+        ):
+            # Redshift's ALTER DEFAULT PRIVILEGES grants to a user or a GROUP;
+            # there is no TO ROLE form. PUBLIC is excluded from this skip because
+            # resolve_grantee_kinds assigns it ParentKind.role as a *placeholder*
+            # (render_grantee special-cases PUBLIC by name and ignores the kind),
+            # and Redshift's ALTER DEFAULT PRIVILEGES does support TO PUBLIC — so
+            # the placeholder must not leak into this decision.
+            return None
+        return super().privilege_op(
+            privilege,
+            schema,
+            grantee,
+            kind,
+            revoke=revoke,
+            grantor=grantor,
+            cascade=cascade,
+        )
+
+    def held_schema_privileges(
+        self,
+        cursor: Any,
+        schemas: Sequence[str],
+        grantees: Sequence[str],
+        kinds: Mapping[str, ParentKind] | None = None,
+    ) -> set[tuple[str, str, str]]:
+        """See the base docstring. ``kinds`` pins each grantee's identity_type —
+        see :func:`_held_identity_pin` for why an unpinned name match is unsafe.
+        """
+        if not schemas or not grantees:
+            return set()
+        pin, pin_params = _held_identity_pin(grantees, kinds)
+        rows = guarded_fetch(
+            cursor,
+            _HELD_SCHEMA_REDSHIFT.format(pin=pin),
+            (list(schemas), *pin_params),
+            savepoint="dp_schema_held",
+        )
+        if rows is None:
+            return set()  # view unavailable -> issue every grant
+        return self._map_held(rows)
 
     def list_schemas(
         self, cursor: Any, *, include_system: bool = False, like: str | None = None
@@ -249,9 +634,30 @@ class RedshiftSchemaDialect(SchemaDialect):
 
 
 class DuckDbSchemaDialect(SchemaDialect):
+    """DuckDB creates and drops schemas; it does not grant or alter them.
+
+    Probed against duckdb 1.5.5, and each refusal below quotes what the engine
+    actually said:
+
+    - ``CREATE SCHEMA s AUTHORIZATION bob`` → ``ParserException`` at
+      ``AUTHORIZATION``. There is no owner to authorize.
+    - ``GRANT USAGE ON SCHEMA s TO bob`` → ``ParserException`` at ``GRANT``. The
+      keyword does not exist, because there is nobody to grant to.
+    - ``ALTER SCHEMA s RENAME TO t`` → ``NotImplementedException``: "Altering
+      schemas is not yet supported".
+
+    ``CREATE SCHEMA [IF NOT EXISTS]`` and ``DROP SCHEMA ... RESTRICT|CASCADE``
+    all work, which is why those two subcommands are not refused here. The CLI
+    gates the rest on :class:`~dataplat.services.db.capabilities.Capability`, so
+    the user gets the engine's reason rather than a parser error; the overrides
+    below are the service-layer half, so no caller can build a statement this
+    engine cannot parse.
+    """
+
     engine = SqlEngine.duckdb
     system_predicate = _HIDE_SYSTEM_DUCKDB
     placeholder = "?"
+    supports_authorization = False
 
     def list_schemas(
         self, cursor: Any, *, include_system: bool = False, like: str | None = None
@@ -259,6 +665,43 @@ class DuckDbSchemaDialect(SchemaDialect):
         return self._roster(
             cursor, _LIST_DUCKDB, include_system=include_system, like=like
         )
+
+    def alter_owner(self, name: str, owner: str) -> SqlOp:
+        raise ValidationError(
+            "DuckDB has no schema owners: every connection is the same implicit "
+            "user, and ALTER SCHEMA is not implemented"
+        )
+
+    def rename_schema(self, name: str, new_name: str) -> SqlOp:
+        raise ValidationError(
+            "DuckDB does not implement ALTER SCHEMA — the engine answers "
+            "'Altering schemas is not yet supported'"
+        )
+
+    def privilege_op(
+        self,
+        privilege: SchemaPrivilege,
+        schema: str,
+        grantee: str,
+        kind: ParentKind,
+        *,
+        revoke: bool = False,
+        grantor: str | None = None,
+        cascade: bool = False,
+    ) -> SqlOp | None:
+        raise ValidationError(
+            "DuckDB has no GRANT statement: the keyword does not parse, because "
+            "there are no users or roles to grant anything to"
+        )
+
+    def held_schema_privileges(
+        self,
+        cursor: Any,
+        schemas: Sequence[str],
+        grantees: Sequence[str],
+        kinds: Mapping[str, ParentKind] | None = None,
+    ) -> set[tuple[str, str, str]]:
+        return set()  # nothing can be held where nothing can be granted
 
 
 def schema_dialect_for(engine: SqlEngine) -> SchemaDialect:
