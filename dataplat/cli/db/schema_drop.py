@@ -43,12 +43,12 @@ from dataplat.cli.db._common import (
 from dataplat.cli.db._plan import execute_ops, print_ops
 from dataplat.cli.db._schema_opts import SchemaLikeOption, is_protected_schema
 from dataplat.core.errors import ValidationError
+from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role_admin import parse_csv_flag
 from dataplat.services.db.schema_admin import (
     SchemaSummary,
     build_drop_plan,
-    translate_like_pattern,
 )
 from dataplat.services.db.schema_dialects import schema_dialect_for
 
@@ -134,9 +134,7 @@ def drop_command(
         if like:
             matched = [
                 row
-                for row in dialect.list_schemas(
-                    cursor, like=translate_like_pattern(like)
-                )
+                for row in dialect.list_schemas(cursor, like=glob_to_like(like))
                 # Re-applied after matching: see the module docstring.
                 if not is_protected_schema(row.name)
             ]

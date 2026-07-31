@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from psycopg import sql
 
 from dataplat.core.errors import ValidationError
+from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE
 from dataplat.services.db._savepoint import guarded_fetch
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.grantees import PUBLIC, render_grantee
@@ -216,7 +217,12 @@ def _where_clause(
     if not include_system:
         predicates.append(system_predicate)
     if like is not None:
-        predicates.append(f"n.nspname LIKE {placeholder}")
+        # ESCAPE is not optional here. The caller builds this pattern with
+        # glob_to_like, which escapes `_` so that a prefix reads as a prefix —
+        # and an escape character the statement does not declare is just a
+        # literal `#`, matching nothing. Silent empty results, or worse for a
+        # destructive --like: the unescaped pattern selecting extra schemas.
+        predicates.append(f"n.nspname LIKE {placeholder} {LIKE_ESCAPE_CLAUSE}")
         params.append(like)
     if not predicates:
         return "", ()
