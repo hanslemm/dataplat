@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import csv
 from datetime import UTC, datetime
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +59,10 @@ from dataplat.cli.db._credentials import (
     file_mode_secure,
     open_credentials_file,
 )
+from dataplat.cli.db._grantees import (  # noqa: F401  (re-export)
+    GranteeKind,
+    parent_kind_for,
+)
 from dataplat.core.errors import ValidationError
 from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
@@ -71,28 +74,6 @@ from dataplat.services.db.role_admin import (
     resolve_grantee_kinds,
 )
 from dataplat.services.db.role_dialects import ParentKind, dialect_for
-
-
-class GranteeKind(str, Enum):
-    """The three things a ``--kind`` / ``--to-kind`` can name.
-
-    Deliberately not :class:`~dataplat.services.db.role.RoleKind`, which has two
-    members because it answers a different question — ``role list`` and
-    ``role show`` classify by "can it log in", so a Redshift RBAC role reads as
-    ``group`` there. And deliberately not :class:`ParentKind`, whose ``absent``
-    member Typer would happily offer as a valid choice on the command line.
-    """
-
-    user = "user"
-    group = "group"
-    role = "role"
-
-
-_PARENT_KIND: dict[GranteeKind, ParentKind] = {
-    GranteeKind.user: ParentKind.user,
-    GranteeKind.group: ParentKind.group,
-    GranteeKind.role: ParentKind.role,
-}
 
 
 def _render_plan(console: Console, plan: GrantPlan) -> None:
@@ -191,8 +172,8 @@ def grant_command(
     role_names = parse_csv_flag(roles)
     target_names = parse_csv_flag(to)
     dialect = dialect_for(conn_params.engine)
-    forced = _PARENT_KIND[kind] if kind is not None else None
-    forced_to = _PARENT_KIND[to_kind] if to_kind is not None else None
+    forced = parent_kind_for(kind)
+    forced_to = parent_kind_for(to_kind)
 
     # Resolved lazily, inside the branch that actually needs it: the default
     # path creates ~/.config/dataplat/credentials/ as a side effect, and a
