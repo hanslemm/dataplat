@@ -228,6 +228,7 @@ all — every connection is the same implicit user, `duckdb`.
 | `query` | ✓ | ✓ | ✓ | — |
 | `describe` | ✓ | ✓ | ✓ | — |
 | `top-tables` | ✓ | ✓ | ✓ | works, but ranks by estimated rows and shows no sizes — [see below](#duckdb-top-tables-sizes-are-estimates) |
+| `schema list` | ✓ | ✓ ³ | ✓ ⁴ | — |
 | `role list` / `show` / `create` / `grant` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
 | `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
 | `kill` | ✓ | ✓ | ✗ | the same — there is no other session to cancel |
@@ -238,6 +239,13 @@ all — every connection is the same implicit user, `duckdb`.
 the question cannot be answered rather than answered wrongly.
 ² `dp db dbt-orphans` does not consider materialized views on Redshift: there is
 no `pg_matviews` catalog listing them.
+³ `dp db schema list` adds Used/Quota columns on Redshift, the only engine with
+schema quotas. `svv_schema_quota_state` is version-dependent, so an unavailable
+view renders every quota as `?` rather than failing the listing.
+⁴ `dp db schema list` reports `duckdb` as every schema's owner — there is no
+`pg_roles` and every connection is the same implicit user — and
+`--include-system` reveals nothing extra, because DuckDB keeps its catalog
+schemas out of `pg_namespace` entirely.
 
 A refused command **exits 2** — "a combination of arguments that cannot work",
 the same code as an unknown flag or an unknown target — and says which engine
@@ -542,6 +550,33 @@ login user, writing generated passwords to the same CSV `create` uses
 (`~/.config/dataplat/credentials/`, mode `0600`). Creates and grants share one
 transaction, so a failed grant leaves no half-onboarded user behind and the
 command is safe to re-run.
+
+### Schemas
+
+```bash
+dp db schema list                        # schemas with owner and object counts
+dp db schema list --like 'dev_*'         # glob `*` or SQL `%`, either works
+dp db schema list --include-system       # add pg_catalog, information_schema, …
+dp db schema list -t local --json
+```
+
+Works on all three engines, because all three have schemas — no refusal here (see
+[Engines](#engines)). What differs is where the answer comes from: PostgreSQL
+resolves the owner through `pg_roles`, Redshift through `pg_user`, and DuckDB has
+no `pg_roles` at all, so it reports its single implicit user, `duckdb`.
+
+Redshift adds schema quotas, shown as two extra columns when the cluster reports
+them. An unknown quota renders as `?`, never `0` — `svv_schema_quota_state` is
+version-dependent, and "nobody could tell" is not "no limit".
+
+Two engine differences worth knowing:
+
+- DuckDB's `main` is its *default* schema, the analogue of PostgreSQL's `public`,
+  so it is listed rather than hidden. A database whose tables all live in `main`
+  would otherwise list as empty.
+- DuckDB never exposes `information_schema` or `pg_catalog` through
+  `pg_namespace` — it flags them `internal` — so `--include-system` has nothing
+  extra to show there.
 
 ### Cleanup
 
