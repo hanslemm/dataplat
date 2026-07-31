@@ -56,6 +56,7 @@ from dataplat.cli.db._common import (
     db_session,
 )
 from dataplat.core.errors import ExitCode, ValidationError
+from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.capabilities import Capability, capabilities_for
 from dataplat.services.db.connection import (
     MEMORY_PATH,
@@ -94,7 +95,6 @@ from dataplat.services.db.schema_admin import (
     SchemaPrivilege,
     build_create_plan,
     build_drop_plan,
-    translate_like_pattern,
 )
 from dataplat.services.db.schema_dialects import DuckDbSchemaDialect
 from dataplat.services.db.top_tables import (
@@ -1553,7 +1553,7 @@ class TestSchemaList:
         self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
     ) -> None:
         rows = DuckDbSchemaDialect().list_schemas(
-            ddb_cursor, like=translate_like_pattern("analytics*")
+            ddb_cursor, like=glob_to_like("analytics*")
         )
 
         names = {r.name for r in rows}
@@ -1696,3 +1696,25 @@ class TestSchemaDdl:
             DuckDbSchemaDialect().held_schema_privileges(ddb_cursor, ["main"], ["bob"])
             == set()
         )
+
+    def test_a_glob_prefix_does_not_reach_a_neighbouring_schema(
+        self, ddb_cursor: DuckDbCursor, ddb_sample_schema: str
+    ) -> None:
+        """DuckDB honours ESCAPE too — asserted, not assumed from Postgres.
+
+        The fixture gives us `analytics` and `analytics_stg`. An unescaped
+        `analytics_*` matches both; escaped, it matches only the one whose name
+        really continues after a literal underscore.
+        """
+        dialect = DuckDbSchemaDialect()
+
+        escaped = {
+            r.name
+            for r in dialect.list_schemas(ddb_cursor, like=glob_to_like("analytics_*"))
+        }
+        assert escaped == {SAMPLE_STAGING_SCHEMA}
+
+        unescaped = {
+            r.name for r in dialect.list_schemas(ddb_cursor, like="analytics_%")
+        }
+        assert unescaped == {SAMPLE_STAGING_SCHEMA}

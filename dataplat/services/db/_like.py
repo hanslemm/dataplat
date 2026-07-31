@@ -30,7 +30,7 @@ behaves identically on both. Do not "simplify" this back to a backslash.
 
 from __future__ import annotations
 
-__all__ = ["LIKE_ESCAPE", "LIKE_ESCAPE_CLAUSE", "like_escape"]
+__all__ = ["LIKE_ESCAPE", "LIKE_ESCAPE_CLAUSE", "glob_to_like", "like_escape"]
 
 # The escape character itself, exposed so tests can assert on one constant
 # rather than a literal repeated across modules.
@@ -53,4 +53,32 @@ def like_escape(value: str) -> str:
         value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
         .replace("%", f"{LIKE_ESCAPE}%")
         .replace("_", f"{LIKE_ESCAPE}_")
+    )
+
+
+def glob_to_like(pattern: str) -> str:
+    """Translate an operator's glob into a ``LIKE`` pattern.
+
+    ``*`` becomes ``%``, because a filter is the one place shell habits should
+    apply. A literal ``%`` is left alone, so ``dev_*`` and ``dev_%`` stay
+    equivalent for anyone who already thinks in SQL.
+
+    ``_`` is escaped, and that is the whole point of this function existing
+    rather than a bare ``pattern.replace("*", "%")``. In ``LIKE``, ``_`` matches
+    any single character, so ``dev_*`` also matches ``devops_prod`` — every
+    schema in these warehouses uses ``_`` as a word separator, so the pattern an
+    operator reads as a prefix is not the one the server applies. On a listing
+    that is a surprise; on ``dp db schema drop --like`` it selected a schema
+    nobody named and destroyed what was in it. Same failure as the
+    ``'%_deprecated'`` purge candidates that motivated this module, one command
+    further along.
+
+    Pair the result with :data:`LIKE_ESCAPE_CLAUSE`. Escaping without declaring
+    the escape character leaves ``#`` as a literal ``#``, which matches nothing —
+    a silent empty result rather than an error.
+    """
+    return (
+        pattern.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("_", f"{LIKE_ESCAPE}_")
+        .replace("*", "%")
     )

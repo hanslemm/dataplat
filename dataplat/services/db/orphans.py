@@ -344,6 +344,14 @@ def fetch_deprecated_objects(
     # name ending in <anychar>deprecated. A table called "legacydeprecated" came
     # back as a purge candidate, and with --include-unknown the purge would have
     # dropped it.
+    # The `pg#_%%` exclusions below need the escape as much as the suffix pattern
+    # does, and for the mirror-image reason. Unescaped, `pg_%` reads as "pg, any
+    # character, anything" — so it excludes `pgx_staging` and `pgbouncer_meta`
+    # along with the catalogs, and an orphan in one of those schemas is invisible
+    # to this scan. A false negative rather than a false positive, which is why it
+    # could sit here unnoticed: the command reports fewer candidates, and nothing
+    # says any are missing. Confirmed on PostgreSQL 16, where a
+    # `pgx_staging.orders_deprecated` returned 0 rows before this.
     suffix_pattern = f"%{like_escape(DEPRECATED_SUFFIX)}"
     results: list[tuple[str, str, ObjectKind]] = []
 
@@ -353,7 +361,7 @@ def fetch_deprecated_objects(
         SELECT table_schema, table_name, table_type
         FROM information_schema.tables t
         WHERE table_name LIKE %s {LIKE_ESCAPE_CLAUSE}
-          AND table_schema NOT LIKE 'pg_%%'
+          AND table_schema NOT LIKE 'pg#_%%' {LIKE_ESCAPE_CLAUSE}
           AND table_schema <> 'information_schema'
           {partition_child_filter}
         """,
@@ -371,7 +379,7 @@ def fetch_deprecated_objects(
             SELECT schemaname, matviewname
             FROM pg_matviews
             WHERE matviewname LIKE %s {LIKE_ESCAPE_CLAUSE}
-              AND schemaname NOT LIKE 'pg_%%'
+              AND schemaname NOT LIKE 'pg#_%%' {LIKE_ESCAPE_CLAUSE}
             """,
             (suffix_pattern,),
         )

@@ -65,6 +65,7 @@ from dataplat.cli.db._schema_opts import (
     ToKindOption,
 )
 from dataplat.core.errors import ValidationError
+from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role_admin import parse_csv_flag, resolve_grantee_kinds
@@ -75,7 +76,6 @@ from dataplat.services.db.schema_admin import (
     build_grant_plan,
     parse_grant_spec,
     parse_privileges,
-    translate_like_pattern,
 )
 from dataplat.services.db.schema_dialects import schema_dialect_for
 
@@ -170,7 +170,7 @@ def _privilege_command(
 
     with db_session(conn_params) as conn, conn.cursor() as cursor:
         rows = schema_dialect.list_schemas(
-            cursor, like=translate_like_pattern(like) if like else None
+            cursor, like=glob_to_like(like) if like else None
         )
         owners = {row.name: row.owner for row in rows}
         if like:

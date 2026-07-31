@@ -44,7 +44,6 @@ __all__ = [
     "parse_grant_spec",
     "parse_privileges",
     "parse_quota",
-    "translate_like_pattern",
 ]
 
 
@@ -77,22 +76,6 @@ class SchemaSummary:
     def object_count(self) -> int:
         """Everything a ``CASCADE`` would destroy, for the drop pre-flight."""
         return self.tables + self.views + self.other
-
-
-def translate_like_pattern(pattern: str) -> str:
-    """Accept glob ``*`` as a friendlier spelling of SQL ``LIKE``'s ``%``.
-
-    ``dev_*`` and ``dev_%`` both work, because a filter is the one place an
-    operator expects shell habits to apply.
-
-    ``_`` is left alone. It *is* a single-character wildcard in ``LIKE``, so
-    ``dev_x`` also matches ``devax`` — but every schema in these warehouses uses
-    ``_`` as a literal word separator, and over-matching by one character in a
-    read-only filter is harmless. Where over-matching is *not* harmless — a
-    pattern that selects schemas to drop — the caller escapes it instead, with
-    :func:`~dataplat.services.db._like.like_escape`.
-    """
-    return pattern.replace("*", "%")
 
 
 # ---------------------------------------------------------------------------

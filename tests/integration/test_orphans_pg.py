@@ -934,3 +934,42 @@ def test_purge_names_the_blocking_relation_and_logs_the_refused_attempt(
         assert row == (True,), "the refused purge must have rolled its drop back"
     finally:
         run(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_a_schema_merely_starting_with_pg_is_still_scanned(
+    pg_cursor: Cursor[TupleRow],
+) -> None:
+    """The mirror image of the suffix bug, in the schema *exclusion*.
+
+    The scan hides catalogs with ``table_schema NOT LIKE 'pg_%'``. Unescaped,
+    that reads as "pg, any character, anything" — so it excluded ``pgx_staging``
+    and ``pgbouncer_meta`` along with ``pg_catalog``, and an orphan living in one
+    of those was invisible.
+
+    A false negative, which is why it sat unnoticed: the command reported fewer
+    candidates and nothing said any were missing. PostgreSQL reserves the literal
+    ``pg_`` prefix for itself, so ``pgx_staging`` is the closest a user schema can
+    get to the exclusion — and it must be scanned.
+    """
+    pg_cursor.execute("CREATE SCHEMA pgx_scan")
+    pg_cursor.execute("CREATE TABLE pgx_scan.orders_deprecated (id int)")
+
+    assert _deprecated_in(pg_cursor, "pgx_scan") == {"orders_deprecated": "table"}
+
+
+def test_the_real_catalogs_are_still_excluded(
+    pg_cursor: Cursor[TupleRow], sample_schema: str
+) -> None:
+    """Escaping the exclusion must not stop it excluding what it is for.
+
+    Paired with the test above so a fix to one cannot silently break the other.
+    """
+    from dataplat.services.db import orphans
+
+    rows = orphans.fetch_deprecated_objects(
+        pg_cursor, is_redshift=False, excluded_schemas=frozenset()
+    )
+
+    schemas = {schema for schema, _, _ in rows}
+    assert not any(s.startswith("pg_") for s in schemas)
+    assert "information_schema" not in schemas

@@ -567,7 +567,7 @@ command is safe to re-run.
 
 ```bash
 dp db schema list                        # schemas with owner and object counts
-dp db schema list --like 'dev_*'         # glob `*` or SQL `%`, either works
+dp db schema list --like 'dev_*'         # glob `*` or SQL `%`; `_` is literal
 dp db schema list --include-system       # add pg_catalog, information_schema, …
 dp db schema create analytics --owner svc_etl --quota 50GB
 dp db schema drop dev_old --cascade --dry-run
@@ -584,6 +584,12 @@ implement `ALTER SCHEMA` (see [Engines](#engines)). What differs on `list` is
 where the answer comes from: PostgreSQL resolves the owner through `pg_roles`,
 Redshift through `pg_user`, and DuckDB has no `pg_roles` at all, so it reports its
 single implicit user, `duckdb`.
+
+`--like` treats `*` and `%` as wildcards and `_` as a literal character. That
+last part matters: in SQL `LIKE`, `_` matches *any* single character, so an
+unescaped `dev_*` also selects `devops_prod`. Harmless on a listing, not harmless
+on `schema drop --like`, so the underscore is escaped and the statement declares
+`ESCAPE '#'`.
 
 **Privileges.** `--privileges` takes any of `usage`, `create`, `all`, `select`,
 `insert`, `update`, `delete`, `table-all`, `sequence-usage`, `function-execute`,

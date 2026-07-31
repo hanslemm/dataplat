@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.role_dialects import ParentKind
 from dataplat.services.db.schema_admin import (
     CreateSchemaSpec,
@@ -27,7 +28,6 @@ from dataplat.services.db.schema_admin import (
     build_create_plan,
     build_drop_plan,
     build_grant_plan,
-    translate_like_pattern,
 )
 from dataplat.services.db.schema_dialects import PostgresSchemaDialect
 from tests.integration.conftest import TempRoleFactory
@@ -151,11 +151,13 @@ def test_postgres_reserves_the_pg_underscore_prefix(
 def test_a_like_pattern_filters_server_side(
     pg_cursor: Cursor[TupleRow], schemas: str
 ) -> None:
+    # The escaped form is what glob_to_like produces, and the statement declares
+    # ESCAPE '#', so these underscores match literally.
     rows = PostgresSchemaDialect().list_schemas(pg_cursor, like="dp#_list#_%")
+    assert {r.name for r in rows} == {"dp_list_a", "dp_list_b"}
 
-    # No ESCAPE clause on the user pattern, so `#` is literal and matches nothing.
-    assert rows == []
-
+    # Unescaped, `_` is a single-character wildcard — which is exactly why the
+    # callers escape.
     rows = PostgresSchemaDialect().list_schemas(pg_cursor, like="dp_list_%")
     assert {r.name for r in rows} == {"dp_list_a", "dp_list_b"}
 
@@ -165,7 +167,7 @@ def test_a_glob_pattern_reaches_the_same_rows(
 ) -> None:
     """`dp_list_*` is the spelling an operator reaches for first."""
     rows = PostgresSchemaDialect().list_schemas(
-        pg_cursor, like=translate_like_pattern("dp_list_*")
+        pg_cursor, like=glob_to_like("dp_list_*")
     )
 
     assert {r.name for r in rows} == {"dp_list_a", "dp_list_b"}
@@ -466,3 +468,45 @@ def test_default_privileges_apply_to_a_table_created_later(
     )
     row = pg_cursor.fetchone()
     assert row is not None and row[0] is True
+
+
+def test_a_glob_prefix_does_not_reach_a_neighbouring_schema(
+    pg_cursor: Cursor[TupleRow],
+) -> None:
+    """The bug this escaping exists for, pinned against the server.
+
+    ``dp_glob_*`` reads as "schemas starting with dp_glob_". Unescaped, LIKE
+    treats the ``_`` as any single character, so it also matches
+    ``dp_globops_prod`` — and ``dp db schema drop --like`` destroyed what was in
+    it. Observed with ``dev_*`` and ``devops_prod`` on a real database.
+
+    Both halves are asserted: that the escaped pattern selects only what was
+    asked for, and that the unescaped one really does over-match. The second is
+    what makes the first more than a tautology.
+    """
+    pg_cursor.execute("CREATE SCHEMA dp_glob_alpha")
+    pg_cursor.execute("CREATE SCHEMA dp_globops_prod")
+    dialect = PostgresSchemaDialect()
+
+    selected = {
+        r.name for r in dialect.list_schemas(pg_cursor, like=glob_to_like("dp_glob_*"))
+    }
+    assert selected == {"dp_glob_alpha"}
+
+    over_matched = {r.name for r in dialect.list_schemas(pg_cursor, like="dp_glob_%")}
+    assert "dp_globops_prod" in over_matched
+
+
+def test_a_typed_percent_is_still_a_wildcard(pg_cursor: Cursor[TupleRow]) -> None:
+    """Escaping `_` must not also disarm the wildcard the operator did type."""
+    pg_cursor.execute("CREATE SCHEMA dp_glob_alpha")
+    pg_cursor.execute("CREATE SCHEMA dp_globops_prod")
+
+    selected = {
+        r.name
+        for r in PostgresSchemaDialect().list_schemas(
+            pg_cursor, like=glob_to_like("dp_glob*")
+        )
+    }
+
+    assert selected == {"dp_glob_alpha", "dp_globops_prod"}
