@@ -5,7 +5,8 @@
 ### Added
 
 - **`dp db schema list` — schemas with owner and object counts**, on all three
-  engines, with `--like` (glob `*` or SQL `%`), `--include-system` and `--json`.
+  engines, with `--like` (glob `*` or SQL `%`; `_` is literal),
+  `--include-system` and `--json`.
   No refusal for DuckDB: it has schemas, so it gets an answer.
 
   The three engines need three statements, not one with a flag. PostgreSQL
@@ -91,6 +92,30 @@
   a live PostgreSQL server, not just fakes.
 
 ### Fixed
+
+- **`dp db schema drop --like` could destroy a schema nobody named.** `--like`
+  translated glob `*` to SQL `%` and left `_` alone — but `_` is a
+  single-character wildcard in `LIKE`, so `dev_*` also matched `devops_prod`. With
+  `--cascade --yes` that dropped it and everything in it.
+
+  Underscores in a `--like` pattern are now escaped and the statement declares
+  `ESCAPE '#'`; a typed `%` is still a wildcard, so `dev_*` and `dev_%` remain
+  equivalent. Applies to `list`, `drop`, `grant` and `revoke`. Pinned against
+  PostgreSQL 16 and DuckDB from both sides: the escaped pattern selects only what
+  was asked for, and the unescaped one demonstrably over-matches.
+
+  Same lesson as the `top-tables`/`dbt-orphans` escaping fix below, reintroduced
+  one command further along — which is why the shared helper now lives next to
+  `like_escape` rather than in the schema module, so the next caller has somewhere
+  obvious to reach for.
+
+- **`dp db dbt-orphans` silently skipped schemas whose names start with `pg` plus
+  one character.** The system-schema exclusion was `table_schema NOT LIKE 'pg_%'`
+  with no `ESCAPE`, so it swallowed `pgx_staging` and `pgbouncer_meta` along with
+  `pg_catalog` — and an orphan in one of those was invisible to the scan. A false
+  negative, which is why it went unnoticed: the command reported fewer candidates
+  and nothing said any were missing. Confirmed on PostgreSQL 16, where a
+  `pgx_staging.orders_deprecated` returned no rows before this.
 
 - **`dp db role create --no-login` created `~/.config/dataplat/credentials/`
   even though it generates no passwords.** The default credentials path is now

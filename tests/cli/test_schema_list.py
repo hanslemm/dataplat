@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 
 from dataplat.cli.db import schema_list as sl
-from dataplat.services.db.schema_admin import SchemaSummary, translate_like_pattern
+from dataplat.services.db._like import glob_to_like
+from dataplat.services.db.schema_admin import SchemaSummary
 
 
 class _Cursor:
@@ -128,7 +129,9 @@ def test_a_glob_pattern_is_translated_before_it_reaches_sql(
 
     _invoke(like="dev_*")
 
-    assert cursor.params[0] == ("dev_%",)
+    # The `_` arrives escaped, and the statement declares the escape character.
+    assert cursor.params[0] == ("dev#_%",)
+    assert "ESCAPE '#'" in cursor.executed[0]
 
 
 def test_json_is_machine_readable_and_carries_unknown_as_null(
@@ -184,12 +187,28 @@ def test_a_schema_name_containing_markup_is_not_interpreted(
     assert "a[x]" in out
 
 
-def test_glob_translation_leaves_underscores_alone() -> None:
-    """`_` stays a LIKE wildcard: over-matching a read-only filter is harmless.
+def test_glob_translation_escapes_underscores() -> None:
+    """A prefix an operator reads as a prefix must be the one the server applies.
 
-    Documented rather than incidental — a pattern that selects schemas to *drop*
-    must escape instead, which is what like_escape is for.
+    `_` is a single-character wildcard in LIKE, so an unescaped `dev_*` also
+    matches `devops_prod`. Harmless-looking on a listing, and not harmless at all
+    on `schema drop --like`, which is where it selected a schema nobody named.
     """
-    assert translate_like_pattern("dev_*") == "dev_%"
-    assert translate_like_pattern("a*b*c") == "a%b%c"
-    assert translate_like_pattern("plain") == "plain"
+    assert glob_to_like("dev_*") == "dev#_%"
+    assert glob_to_like("a*b*c") == "a%b%c"
+    assert glob_to_like("plain") == "plain"
+
+
+def test_a_literal_percent_stays_a_wildcard() -> None:
+    """`dev_*` and `dev_%` stay equivalent for anyone who thinks in SQL.
+
+    A typed `%` is explicit wildcard intent, unlike a `_` that is almost always
+    a word separator.
+    """
+    assert glob_to_like("dev_%") == "dev#_%"
+    assert glob_to_like("dev%") == "dev%"
+
+
+def test_the_escape_character_itself_is_escaped_first() -> None:
+    """Or the escapes this function adds would themselves be escaped."""
+    assert glob_to_like("a#b_c") == "a##b#_c"

@@ -38,8 +38,9 @@ from dataplat.cli.db._common import (
     db_session,
     resolve_any_params_or_exit,
 )
+from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.connection import SqlEngine
-from dataplat.services.db.schema_admin import SchemaSummary, translate_like_pattern
+from dataplat.services.db.schema_admin import SchemaSummary
 from dataplat.services.db.schema_dialects import schema_dialect_for
 
 
@@ -134,7 +135,7 @@ def list_command(
     )
 
     dialect = schema_dialect_for(conn_params.engine)
-    pattern = translate_like_pattern(like) if like is not None else None
+    pattern = glob_to_like(like) if like is not None else None
     with db_session(conn_params) as conn, conn.cursor() as cursor:
         rows = dialect.list_schemas(cursor, include_system=include_system, like=pattern)
 
