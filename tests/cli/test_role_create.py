@@ -537,3 +537,46 @@ def test_create_refuses_a_duckdb_target(monkeypatch, tmp_path: Path) -> None:
     # disk for a role that could never exist.
     assert not creds.exists()
     assert "Plan:" not in out
+
+
+def test_credentials_default_path_is_not_the_working_directory(
+    monkeypatch, tmp_path
+) -> None:
+    """A generated password must not land in whatever directory you ran from.
+
+    The old default was ``./dp-credentials-<stamp>.csv``. A data engineer's cwd is
+    usually a checkout, nothing gitignores that name, and the file holds a real
+    password — so the default was one `git add -A` away from committing a
+    credential.
+    """
+    import stat
+
+    from dataplat.cli.db import role_create
+
+    monkeypatch.setattr(role_create, "CREDENTIALS_DIR", tmp_path / "credentials")
+    monkeypatch.chdir(tmp_path)
+
+    path = role_create._credentials_default_path()
+
+    assert path.parent == tmp_path / "credentials"
+    assert path.parent != Path.cwd()
+    assert path.name.startswith("dp-credentials-")
+    # The directory listing alone leaks which roles were created and when.
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_credentials_file_is_created_unreadable_to_others(
+    monkeypatch, tmp_path
+) -> None:
+    """0600, and created that way atomically rather than chmod-ed after."""
+    import stat
+
+    from dataplat.cli.db import role_create
+
+    target = tmp_path / "creds.csv"
+    handle, is_new = role_create._open_credentials_file(target)
+    handle.close()
+
+    assert is_new is True
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert role_create._file_mode_secure(target) is True

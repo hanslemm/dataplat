@@ -10,7 +10,8 @@ Redshift RBAC role); ``--grant-to`` grants the new role to existing
 roles or users (``GRANT <new> TO <target>``).
 
 Generated passwords are written to a CSV at ``--credentials-out`` (default
-``./dp-credentials-<timestamp>.csv``) with mode ``0600``. They are never
+``~/.config/dataplat/credentials/dp-credentials-<timestamp>.csv``) with mode
+``0600``, in a directory created ``0700``. They are never
 printed to stdout or logs. With ``--no-login`` no credentials file is
 written at all.
 """
@@ -47,6 +48,7 @@ from dataplat.cli.db._common import (
     engine_or_exit,
     resolve_params_or_exit,
 )
+from dataplat.core.envrc import CONFIG_DIR
 from dataplat.core.errors import ValidationError
 from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
@@ -61,10 +63,25 @@ from dataplat.services.db.role_admin import (
 )
 from dataplat.services.db.role_dialects import ParentKind, dialect_for
 
+# Generated credentials belong with dataplat's other state, not in whatever
+# directory the command happened to run from. A checkout is the likeliest cwd for
+# a data engineer, nothing gitignores dp-credentials-*.csv, and the file holds a
+# real password — so the old default could drop one inside a repo and wait to be
+# committed. Derived from envrc.CONFIG_DIR rather than rebuilt, so the config
+# location stays defined in one place.
+CREDENTIALS_DIR = CONFIG_DIR / "credentials"
+
 
 def _credentials_default_path() -> Path:
+    """A timestamped credentials CSV under the shared config directory.
+
+    The directory is created 0700 on first use: its listing alone leaks which
+    roles were created and when, even before anyone reads a file. The file itself
+    is opened 0600 by :func:`_open_credentials_file`.
+    """
+    CREDENTIALS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return Path.cwd() / f"dp-credentials-{stamp}.csv"
+    return CREDENTIALS_DIR / f"dp-credentials-{stamp}.csv"
 
 
 def _open_credentials_file(path: Path) -> tuple[Any, bool]:
@@ -248,8 +265,9 @@ def create_command(
     credentials_out: Path | None = typer.Option(
         None,
         "--credentials-out",
-        help="CSV file to append generated credentials to. "
-        "Default: ./dp-credentials-<timestamp>.csv",
+        help="CSV file to append generated credentials to. Default: a timestamped "
+        "file under ~/.config/dataplat/credentials/ — not the current "
+        "directory, which is usually a checkout.",
     ),
     password_length: int = typer.Option(
         32,
