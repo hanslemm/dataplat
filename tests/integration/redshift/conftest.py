@@ -126,8 +126,12 @@ Point the suite at a cluster with either:
 
 or, as an escape hatch:
 
-    export {DSN_ENV_VAR}='redshift://user:pw@cluster.eu-central-1.redshift\
+    export {DSN_ENV_VAR}='postgresql://user:pw@cluster.eu-central-1.redshift\
 .amazonaws.com:5439/dev?sslmode=require'
+
+The scheme is postgresql://, not redshift://. Redshift speaks the PostgreSQL
+wire protocol, and libpq only recognises postgresql:// and postgres:// — it
+rejects anything else outright, before a connection is attempted.
 
 The read-only tier is safe against a warehouse in use. Mutating tests
 additionally need {DISPOSABLE_ENV_VAR}=1."""
