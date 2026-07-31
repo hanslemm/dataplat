@@ -63,6 +63,18 @@ class DropOps:
     cluster_ops: list[SqlOp] = field(default_factory=list)
 
 
+# Role membership on Postgres is one table, so one query answers for every
+# role at once. Joined twice against pg_roles because pg_auth_members stores
+# OIDs, and the caller wants names. Verified on PostgreSQL 16.
+_HELD_GRANTS_POSTGRES = """
+SELECT r.rolname, m.rolname
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.roleid
+JOIN pg_roles m ON m.oid = am.member
+WHERE r.rolname = ANY(%s)
+"""
+
+
 class RoleDialect(ABC):
     """Strategy for one SQL engine."""
 
@@ -200,6 +212,38 @@ class RoleDialect(ABC):
         # at execution time.
         return ParentKind.role
 
+    def grantable_kinds(self, cursor: Any, name: str) -> tuple[ParentKind, ...]:
+        """Every kind ``name`` exists as, or ``()`` when it does not exist.
+
+        Distinct from :meth:`resolve_grantee_kind`, which answers "what should I
+        render in a ``TO`` clause" and on Postgres answers ``role`` without
+        looking. This one is a real lookup, because two callers need more than a
+        rendering hint: ``--create-missing-users`` has to know a name is *absent*
+        rather than assume it will exist by execution time, and ``--kind`` exists
+        to resolve names that are genuinely more than one thing.
+
+        Postgres keeps every principal in ``pg_roles`` and distinguishes them
+        only by ``rolcanlogin``, so a name is exactly one kind and the tuple
+        never holds more than one entry. Redshift overrides this.
+        """
+        cursor.execute("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (name,))
+        rows = cursor.fetchall()
+        if not rows:
+            return ()
+        return (ParentKind.user if rows[0][0] else ParentKind.role,)
+
+    def held_grants(self, cursor: Any, roles: tuple[str, ...]) -> set[tuple[str, str]]:
+        """``(role, target)`` pairs already in effect, for the given roles.
+
+        Lets ``role grant`` report a redundant grant instead of re-issuing it.
+        Re-granting is harmless on both engines, so this is about the operator
+        reading the plan and seeing what actually changes.
+        """
+        if not roles:
+            return set()
+        cursor.execute(_HELD_GRANTS_POSTGRES, (list(roles),))
+        return {(role, target) for role, target in cursor.fetchall()}
+
     def list_roles(self, cursor: Any) -> list[Any]:
         # Postgres: cluster-wide pg_roles. Imported lazily to avoid a cycle.
         from dataplat.services.db import role_admin
@@ -277,6 +321,34 @@ class PostgresDialect(RoleDialect):
                 "GRANT USAGE ON ALL SEQUENCES IN SCHEMA {s} TO {r}"
             ).format(s=sql.Identifier(schema), r=sql.Identifier(name)),
         )
+
+
+# Three ways a grant is already in effect on Redshift, because it has three
+# kinds of grantee. The group edge reads pg_group, which exists on every
+# cluster; the two RBAC edges read svv_* views that a pre-RBAC cluster does not
+# have at all, which is why the caller runs them through ``_guarded_fetch``.
+_HELD_ROLE_TO_USER_REDSHIFT = """
+SELECT role_name, user_name
+FROM svv_user_grants
+WHERE role_name = ANY(%s)
+"""
+
+# svv_role_grants(role_name, granted_role_name) reads "role_name HOLDS
+# granted_role_name", so the granted role is the one being looked up and the
+# columns come back swapped relative to the pair this returns.
+_HELD_ROLE_TO_ROLE_REDSHIFT = """
+SELECT granted_role_name, role_name
+FROM svv_role_grants
+WHERE granted_role_name = ANY(%s)
+"""
+
+# grolist is an array of usesysid, so membership is a containment test rather
+# than a join key.
+_HELD_GROUP_MEMBERS_REDSHIFT = """
+SELECT g.groname, u.usename
+FROM pg_group g, pg_user u
+WHERE g.groname = ANY(%s) AND u.usesysid = ANY(g.grolist)
+"""
 
 
 class RedshiftDialect(RoleDialect):
@@ -402,6 +474,72 @@ class RedshiftDialect(RoleDialect):
         if self._rbac_role_exists(cursor, target):
             return ParentKind.role
         return ParentKind.absent
+
+    def grantable_kinds(self, cursor: Any, name: str) -> tuple[ParentKind, ...]:
+        """Every kind ``name`` exists as — possibly more than one.
+
+        Redshift keeps users, legacy groups and RBAC roles in three separate
+        catalogs with no shared namespace, so one name can be a user *and* a
+        group *and* a role, carrying different privileges in each. Unlike
+        :meth:`resolve_grantee_kind`, which returns the first hit and would
+        silently pick one, this reports all of them so the caller can insist on
+        ``--kind`` rather than grant to whichever catalog happened to be probed
+        first.
+        """
+        found: list[ParentKind] = []
+        cursor.execute("SELECT 1 FROM pg_user WHERE usename = %s", (name,))
+        if cursor.fetchall():
+            found.append(ParentKind.user)
+        cursor.execute("SELECT 1 FROM pg_group WHERE groname = %s", (name,))
+        if cursor.fetchall():
+            found.append(ParentKind.group)
+        if self._rbac_role_exists(cursor, name):
+            found.append(ParentKind.role)
+        return tuple(found)
+
+    _HELD_SAVEPOINT = "dp_held_grants"
+
+    def _guarded_fetch(
+        self, cursor: Any, sql_text: str, params: tuple[Any, ...]
+    ) -> list[tuple[Any, ...]]:
+        """Run a query that may reference an ``svv_*`` view the cluster lacks.
+
+        Returns ``[]`` when the view is missing, rolling back to a savepoint so
+        the failure cannot abort the caller's transaction. ``_rbac_role_exists``
+        below hand-rolls this same pattern; it is left alone deliberately —
+        its fakes queue ``fetchone`` results, and converting it is a cleanup
+        that belongs on its own, not smuggled into a feature.
+        """
+        try:
+            cursor.execute(f"SAVEPOINT {self._HELD_SAVEPOINT}")
+        except Exception:  # noqa: BLE001  connection-level failure, bail
+            return []
+        try:
+            cursor.execute(sql_text, params)
+            rows = list(cursor.fetchall())
+        except Exception:  # noqa: BLE001  view missing / no permission
+            with contextlib.suppress(Exception):
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {self._HELD_SAVEPOINT}")
+            return []
+        with contextlib.suppress(Exception):
+            cursor.execute(f"RELEASE SAVEPOINT {self._HELD_SAVEPOINT}")
+        return rows
+
+    def held_grants(self, cursor: Any, roles: tuple[str, ...]) -> set[tuple[str, str]]:
+        """``(role, target)`` pairs already in effect across all three edges."""
+        if not roles:
+            return set()
+        names = list(roles)
+        held: set[tuple[str, str]] = set()
+        # pg_group exists on every cluster, so this one needs no guard.
+        cursor.execute(_HELD_GROUP_MEMBERS_REDSHIFT, (names,))
+        held.update((group, user) for group, user in cursor.fetchall())
+        for sql_text in (_HELD_ROLE_TO_USER_REDSHIFT, _HELD_ROLE_TO_ROLE_REDSHIFT):
+            held.update(
+                (role, target)
+                for role, target in self._guarded_fetch(cursor, sql_text, (names,))
+            )
+        return held
 
     def _rbac_role_exists(self, cursor: Any, parent: str) -> bool:
         """Probe svv_roles for an RBAC role, guarded so a missing view on a
