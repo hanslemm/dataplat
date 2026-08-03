@@ -160,8 +160,14 @@ def test_redshift_membership_role_member_uses_to_role() -> None:
 class _ScriptedCursor:
     """Fake cursor that returns queued results and swallows SAVEPOINT/ROLLBACK.
 
-    ``script`` maps a substring of the SQL to the ``fetchone`` result for the
-    next matching execute. Transaction-control statements are no-ops.
+    ``script`` maps a substring of the SQL to the row the next matching execute
+    returns. Transaction-control statements are no-ops.
+
+    Both fetch methods are served from that one queued row, because the dialect
+    reads some probes with ``fetchone`` and others — the ones that go through
+    :func:`~dataplat.services.db._savepoint.guarded_fetch` — with ``fetchall``.
+    A fake that answered only one of them would decide which production code path
+    was testable.
     """
 
     def __init__(self, script: dict[str, tuple | None]) -> None:
@@ -182,6 +188,9 @@ class _ScriptedCursor:
 
     def fetchone(self):
         return self._next
+
+    def fetchall(self) -> list[tuple]:
+        return [self._next] if self._next is not None else []
 
 
 def test_redshift_role_exists_checks_user_then_group() -> None:
