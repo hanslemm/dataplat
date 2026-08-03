@@ -1563,3 +1563,40 @@ def test_granting_to_public_is_refused_before_postgres_rejects_it(
     with pytest.raises(psycopg.errors.UndefinedObject):
         pg_cursor.execute(sql.SQL("GRANT {r} TO PUBLIC").format(r=sql.Identifier(role)))
     pg_cursor.execute("ROLLBACK TO SAVEPOINT before_public")
+
+
+@pytest.mark.integration
+def test_list_roles_parses_with_the_redshift_string_setting(pg_dsn: str) -> None:
+    """``_LIST_ROLES_SQL`` must not depend on ``standard_conforming_strings``.
+
+    It carried ``NOT LIKE 'pg\\_%' ESCAPE '\\'`` — correct on a default PostgreSQL
+    server and a syntax error on one where the setting is off, which is every
+    Redshift cluster and any PostgreSQL carrying the legacy value. Only Postgres
+    reaches this query, so it was never a Redshift bug; it was `dp db role list`
+    failing outright on a server nobody thought to try.
+
+    Found by the ``scs: off`` CI leg on its first run. This test is the targeted
+    twin of that leg: the leg catches the class across the whole tier, and this
+    names the one statement and the reason.
+
+    Proven before the fix::
+
+        ERROR:  unterminated quoted string at or near "'\\'"
+        LINE 12: WHERE r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
+    """
+    import psycopg
+
+    # options= applies before the first statement is parsed; a SET in the same
+    # batch is too late, because the whole batch is parsed first.
+    with (
+        psycopg.connect(pg_dsn, options="-c standard_conforming_strings=off") as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SHOW standard_conforming_strings")
+        row = cursor.fetchone()
+        assert row is not None and row[0] == "off", "precondition: setting is off"
+
+        # The statement parses, and still hides what it is supposed to hide.
+        roles = list_roles(cursor)
+        assert roles, "expected at least one role on any cluster"
+        assert not any(r.name.startswith("pg_") for r in roles)

@@ -419,10 +419,11 @@ def fetch_live_model_relations(
     ``invocation_command``, where ``_`` and ``%`` are ordinary characters in a
     dbt command line (``--select tag:hourly_refresh``).
 
-    Dialect note: ``ESCAPE '\\'`` reaches Redshift from here. It is already in
-    production on that path — ``top_tables._build_schema_where`` sends it to
-    both engines, and ``fetch_deprecated_objects`` above sends it on its
-    ``is_redshift`` branch — so this is the same construct, not a new one.
+    Dialect note: the escape character is ``#``, not a backslash, and reaches
+    Redshift from here. ``top_tables._build_schema_where`` and
+    ``fetch_deprecated_objects`` above send the same construct, so this is not a
+    new one. It used to be ``ESCAPE '\\'`` on all three, which never parsed on
+    Redshift at all — see :mod:`dataplat.services.db._like`.
     """
     invocation_filter = ""
     params: list[Any] = []

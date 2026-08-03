@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`dp db role list` failed outright on a PostgreSQL server with
+  `standard_conforming_strings` off.** `_LIST_ROLES_SQL` hid system roles with
+  `NOT LIKE 'pg\_%' ESCAPE '\'`, and with that setting off the backslash escapes
+  its own closing quote, so the statement raised `unterminated quoted string`
+  before returning a row. Correct on a default server, which is why it survived —
+  PostgreSQL has defaulted the setting to `on` since 9.1. Now `#`, matching the
+  rest of the tree.
+
+  Only PostgreSQL reached that query, so this was never a Redshift bug. It is the
+  third instance of the same class, after the `top-tables`/`dbt-orphans` escape and
+  the `schema drop --like` over-match.
+
+### Changed
+
+- **CI runs the whole PostgreSQL integration tier twice**, once with
+  `standard_conforming_strings` on and once off — the setting every Redshift
+  cluster runs with, and the one documented Redshift behaviour reproducible on a
+  server CI can actually have.
+
+  It is not a Redshift emulation and is documented not to be read as one: Redshift
+  also has an 8.0.2 leader node, no `aclexplode()` and different catalogs, none of
+  which a setting reproduces. What the leg proves is narrower — that no SQL a
+  PostgreSQL target runs depends on that setting — and it is a standing guard on
+  the one bug class that has escaped this project three times now. It found the
+  `role list` failure above on its first run.
+
+  Two Postgres-only regexes moved from `'\s+'` to `'[[:space:]]+'` in the process:
+  no backslash at all, so they behave identically whatever the setting is. The
+  Redshift-only regex in `build_long_queries_query` keeps its doubled backslash,
+  which is correct for that server, and now carries a comment saying why it differs
+  and what the wrong backslash count would cost — measured on PostgreSQL 16,
+  `SELECT * FROM users` renders as `SELECT * FROM u er`, silently corrupting the
+  SQL an operator reads to decide what to kill.
+
 ## 0.5.0
 
 ### Added
