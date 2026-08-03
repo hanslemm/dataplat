@@ -173,6 +173,36 @@ sections the engine has no concept of, with a reason each. Either way the reason
 is written once, next to the fact, and a refusal never says "not implemented"
 about something the engine simply is not.
 
+### The `scs` leg: one Redshift setting, on a server CI can have
+
+The `integration` job runs its whole tier twice, once with
+`standard_conforming_strings` on and once off. That single setting is the one
+documented Redshift behaviour reproducible on PostgreSQL, and it matters out of
+proportion to its size: with it off, a backslash inside a string literal escapes
+what follows it, so `ESCAPE '\'` leaves the literal unterminated and the statement
+never parses. That is what shipped `dp db top-tables` and `dp db dbt-orphans`
+broken on every Redshift target from 0.2.1 through 0.4.0 — five releases, with
+every test passing against a server whose default hid it.
+
+**Read the leg for what it is.** It is not a Redshift emulation and must not be
+cited as one: Redshift also has an 8.0.2 leader node, no `aclexplode()`, and
+different catalogs, none of which a setting reproduces. What the leg proves is
+narrower — *no SQL a PostgreSQL target runs depends on that setting being on* — and
+it raises nothing to evidence class 0 for Redshift.
+
+What it does buy is a standing guard on the one bug class that has actually
+escaped this project twice. It earned itself on its first run, failing
+`role_admin._LIST_ROLES_SQL`: the same `ESCAPE '\'`, in a Postgres-only query,
+harmless on a default server and fatal on one carrying the legacy setting.
+
+Practically: **write SQL that needs no backslash.** `#` as the `LIKE` escape (see
+`services/db/_like.py`) and `[[:space:]]` rather than `\s`. Both behave identically
+whatever the setting is, on both engines, which sidesteps the class instead of
+getting the escaping right twice. One deliberate exception is documented at
+`long_queries.build_long_queries_query`, which is Redshift-only and doubles its
+backslash *because* that server has the setting off; unifying it needs a real
+cluster, so it waits for one.
+
 ### DuckDB: the rules apply, and the excuse does not
 
 The evidence classes below apply to DuckDB unchanged in principle — same

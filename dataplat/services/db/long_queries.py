@@ -124,6 +124,25 @@ def build_long_queries_query(
     else:
         status_expr = "'unknown'"
 
+    # The backslash is doubled, and that is correct *here* and nowhere else in
+    # this module. This builder targets Redshift, which runs with
+    # `standard_conforming_strings` off, so `'\\s+'` reduces to the regex `\s+`
+    # the server needs. The Postgres queries below spell the same idea
+    # `'[[:space:]]+'` — no backslash at all, so they behave identically whatever
+    # that setting is.
+    #
+    # Two spellings of one regex is a wart, not a design. `[[:space:]]` is
+    # documented for Redshift too and would unify them, but this path works today
+    # and swapping it on documentation alone is the unverified dialect change
+    # CONTRIBUTING's evidence classes exist to prevent. It waits for a
+    # conformance run against a real cluster.
+    #
+    # What the difference costs if it is ever gotten wrong: with the wrong
+    # backslash count the regex becomes `s+`, which does not collapse whitespace
+    # and silently replaces every run of the letter `s` with a space. Measured on
+    # PostgreSQL 16 — `SELECT * FROM users` renders as `SELECT * FROM u er`. The
+    # operator reading `dp db long-queries` to decide what to kill sees corrupted
+    # SQL, and nothing anywhere reports an error.
     text_expr = (
         f"LEFT(REGEXP_REPLACE(CAST({_quote(text_col)} AS VARCHAR), '\\\\s+', ' '), 180)"
         if text_col
@@ -243,7 +262,7 @@ _PG_ACTIVITY_SQL = """
         CAST(
             EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) AS INT
         ) AS elapsed_s,
-        LEFT(REGEXP_REPLACE(query, '\\s+', ' ', 'g'), 180) AS query_text,
+        LEFT(REGEXP_REPLACE(query, '[[:space:]]+', ' ', 'g'), 180) AS query_text,
         CAST(pid AS VARCHAR) AS session_id
     FROM pg_stat_activity
     WHERE state IS NOT NULL
@@ -343,7 +362,7 @@ def fetch_query_history_postgres(
             ({_quote(mean_col)} / 1000.0) AS mean_s,
             ({_quote(max_col)} / 1000.0) AS max_s,
             LEFT(
-                REGEXP_REPLACE({_quote(query_col)}, '\\s+', ' ', 'g'),
+                REGEXP_REPLACE({_quote(query_col)}, '[[:space:]]+', ' ', 'g'),
                 180
             ) AS query_text
         FROM pg_stat_statements

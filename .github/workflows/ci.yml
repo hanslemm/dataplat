@@ -88,6 +88,28 @@ jobs:
         # one-token edit here if catalog drift across majors ever earns the
         # minutes.
         postgres-version: ["16"]
+        # The second leg runs the identical suite against the identical server
+        # with `standard_conforming_strings` off -- the setting Redshift runs with,
+        # and one PostgreSQL has defaulted to `on` since 9.1.
+        #
+        # This is not a Redshift emulation, and should not be read as one. Redshift
+        # differs in ways no setting reproduces (an 8.0.2 leader node, no
+        # aclexplode, different catalogs), and the engine-specific SQL in this tree
+        # is already escaped for whichever engine executes it. What this leg proves
+        # is narrower and worth having on its own: that no SQL a PostgreSQL target
+        # runs depends on that setting being on.
+        #
+        # The absence of that invariant shipped a real bug. `ESCAPE '\'` is a
+        # syntax error when the setting is off, so `dp db top-tables` and
+        # `dp db dbt-orphans` failed on every Redshift target from 0.2.1 through
+        # 0.4.0 -- five releases, green badge throughout, because every test ran
+        # against a server whose default hid it. One extra job is the cheapest
+        # standing guard against the next one, and it needs no new tests.
+        #
+        # It earned itself on its first run, failing `role_admin._LIST_ROLES_SQL`
+        # -- the same `ESCAPE '\'` in a Postgres-only query, harmless on a default
+        # server and fatal on one carrying the legacy setting.
+        scs: ["on", "off"]
     env:
       # The dev pin only -- see the job comment. The 3.12 floor is imported,
       # linted and type-checked by `checks` above.
@@ -101,6 +123,11 @@ jobs:
       # SQL this suite exists to validate. Truthy here means the harness raises
       # instead of skipping.
       DP_TEST_PG_REQUIRED: "1"
+      # libpq reads PGOPTIONS and forwards it at connection setup, so every
+      # connection the suite opens inherits it -- including the ones fixtures make
+      # directly, which a server-side ALTER DATABASE would also cover but only
+      # after both legs stopped sharing one container recipe.
+      PGOPTIONS: "-c standard_conforming_strings=${{ matrix.scs }}"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -181,6 +208,23 @@ jobs:
             --username postgres --dbname dataplat_test \
             --set ON_ERROR_STOP=1 \
             --command 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+
+      # Asserted, not trusted. A PGOPTIONS typo, or a libpq that ignored it, would
+      # turn the second leg into a silent duplicate of the first -- and this job
+      # would still go green, which is the failure mode the whole leg exists to
+      # prevent.
+      - name: Verify standard_conforming_strings is ${{ matrix.scs }}
+        env:
+          EXPECTED_SCS: ${{ matrix.scs }}
+        run: |
+          uv run python -c "
+          import os, psycopg
+          want = os.environ['EXPECTED_SCS']
+          with psycopg.connect(os.environ['DP_TEST_PG_DSN']) as conn:
+              got = conn.execute('SHOW standard_conforming_strings').fetchone()[0]
+          print(f'standard_conforming_strings = {got} (expected {want})')
+          assert got == want, f'PGOPTIONS did not take effect: {got} != {want}'
+          "
 
       - name: Pytest (integration)
         run: uv run pytest -m integration

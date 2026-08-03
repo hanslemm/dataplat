@@ -419,6 +419,14 @@ class RoleSummary:
 # pg_roles is shared across the cluster, so the result is identical from any
 # DB connection. Membership counts come from pg_auth_members; LEFT JOIN +
 # COUNT lets us return a row per role even when there are no edges.
+#
+# `#` rather than a backslash as the LIKE escape, matching the rest of the tree
+# (see _like.py for the mechanism). Only Postgres reaches this query --
+# RedshiftDialect.list_roles overrides it -- so the backslash form worked, but it
+# made the statement depend on `standard_conforming_strings` being on. A Postgres
+# server carrying the legacy setting raised `unterminated quoted string` and
+# `dp db role list` failed outright. Found by running the integration tier with
+# that setting forced, which is now a CI matrix leg.
 _LIST_ROLES_SQL = """
 SELECT r.rolname,
        r.rolcanlogin,
@@ -430,7 +438,7 @@ SELECT r.rolname,
        (SELECT COUNT(*) FROM pg_auth_members am WHERE am.roleid = r.oid)::int
          AS members_count
 FROM pg_roles r
-WHERE r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
+WHERE r.rolname NOT LIKE 'pg#_%' ESCAPE '#'
 ORDER BY r.rolname
 """
 
