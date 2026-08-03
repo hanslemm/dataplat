@@ -6,11 +6,11 @@ fetcher takes an open cursor; callers manage the connection lifecycle.
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from dataplat.services.db._savepoint import guarded_fetch
 from dataplat.services.db.connection import SqlEngine
 
 
@@ -630,24 +630,22 @@ class RedshiftProbeLimitError(Exception):
 # until a full ROLLBACK — which would also throw away the ref/attribute/
 # membership queries already issued earlier in describe_role.
 _REDSHIFT_RBAC_PROBE_SQL = "SELECT 1 FROM svv_relation_privileges LIMIT 0"
-_RBAC_SAVEPOINT = "dna_rbac_probe"
+_RBAC_SAVEPOINT = "dp_rbac_probe"
 
 
 def _redshift_rbac_available(cursor: Any) -> bool:
-    try:
-        cursor.execute(f"SAVEPOINT {_RBAC_SAVEPOINT}")
-    except Exception:  # noqa: BLE001  connection-level failure, just bail
-        return False
-    try:
-        cursor.execute(_REDSHIFT_RBAC_PROBE_SQL)
-        cursor.fetchall()
-    except Exception:  # noqa: BLE001  view missing / no permission / etc.
-        with contextlib.suppress(Exception):
-            cursor.execute(f"ROLLBACK TO SAVEPOINT {_RBAC_SAVEPOINT}")
-        return False
-    with contextlib.suppress(Exception):
-        cursor.execute(f"RELEASE SAVEPOINT {_RBAC_SAVEPOINT}")
-    return True
+    """Whether ``svv_relation_privileges`` can be read on this cluster.
+
+    This is the probe that :func:`~dataplat.services.db._savepoint.guarded_fetch`
+    returns ``None`` rather than ``[]`` for. ``LIMIT 0`` means a *successful*
+    probe returns no rows, so an empty result and an unavailable view are the two
+    outcomes that matter and they must not look alike. Anything that collapsed
+    them would report RBAC as absent on every cluster that has it.
+    """
+    return (
+        guarded_fetch(cursor, _REDSHIFT_RBAC_PROBE_SQL, savepoint=_RBAC_SAVEPOINT)
+        is not None
+    )
 
 
 # SVV views expose ACLs directly, so ``via`` is the real identity that received

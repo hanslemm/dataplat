@@ -341,7 +341,7 @@ class FakeCursorNoRBAC(FakeCursor):
 
 def test_redshift_rbac_probe_rolls_back_savepoint_on_failure() -> None:
     """A failed RBAC probe must ROLLBACK TO SAVEPOINT to keep the tx usable."""
-    from dataplat.services.db.role import _redshift_rbac_available
+    from dataplat.services.db.role import _RBAC_SAVEPOINT, _redshift_rbac_available
 
     cursor = FakeCursorNoRBAC([])
     assert _redshift_rbac_available(cursor) is False
@@ -349,21 +349,27 @@ def test_redshift_rbac_probe_rolls_back_savepoint_on_failure() -> None:
     # SAVEPOINT must be issued first, then ROLLBACK TO SAVEPOINT after the
     # (simulated) probe failure. Without this, psycopg leaves the connection
     # in "current transaction is aborted" state.
-    assert any("SAVEPOINT dna_rbac_probe" in q for q in issued)
-    assert any("ROLLBACK TO SAVEPOINT dna_rbac_probe" in q for q in issued)
+    # Named via the constant, not spelled out: the savepoint name has been
+    # renamed once already (it carried the upstream tool's prefix), and a test
+    # that hardcodes it fails for a reason unrelated to what it checks.
+    assert any(f"SAVEPOINT {_RBAC_SAVEPOINT}" in q for q in issued)
+    assert any(f"ROLLBACK TO SAVEPOINT {_RBAC_SAVEPOINT}" in q for q in issued)
     # The svv probe itself never reaches our FakeCursor.execute because it
     # raises before super().execute is called — that's by design.
     assert not any("svv_relation_privileges" in q for q in issued)
 
 
 def test_redshift_rbac_probe_releases_savepoint_on_success() -> None:
-    from dataplat.services.db.role import _redshift_rbac_available
+    from dataplat.services.db.role import (
+        _RBAC_SAVEPOINT,
+        _redshift_rbac_available,
+    )
 
     cursor = FakeCursor([[]])  # empty probe result — probe "succeeds"
     assert _redshift_rbac_available(cursor) is True
     issued = [q for q, _ in cursor.queries]
-    assert any("SAVEPOINT dna_rbac_probe" in q for q in issued)
-    assert any("RELEASE SAVEPOINT dna_rbac_probe" in q for q in issued)
+    assert any(f"SAVEPOINT {_RBAC_SAVEPOINT}" in q for q in issued)
+    assert any(f"RELEASE SAVEPOINT {_RBAC_SAVEPOINT}" in q for q in issued)
 
 
 def test_fetch_effective_privileges_redshift_rbac_uses_svv() -> None:

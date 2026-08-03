@@ -12,7 +12,6 @@ can import from it without a cycle.
 
 from __future__ import annotations
 
-import contextlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,6 +19,7 @@ from typing import Any
 
 from psycopg import sql
 
+from dataplat.services.db._savepoint import guarded_fetch
 from dataplat.services.db.connection import SqlEngine
 
 
@@ -323,6 +323,14 @@ class PostgresDialect(RoleDialect):
         )
 
 
+# Savepoint names for the guarded probes below. Distinct per probe so that a
+# server log reads unambiguously, and `dp`-prefixed because that is what this tool
+# is called — these were `dna_*` for a while, inherited from the CLI this code was
+# ported from, which is a confusing thing to find in your PostgreSQL log when you
+# have never installed anything called dna.
+_HELD_SAVEPOINT = "dp_held_grants"
+_RBAC_ROLE_SAVEPOINT = "dp_rbac_role_probe"
+
 # Three ways a grant is already in effect on Redshift, because it has three
 # kinds of grantee. The group edge reads pg_group, which exists on every
 # cluster; the two RBAC edges read svv_* views that a pre-RBAC cluster does not
@@ -497,34 +505,6 @@ class RedshiftDialect(RoleDialect):
             found.append(ParentKind.role)
         return tuple(found)
 
-    _HELD_SAVEPOINT = "dp_held_grants"
-
-    def _guarded_fetch(
-        self, cursor: Any, sql_text: str, params: tuple[Any, ...]
-    ) -> list[tuple[Any, ...]]:
-        """Run a query that may reference an ``svv_*`` view the cluster lacks.
-
-        Returns ``[]`` when the view is missing, rolling back to a savepoint so
-        the failure cannot abort the caller's transaction. ``_rbac_role_exists``
-        below hand-rolls this same pattern; it is left alone deliberately —
-        its fakes queue ``fetchone`` results, and converting it is a cleanup
-        that belongs on its own, not smuggled into a feature.
-        """
-        try:
-            cursor.execute(f"SAVEPOINT {self._HELD_SAVEPOINT}")
-        except Exception:  # noqa: BLE001  connection-level failure, bail
-            return []
-        try:
-            cursor.execute(sql_text, params)
-            rows = list(cursor.fetchall())
-        except Exception:  # noqa: BLE001  view missing / no permission
-            with contextlib.suppress(Exception):
-                cursor.execute(f"ROLLBACK TO SAVEPOINT {self._HELD_SAVEPOINT}")
-            return []
-        with contextlib.suppress(Exception):
-            cursor.execute(f"RELEASE SAVEPOINT {self._HELD_SAVEPOINT}")
-        return rows
-
     def held_grants(self, cursor: Any, roles: tuple[str, ...]) -> set[tuple[str, str]]:
         """``(role, target)`` pairs already in effect across all three edges."""
         if not roles:
@@ -535,30 +515,31 @@ class RedshiftDialect(RoleDialect):
         cursor.execute(_HELD_GROUP_MEMBERS_REDSHIFT, (names,))
         held.update((group, user) for group, user in cursor.fetchall())
         for sql_text in (_HELD_ROLE_TO_USER_REDSHIFT, _HELD_ROLE_TO_ROLE_REDSHIFT):
-            held.update(
-                (role, target)
-                for role, target in self._guarded_fetch(cursor, sql_text, (names,))
-            )
+            # `or []` collapses guarded_fetch's None into an empty result on
+            # purpose. Held-detection is cosmetic — a pair it misses costs one
+            # redundant, idempotent GRANT — so "the view is not there" and "the
+            # view says nothing" lead to the same plan here. The callers that
+            # must tell those apart keep the None.
+            rows = guarded_fetch(cursor, sql_text, (names,), savepoint=_HELD_SAVEPOINT)
+            held.update((role, target) for role, target in rows or [])
         return held
 
     def _rbac_role_exists(self, cursor: Any, parent: str) -> bool:
-        """Probe svv_roles for an RBAC role, guarded so a missing view on a
-        pre-RBAC cluster does not poison the outer transaction."""
-        probe = "dna_parent_probe"
-        try:
-            cursor.execute(f"SAVEPOINT {probe}")
-        except Exception:  # noqa: BLE001  connection-level failure, bail
-            return False
-        try:
-            cursor.execute("SELECT 1 FROM svv_roles WHERE role_name = %s", (parent,))
-            found = cursor.fetchone() is not None
-        except Exception:  # noqa: BLE001  view missing / no permission
-            with contextlib.suppress(Exception):
-                cursor.execute(f"ROLLBACK TO SAVEPOINT {probe}")
-            return False
-        with contextlib.suppress(Exception):
-            cursor.execute(f"RELEASE SAVEPOINT {probe}")
-        return found
+        """Probe svv_roles for an RBAC role.
+
+        Guarded, so a missing view on a pre-RBAC cluster does not poison the
+        outer transaction. Both "no such view" (``None``) and "view present, no
+        such role" (``[]``) mean the role does not exist as far as this answers,
+        so the two collapse into ``False`` — and a cluster without RBAC has no
+        RBAC roles, which makes that the true answer rather than a fallback.
+        """
+        rows = guarded_fetch(
+            cursor,
+            "SELECT 1 FROM svv_roles WHERE role_name = %s",
+            (parent,),
+            savepoint=_RBAC_ROLE_SAVEPOINT,
+        )
+        return bool(rows)
 
     def list_roles(self, cursor: Any) -> list[Any]:
         from dataplat.services.db.role_admin import RoleSummary

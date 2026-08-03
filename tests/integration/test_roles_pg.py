@@ -34,6 +34,7 @@ from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role import (
     EffectivePrivilege,
     RoleNotFoundError,
+    _redshift_rbac_available,
     build_closure,
     describe_role,
     fetch_attributes,
@@ -57,7 +58,12 @@ from dataplat.services.db.role_admin import (
     resolve_grantee_kinds,
     role_exists,
 )
-from dataplat.services.db.role_dialects import ParentKind, PostgresDialect, SqlOp
+from dataplat.services.db.role_dialects import (
+    ParentKind,
+    PostgresDialect,
+    RedshiftDialect,
+    SqlOp,
+)
 from tests.integration.conftest import TempRoleFactory, _slug
 
 if TYPE_CHECKING:
@@ -1600,3 +1606,77 @@ def test_list_roles_parses_with_the_redshift_string_setting(pg_dsn: str) -> None
         roles = list_roles(cursor)
         assert roles, "expected at least one role on any cluster"
         assert not any(r.name.startswith("pg_") for r in roles)
+
+
+# ---------------------------------------------------------------------------
+# The guarded probes, against a server that genuinely lacks the views
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "probe"),
+    [
+        (
+            "_redshift_rbac_available",
+            lambda cursor: _redshift_rbac_available(cursor),
+        ),
+        (
+            "_rbac_role_exists",
+            lambda cursor: RedshiftDialect()._rbac_role_exists(cursor, "nobody"),
+        ),
+        (
+            "held_grants",
+            lambda cursor: RedshiftDialect().held_grants(cursor, ("nobody",)),
+        ),
+    ],
+)
+def test_a_guarded_probe_leaves_the_transaction_usable(
+    pg_cursor: Cursor[TupleRow], label: str, probe
+) -> None:
+    """Every ``guarded_fetch`` caller, run where its view does not exist.
+
+    PostgreSQL has no ``svv_*`` views at all, which makes it a free stand-in for
+    the pre-RBAC Redshift cluster these probes exist for: the query fails for real
+    and the savepoint has to absorb it. Without one, the server leaves the
+    connection in *current transaction is aborted* and every later statement fails
+    until a full rollback — which would discard the work ``describe_role`` and
+    ``role grant`` had already done in the same transaction.
+
+    The unit tests for these use fakes that swallow SAVEPOINT and ROLLBACK, so
+    they can assert the statements were *issued* and can never show that the
+    transaction survived. Only a server can, which is why this is here and not
+    beside them.
+    """
+    from psycopg.pq import TransactionStatus
+
+    pg_cursor.execute("CREATE TEMP TABLE dp_probe_canary(i int)")
+    pg_cursor.execute("INSERT INTO dp_probe_canary VALUES (1)")
+
+    probe(pg_cursor)
+
+    assert pg_cursor.connection.info.transaction_status is TransactionStatus.INTRANS, (
+        f"{label} left the transaction unusable"
+    )
+    # Stronger than the status flag: the connection still reads and still writes.
+    pg_cursor.execute("SELECT count(*) FROM dp_probe_canary")
+    row = pg_cursor.fetchone()
+    assert row is not None and row[0] == 1
+    pg_cursor.execute("INSERT INTO dp_probe_canary VALUES (2)")
+
+
+def test_the_guarded_probes_report_absence_rather_than_raising(
+    pg_cursor: Cursor[TupleRow],
+) -> None:
+    """A missing view is an answer, not an error, for all three callers.
+
+    They disagree about what the answer *means*, and that is the point of
+    ``guarded_fetch`` returning ``None`` rather than ``[]``:
+    ``_redshift_rbac_available`` has to tell "view absent" from "view present and
+    empty", because its probe is ``LIMIT 0`` and succeeds with no rows. The other
+    two collapse both into "nothing", because for them the two mean the same.
+    """
+    dialect = RedshiftDialect()
+
+    assert _redshift_rbac_available(pg_cursor) is False
+    assert dialect._rbac_role_exists(pg_cursor, "nobody") is False
+    assert dialect.held_grants(pg_cursor, ("nobody",)) == set()

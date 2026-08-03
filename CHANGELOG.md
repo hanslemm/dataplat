@@ -18,6 +18,31 @@
 
 ### Changed
 
+- **One savepoint guard instead of four.** Probing for a catalog that may not
+  exist — Redshift's `svv_*` views are version-dependent and can be
+  permission-denied — needs a savepoint, because a failed probe inside a
+  transaction aborts the whole transaction and would discard work the caller had
+  already done. Three call sites hand-rolled that pattern next to the shared
+  `guarded_fetch` that now does it, and four copies of a subtle transaction-safety
+  routine is how one of them eventually loses its rollback.
+
+  The `None` vs `[]` distinction in `guarded_fetch`'s return is what made the
+  consolidation possible rather than a lossy merge: `_redshift_rbac_available`
+  must tell "view absent" from "view present and empty", because its probe is
+  `LIMIT 0` and succeeds with no rows, while the other two callers legitimately
+  collapse both into "nothing".
+
+  Also renames two savepoints that carried the upstream tool's `dna_` prefix —
+  `dp db` users were finding `dna_rbac_probe` in their PostgreSQL logs — and the
+  tests that asserted the old name now reference the constant instead.
+
+  The property all of this exists for is now covered against a real server for the
+  first time. The unit tests use fakes that swallow SAVEPOINT and ROLLBACK, so they
+  can show the statements were issued and never that the transaction survived;
+  PostgreSQL has no `svv_*` views at all, which makes it a free stand-in for the
+  pre-RBAC cluster these probes are for. Verified by mutation: removing the
+  savepoint fails all four new tests.
+
 - **CI runs the whole PostgreSQL integration tier twice**, once with
   `standard_conforming_strings` on and once off — the setting every Redshift
   cluster runs with, and the one documented Redshift behaviour reproducible on a
