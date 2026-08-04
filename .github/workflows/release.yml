@@ -20,10 +20,18 @@ jobs:
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned exactly, not `@v9`: setup-uv dropped floating major tags after
+        # v7, so `@v9` does not resolve at all and the workflow fails to start.
+        #
+        # prune-cache is set because v9 flipped its default from true to false.
+        # Left implicit, the upgrade would silently stop pruning and grow the
+        # Actions cache for no benefit — this keeps the behaviour v5 had.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          prune-cache: true
 
       - name: Setup Python
         run: uv python install ${{ matrix.python-version }}
@@ -110,7 +118,7 @@ jobs:
       DP_TEST_PG_REQUIRED: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # `docker run` rather than a `services:` block: a service container runs
       # the image's default command with no way to append arguments, so
@@ -131,7 +139,15 @@ jobs:
             -c shared_preload_libraries=pg_stat_statements
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned exactly, not `@v9`: setup-uv dropped floating major tags after
+        # v7, so `@v9` does not resolve at all and the workflow fails to start.
+        #
+        # prune-cache is set because v9 flipped its default from true to false.
+        # Left implicit, the upgrade would silently stop pruning and grow the
+        # Actions cache for no benefit — this keeps the behaviour v5 had.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          prune-cache: true
 
       - name: Setup Python
         run: uv python install 3.13
@@ -191,16 +207,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned exactly, not `@v9`: setup-uv dropped floating major tags after
+        # v7, so `@v9` does not resolve at all and the workflow fails to start.
+        #
+        # prune-cache is set because v9 flipped its default from true to false.
+        # Left implicit, the upgrade would silently stop pruning and grow the
+        # Actions cache for no benefit — this keeps the behaviour v5 had.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          prune-cache: true
 
       - name: Build sdist and wheel
         run: uv build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -212,8 +236,17 @@ jobs:
     permissions:
       id-token: write  # PyPI Trusted Publishing (OIDC)
     steps:
+      # v8 defaults `digest-mismatch` to `error` where v4 only logged a warning.
+      # That is a behaviour change on the one path in this repo that cannot be
+      # undone: a corrupted artifact now fails the job instead of being published
+      # to PyPI, where a version can be yanked but never replaced. Left at the
+      # default deliberately — if a release ever fails here, the artifact is wrong
+      # and the failure is the feature.
+      #
+      # v5's breaking change does not apply: it altered the output path for
+      # single-artifact downloads *by ID*, and this downloads by name.
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -228,13 +261,13 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
