@@ -40,6 +40,40 @@ docker rm -f -v dp-pg-test                       # -v, or the volume dangles
 skip. CI sets it; without it a broken database would make the whole suite skip
 and still report success.
 
+### Coverage
+
+With a server running, one command gives the whole figure:
+
+```bash
+DP_TEST_PG_REQUIRED=1 uv run pytest --cov --cov-report=term-missing
+```
+
+CI cannot do it that simply, because no single job there runs the whole suite:
+`checks` deselects the tier that needs a server and `integration` deselects
+everything else. Each uploads its own data file and a third job combines them —
+the unit leg alone reads 87%, the integration leg 30%, and only the union means
+anything. If you are reproducing what CI reports, combine the same way:
+
+```bash
+uv run pytest -m "not integration" --cov --cov-report= --cov-fail-under=0
+mv .coverage /tmp/cov-unit          # outside the working directory: pytest-cov
+                                    # erases .coverage* when it starts
+DP_TEST_PG_REQUIRED=1 uv run pytest -m integration --cov --cov-report= --cov-fail-under=0
+mv .coverage .coverage.integration
+cp /tmp/cov-unit .coverage.unit
+uv run coverage combine && uv run coverage report
+```
+
+**What the number is for, and what it is not.** `fail_under` is a floor that
+catches a test file which stopped running, or a sizeable module that arrived
+without tests. It is not evidence of correctness and should not be treated as a
+goal. Coverage records which lines *executed*; the `ESCAPE '\'` that broke
+`dp db top-tables` on every Redshift target for five releases was covered the
+whole time it was broken — executed by passing tests, against a PostgreSQL server
+whose default setting hid it. Every defect found in this project so far came from
+running SQL against a real engine. Raise the floor when the figure rises for a
+reason; do not chase it.
+
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Testing against DuckDB

@@ -88,6 +88,7 @@ package = true
 dev = [
     "mypy>=1.18.2",
     "pytest>=9.0.3",
+    "pytest-cov>=7",
     "ruff>=0.14.1",
 ]
 
@@ -106,6 +107,45 @@ markers = [
     # apart is what lets a production cluster be used for the first tier only.
     "redshift: requires a live Redshift cluster; read-only",
     "redshift_ddl: requires a DISPOSABLE Redshift cluster; mutates it",
+]
+
+[tool.coverage.run]
+source = ["dataplat"]
+branch = true
+# Written per-job and combined, because no single CI job runs the whole suite:
+# `checks` runs the unit tests on two interpreters, `integration` runs the tier
+# that needs a server. A number from either alone would be wrong in a way that
+# looks plausible.
+parallel = true
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# A floor to catch a regression, not a target to aim at. Set just under the
+# current combined figure (87%) so that deleting a test file or landing a
+# sizeable untested module fails the build, while ordinary work does not trip it.
+#
+# This counts branches as well as lines, so it reads lower than a line-only
+# number for the same suite would — 87 here against 89 without `branch = true`.
+# Raise the floor when the figure rises for a reason; do not raise it to set a
+# goal.
+#
+# Read the number for what it is. Coverage records which lines *executed*, and
+# says nothing about whether what they did was right: the `ESCAPE '\'` that broke
+# `dp db top-tables` on every Redshift target for five releases was covered the
+# whole time — executed by passing tests, against a PostgreSQL server whose
+# default setting hid the bug. Every defect found in this repo so far came from
+# running SQL against a real engine, not from raising this figure.
+fail_under = 86
+exclude_also = [
+    # Abstract-method bodies. `def create_login(...) -> SqlOp: ...` is a
+    # signature, and counting it as an unexecuted statement would report the
+    # dialect base classes as half-tested when there is nothing there to run.
+    "^\\s*\\.\\.\\.$",
+    # Import-time only, never executed.
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
 ]
 
 [tool.ruff]

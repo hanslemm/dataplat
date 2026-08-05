@@ -12,10 +12,12 @@ from __future__ import annotations
 import pytest
 
 from dataplat.services.db.connection import SqlEngine
+from dataplat.services.db.role_dialects import ParentKind
 from dataplat.services.db.schema_dialects import (
     DuckDbSchemaDialect,
     PostgresSchemaDialect,
     RedshiftSchemaDialect,
+    _held_identity_pin,
     schema_dialect_for,
 )
 
@@ -270,3 +272,95 @@ def test_postgres_never_asks_about_quotas() -> None:
         (row,) = dialect.list_schemas(cursor)
         assert row.quota_mb is None
         assert not any("quota" in q for q in cursor.executed)
+
+
+# ---------------------------------------------------------------------------
+# _held_identity_pin — the predicate that keeps two principals apart
+# ---------------------------------------------------------------------------
+
+
+def test_the_pin_requires_name_and_type_together() -> None:
+    """Name alone is the bug this exists to close.
+
+    Redshift lets a group and an RBAC role share one name, and
+    svv_schema_privileges matches on identity name only — so an unpinned
+    predicate merges both principals' privileges into one answer and reports
+    access nobody has.
+    """
+    clause, params = _held_identity_pin(["finance"], {"finance": ParentKind.group})
+
+    assert "identity_name = %s AND identity_type = %s" in clause
+    assert params == ("finance", "group")
+
+
+@pytest.mark.parametrize(
+    ("kind", "spelling"),
+    [
+        (ParentKind.user, "user"),
+        (ParentKind.group, "group"),
+        (ParentKind.role, "role"),
+    ],
+)
+def test_each_kind_gets_its_catalog_spelling(kind: ParentKind, spelling: str) -> None:
+    """The values are svv_schema_privileges' own, not ParentKind's names."""
+    _, params = _held_identity_pin(["x"], {"x": kind})
+
+    assert params == ("x", spelling)
+
+
+def test_public_gets_its_own_arm_and_no_parameters() -> None:
+    """Its rows carry identity_type = 'public', so a name+type pair would drop it."""
+    clause, params = _held_identity_pin(["PUBLIC"], {"PUBLIC": ParentKind.role})
+
+    assert "identity_type = 'public'" in clause
+    # Not bound as a name: PUBLIC is a keyword, and binding it would look for a
+    # principal actually called PUBLIC.
+    assert params == ()
+
+
+def test_the_public_arm_is_always_present() -> None:
+    """Even when nobody asked for PUBLIC — a grant to PUBLIC is held by everyone.
+
+    Leaving it out would report a schema as un-granted to a named user who in fact
+    reaches it through PUBLIC.
+    """
+    clause, _ = _held_identity_pin(["alice"], {"alice": ParentKind.user})
+
+    assert "identity_type = 'public'" in clause
+
+
+def test_an_unknown_kind_matches_nothing_rather_than_falling_back() -> None:
+    """Under-detecting costs one redundant idempotent GRANT. Matching on name
+    alone is the incident. So a grantee whose kind was never resolved is simply
+    left out of the predicate."""
+    clause, params = _held_identity_pin(["ghost"], {})
+
+    assert clause == "identity_type = 'public'"
+    assert params == ()
+    assert "identity_name" not in clause
+
+
+def test_absent_is_treated_as_unknown() -> None:
+    clause, params = _held_identity_pin(["ghost"], {"ghost": ParentKind.absent})
+
+    assert "identity_name" not in clause
+    assert params == ()
+
+
+def test_several_grantees_each_get_their_own_pinned_arm() -> None:
+    clause, params = _held_identity_pin(
+        ["alice", "finance", "PUBLIC", "ghost"],
+        {"alice": ParentKind.user, "finance": ParentKind.role},
+    )
+
+    # Two pinned arms plus the public one; ghost contributes nothing.
+    assert clause.count("identity_name = %s") == 2
+    assert params == ("alice", "user", "finance", "role")
+
+
+def test_no_kinds_at_all_degrades_to_the_public_arm() -> None:
+    """`kinds=None` is a legal call, and must not produce a name-only match."""
+    clause, params = _held_identity_pin(["alice"], None)
+
+    assert clause == "identity_type = 'public'"
+    assert params == ()

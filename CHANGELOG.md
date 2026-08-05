@@ -18,6 +18,35 @@
 
 ### Changed
 
+- **CI measures coverage**, combined across jobs, with a floor that fails the
+  build on a regression. There was no measurement at all before.
+
+  It has to be combined because no single job runs the whole suite: `checks`
+  deselects the tier that needs a server and `integration` deselects everything
+  else. Either figure alone is wrong in a way that looks plausible — the unit leg
+  reads 87%, the integration leg 30%, and the union is what the suite exercises.
+  The number is rendered into the run summary so a reviewer sees it without
+  opening a log.
+
+  `fail_under` is a floor for catching a test file that stopped running or a
+  sizeable module that arrived without tests, not a target. `pyproject.toml` and
+  `CONTRIBUTING.md` both say so at the point of use, with the reason: the
+  `ESCAPE '\'` that broke `dp db top-tables` on every Redshift target for five
+  releases was covered the entire time it was broken.
+
+  Measuring it immediately found two gaps in code shipped days earlier, both now
+  closed:
+
+  - **`dp db schema alter`'s entire happy path was untested** — every existing
+    test for it asserted a refusal, so all of them returned before the plan was
+    built. Build, print, confirm and execute had never run outside a manual
+    check. 66% → 100%.
+  - **`_held_identity_pin` had no tests at all.** It is the predicate that keeps a
+    Redshift group's privileges from being merged with a same-named role's, which
+    is a security-relevant rule and pure logic needing no server. Now covered
+    arm by arm, including that `PUBLIC` is never bound as a name and that an
+    unresolved kind matches nothing rather than falling back to a name-only match.
+
 - **One savepoint guard instead of four.** Probing for a catalog that may not
   exist — Redshift's `svv_*` views are version-dependent and can be
   permission-denied — needs a savepoint, because a failed probe inside a
