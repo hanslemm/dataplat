@@ -601,3 +601,117 @@ def test_duckdb_allows_what_it_can_do(monkeypatch, tmp_path, argv: list[str]) ->
     result = CliRunner().invoke(db_app, [*argv, "-t", "ddb"])
 
     assert result.exit_code == ExitCode.SUCCESS, result.output
+
+
+# ---------------------------------------------------------------------------
+# alter: the happy path, which had no coverage at all
+# ---------------------------------------------------------------------------
+
+
+def _alter(monkeypatch, cursor: _Cursor, **overrides):
+    _patch(monkeypatch, schema_alter, cursor)
+    kwargs = {
+        "names": ["dev_x"],
+        "owner": None,
+        "quota": None,
+        "rename_to": None,
+        "dry_run": False,
+        "yes": True,
+        **_CONN,
+    }
+    kwargs.update(overrides)
+    return schema_alter.alter_command(**kwargs)
+
+
+def test_alter_executes_an_owner_change(monkeypatch, capsys) -> None:
+    """The plainest use of the command, and it was reached only by hand before.
+
+    Every existing alter test asserted a refusal, so all of them returned before
+    the plan was built. Coverage put the whole build/print/execute tail at 0%.
+    """
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, owner="svc_new")
+
+    assert cursor.statements == ['ALTER SCHEMA "dev_x" OWNER TO "svc_new"']
+    out = capsys.readouterr().out
+    assert "1 change(s)" in out
+    assert "Altered:" in out
+
+
+def test_alter_renames(monkeypatch, capsys) -> None:
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, rename_to="dev_y")
+
+    assert cursor.statements == ['ALTER SCHEMA "dev_x" RENAME TO "dev_y"']
+
+
+def test_alter_applies_changes_in_a_stable_order(monkeypatch) -> None:
+    """Owner before rename, so the second statement names the schema that exists."""
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, owner="svc_new", rename_to="dev_y")
+
+    assert cursor.statements == [
+        'ALTER SCHEMA "dev_x" OWNER TO "svc_new"',
+        'ALTER SCHEMA "dev_x" RENAME TO "dev_y"',
+    ]
+
+
+def test_alter_covers_every_named_schema(monkeypatch) -> None:
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, names=["dev_x,dev_y"], owner="svc")
+
+    assert cursor.statements == [
+        'ALTER SCHEMA "dev_x" OWNER TO "svc"',
+        'ALTER SCHEMA "dev_y" OWNER TO "svc"',
+    ]
+
+
+def test_alter_dry_run_shows_the_sql_and_executes_nothing(monkeypatch, capsys) -> None:
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, owner="svc_new", dry_run=True)
+
+    assert cursor.statements == []
+    out = capsys.readouterr().out
+    assert 'ALTER SCHEMA "dev_x" OWNER TO "svc_new"' in out
+    assert "Dry-run" in out
+
+
+def test_alter_prints_the_quota_warning_off_redshift(monkeypatch, capsys) -> None:
+    """Quota is Redshift-only. Alongside other work it warns and is skipped —
+    an error only when it is the *only* change asked for, which is covered by the
+    plan builder's own tests."""
+    cursor = _Cursor()
+
+    _alter(monkeypatch, cursor, owner="svc_new", quota="50GB")
+
+    assert cursor.statements == ['ALTER SCHEMA "dev_x" OWNER TO "svc_new"']
+    assert "only Redshift supports schema quotas" in capsys.readouterr().out
+
+
+def test_alter_declining_the_confirmation_executes_nothing(monkeypatch) -> None:
+    cursor = _Cursor()
+    monkeypatch.setattr(schema_alter.typer, "confirm", lambda *a, **k: False)
+
+    with pytest.raises(typer.Exit) as exc:
+        _alter(monkeypatch, cursor, owner="svc_new", yes=False)
+
+    # A refusal is not a service failure.
+    assert exc.value.exit_code == ExitCode.FAILURE
+    assert cursor.statements == []
+
+
+def test_alter_with_nothing_to_change_is_refused(monkeypatch, capsys) -> None:
+    """Otherwise the command reports success having done nothing at all."""
+    cursor = _Cursor()
+
+    with pytest.raises(typer.Exit) as exc:
+        _alter(monkeypatch, cursor)
+
+    assert exc.value.exit_code == ExitCode.INVALID_INPUT
+    assert cursor.statements == []
+    assert "nothing to do" in capsys.readouterr().out

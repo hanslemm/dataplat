@@ -62,8 +62,26 @@ jobs:
       # skips reported twice per push. Marker deselection happens after
       # collection, so an import error under tests/integration/ still fails
       # here and does not have to wait for the integration job.
+      # --cov-fail-under=0 because the floor belongs to the combined report, not
+      # to one leg of it. No job here runs the whole suite -- this one skips the
+      # tier that needs a server -- so enforcing the threshold per job would fail
+      # every job for the same wrong reason.
       - name: Pytest (unit)
-        run: uv run pytest -m "not integration"
+        run: uv run pytest -m "not integration" --cov --cov-report= --cov-fail-under=0
+
+      # Only from 3.13, the dev pin. Both interpreters execute the same lines, so
+      # a second copy would add nothing to the union and would need a distinct
+      # artifact name to avoid a collision.
+      - name: Stash coverage
+        if: matrix.python-version == '3.13'
+        run: mv .coverage coverage-unit
+      - name: Upload coverage
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-unit
+          path: coverage-unit
+          include-hidden-files: true
 
       # The third engine's real-SQL tier, and the only one that belongs in this
       # job: DuckDB is a library, so it needs no container, no credentials and no
@@ -243,10 +261,89 @@ jobs:
           "
 
       - name: Pytest (integration)
-        run: uv run pytest -m integration
+        run: uv run pytest -m integration --cov --cov-report= --cov-fail-under=0
+
+      # Only the `on` leg. Both scs legs run identical Python over identical SQL,
+      # so the second contributes no new lines -- the leg exists to prove a server
+      # setting, not to reach different code.
+      - name: Stash coverage
+        if: matrix.scs == 'on'
+        run: mv .coverage coverage-integration
+      - name: Upload coverage
+        if: matrix.scs == 'on'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-integration
+          path: coverage-integration
+          include-hidden-files: true
 
       # For the failures that are about the database rather than the SQL:
       # refused connections, a crashed backend, the OOM killer.
       - name: PostgreSQL server log
         if: failure()
         run: docker logs dp-pg-ci
+
+  # Coverage is reported here and nowhere else, because no other job can see the
+  # whole picture: `checks` deselects the tier that needs a server and
+  # `integration` deselects everything else. Either number alone is wrong in a way
+  # that looks plausible -- the unit leg reads 87%, the integration leg 30%, and
+  # the union is what the suite actually exercises.
+  #
+  # What the figure is for: catching a test file that stopped running, or a
+  # sizeable module that arrived without tests. What it is not for is evidence of
+  # correctness -- see the long note on `fail_under` in pyproject.toml, and the
+  # bug that was covered the whole time it was broken.
+  coverage:
+    runs-on: ubuntu-latest
+    needs: [checks, integration]
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup uv
+        # Pinned exactly and prune-cache set for the reasons given in the jobs
+        # above; setup-uv has no floating major tag past v7.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          prune-cache: true
+
+      - name: Setup Python
+        run: uv python install 3.13
+
+      # No --all-extras: this job runs no tests, so it needs the coverage tool and
+      # nothing else the suite imports.
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # Into the working directory, where `coverage combine` looks. Each arrives
+      # as its own artifact because a matrix leg cannot append to a sibling's.
+      - name: Download coverage from every leg
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+
+      # Renamed only now: `.coverage.*` is the pattern combine consumes, and a
+      # file called that in a job that *runs* pytest would be erased on startup by
+      # pytest-cov before it could be read.
+      - name: Combine
+        run: |
+          mv coverage-unit .coverage.unit
+          mv coverage-integration .coverage.integration
+          uv run coverage combine
+          uv run coverage report
+
+      # Rendered into the run summary so a reviewer sees the number without
+      # opening a log, and the per-file misses without running anything locally.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage'
+            echo
+            echo '```'
+            uv run coverage report --fail-under=0 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
