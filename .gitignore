@@ -42,6 +42,9 @@ htmlcov/
 .nox/
 .coverage
 .coverage.*
+# Scratch directory for reproducing CI's cross-job coverage combine locally
+# (see CONTRIBUTING). Holds binary coverage data, never source.
+.covstash/
 .cache
 nosetests.xml
 coverage.xml
