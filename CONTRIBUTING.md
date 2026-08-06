@@ -55,12 +55,14 @@ the unit leg alone reads 87%, the integration leg 30%, and only the union means
 anything. If you are reproducing what CI reports, combine the same way:
 
 ```bash
+mkdir -p .covstash
 uv run pytest -m "not integration" --cov --cov-report= --cov-fail-under=0
-mv .coverage /tmp/cov-unit          # outside the working directory: pytest-cov
-                                    # erases .coverage* when it starts
+mv .coverage .covstash/unit         # outside the .coverage* pattern, which
+                                    # pytest-cov erases when it starts.
+                                    # .covstash/ is gitignored.
 DP_TEST_PG_REQUIRED=1 uv run pytest -m integration --cov --cov-report= --cov-fail-under=0
 mv .coverage .coverage.integration
-cp /tmp/cov-unit .coverage.unit
+cp .covstash/unit .coverage.unit
 uv run coverage combine && uv run coverage report
 ```
 
