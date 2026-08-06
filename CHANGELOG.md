@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Added
+
+- **Tests for the Airbyte service layer**, which was the largest untested area
+  left after coverage measurement arrived: 64% → 89% across those modules, with
+  `tags.py` going 36% → 97% and `connections.py` 53% → 80%.
+
+  Nothing here executes against a real Airbyte, and the tests say so at the top of
+  each module. What a fake can prove is what *this* code does with a given
+  response — which is the whole subject, because these branches exist to absorb
+  the shape variance the API is known to produce (`tagId` or `id`, `workspaceId`
+  or `workspace_id`, a bare list or a dict wrapping one) and none of them had ever
+  run.
+
+  Two latent risks are now pinned by tests that name them and deliberately do
+  **not** change behaviour, because choosing between the alternatives needs an
+  Airbyte to ask and there is none:
+
+  - `merge_tags` silently drops a tag carrying no id. The merged list is written
+    back as a connection's *complete* tag set, so an entry it cannot identify is
+    not merely unmerged — it is removed, and adding one tag would delete another.
+  - `TagResolver` caches by the workspace found in the payload but looks up by the
+    workspace it was asked about, so a listing that omits `workspaceId` recreates
+    a tag that already exists.
+
+  No defects were found in `client.py`'s helpers — `build_auth_headers`,
+  `parse_jwt_exp` and the cron pair were correct in every branch, including the
+  subtle ones (an empty `AIRBYTE_AUTH_VALUE` is honoured rather than falling back
+  to a credential the operator cleared; a trailing field that does not resolve as
+  a timezone is left attached rather than silently dropped). They were simply
+  untested, and four environment variables that decide what credential goes on
+  every request now have tests.
+
 ### Fixed
 
 - **`dp db role list` failed outright on a PostgreSQL server with
