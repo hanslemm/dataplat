@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -161,33 +162,163 @@ def _repo_id(repo_url: str) -> str:
     return _slug(_normalize_repo_ref(repo_url), fallback="repo")
 
 
+def _repo_owner(repo_url: str) -> str | None:
+    """Return the account owning ``repo_url`` (``github.com/<owner>/<repo>``)."""
+    parts = _normalize_repo_ref(repo_url).split("/")
+    return parts[1] if len(parts) >= 3 and parts[1] else None
+
+
+def _org_id(org: str) -> str:
+    """Build a filesystem-safe identifier for an organization."""
+    return _slug(f"github.com/{org.strip().lower()}", fallback="org")
+
+
+def get_mount_dir(target_id: str) -> Path:
+    """Return the default host mount directory for a runner target."""
+    return get_runner_state_dir() / "workdirs" / target_id
+
+
+def get_mount_record_path(target_id: str) -> Path:
+    """Return the path of the mount-record file for a runner target."""
+    return get_runner_state_dir() / "mounts" / f"{target_id}.path"
+
+
 def get_repo_mount_dir(repo_url: str) -> Path:
     """Return the default host mount directory for a repository."""
-    return get_runner_state_dir() / "workdirs" / _repo_id(repo_url)
+    return get_mount_dir(_repo_id(repo_url))
 
 
 def get_repo_mount_record_path(repo_url: str) -> Path:
     """Return the path of the mount-record file for a repository."""
-    return get_runner_state_dir() / "mounts" / f"{_repo_id(repo_url)}.path"
+    return get_mount_record_path(_repo_id(repo_url))
 
 
-def resolve_local_workdir(repo_url: str, local_workdir: str | None) -> Path:
-    """Resolve (and create) the local workdir for a repository mount."""
+def get_org_mount_dir(org: str) -> Path:
+    """Return the default host mount directory for an organization runner."""
+    return get_mount_dir(_org_id(org))
+
+
+def get_org_mount_record_path(org: str) -> Path:
+    """Return the path of the mount-record file for an organization runner."""
+    return get_mount_record_path(_org_id(org))
+
+
+def resolve_local_workdir(target_id: str, local_workdir: str | None) -> Path:
+    """Resolve (and create) the local workdir for a runner target's mount."""
     workdir = (
-        Path(local_workdir).expanduser()
-        if local_workdir
-        else get_repo_mount_dir(repo_url)
+        Path(local_workdir).expanduser() if local_workdir else get_mount_dir(target_id)
     )
     workdir.mkdir(parents=True, exist_ok=True)
     return workdir.resolve()
 
 
-def record_repo_mount(repo_url: str, resolved_workdir: Path) -> Path:
+def record_mount(target_id: str, resolved_workdir: Path) -> Path:
     """Persist the mount record after a successful container start."""
-    mount_record_path = get_repo_mount_record_path(repo_url)
+    mount_record_path = get_mount_record_path(target_id)
     mount_record_path.parent.mkdir(parents=True, exist_ok=True)
     mount_record_path.write_text(f"{resolved_workdir}\n")
     return mount_record_path
+
+
+@dataclass(frozen=True)
+class RunnerTarget:
+    """Where a runner registers: one repository, or a whole organization.
+
+    Organization runners serve every repository their runner group allows, so
+    they need no ``REPO_URL``; the image instead needs ``ORG_NAME`` and, for
+    GitHub App authentication, ``APP_LOGIN`` (the login the App is installed
+    on). Registering at org level requires the App to hold the organization
+    permission "Self-hosted runners: Read and write".
+    """
+
+    scope: str  # "repo" | "org"
+    repo_url: str | None = None
+    org: str | None = None
+    runner_group: str | None = None
+
+    @property
+    def id(self) -> str:
+        if self.scope == "org":
+            assert self.org is not None
+            return _org_id(self.org)
+        assert self.repo_url is not None
+        return _repo_id(self.repo_url)
+
+    @property
+    def label(self) -> str:
+        if self.scope == "org":
+            group = f" (runner group: {self.runner_group})" if self.runner_group else ""
+            return f"organization {self.org}{group}"
+        return f"repository {self.repo_url}"
+
+    def docker_env(self) -> list[str]:
+        """``NAME=value`` pairs the runner image needs for this target."""
+        if self.scope == "org":
+            assert self.org is not None
+            env = [
+                "RUNNER_SCOPE=org",
+                f"ORG_NAME={self.org}",
+                f"APP_LOGIN={self.org}",
+            ]
+            if self.runner_group:
+                env.append(f"RUNNER_GROUP={self.runner_group}")
+            return env
+        assert self.repo_url is not None
+        env = ["RUNNER_SCOPE=repo", f"REPO_URL={self.repo_url}"]
+        owner = _repo_owner(self.repo_url)
+        if owner:
+            env.append(f"APP_LOGIN={owner}")
+        return env
+
+
+def resolve_runner_target(
+    repo_url: str | None,
+    org: str | None,
+    runner_scope: str | None,
+    runner_group: str | None,
+) -> RunnerTarget:
+    """Validate the target options and pick the registration scope.
+
+    The scope is inferred from which of ``--repo-url`` / ``--org`` is given;
+    an explicit ``--scope`` must agree with it. Enterprise scope is rejected
+    because GitHub Apps cannot register enterprise runners.
+    """
+    if repo_url and org:
+        raise typer.BadParameter(
+            "Pass either --repo-url (repository runner) or --org "
+            "(organization runner), not both."
+        )
+    if not repo_url and not org:
+        raise typer.BadParameter(
+            "Pass --repo-url for a repository runner or --org for an "
+            "organization runner."
+        )
+    inferred = "org" if org else "repo"
+    if runner_scope:
+        wanted = runner_scope.strip().lower()
+        if wanted in {"ent", "enterprise"}:
+            raise typer.BadParameter(
+                "Enterprise-scope runners cannot be registered with a GitHub "
+                "App; use --repo-url or --org."
+            )
+        if wanted not in {"repo", "org"}:
+            raise typer.BadParameter(f"Unknown --scope '{runner_scope}' (repo or org).")
+        if wanted != inferred:
+            flag = "--org" if org else "--repo-url"
+            raise typer.BadParameter(
+                f"--scope {wanted} does not match {flag}; drop --scope, it is inferred."
+            )
+    if runner_group and inferred == "repo":
+        raise typer.BadParameter(
+            "--runner-group only applies to organization runners (--org); "
+            "repository runners always use the repository's default group."
+        )
+    return RunnerTarget(
+        scope=inferred,
+        repo_url=repo_url.strip() if repo_url else None,
+        org=org.strip() if org else None,
+        runner_group=runner_group.strip() if runner_group else None,
+    )
 
 
 @app.command()
@@ -195,14 +326,36 @@ def start(
     runner_name: str = typer.Option(
         ..., "--runner-name", "-n", help="Name for the GitHub Actions runner"
     ),
-    repo_url: str = typer.Option(
-        ...,
+    repo_url: str | None = typer.Option(
+        None,
         "--repo-url",
         "-r",
-        help="Repository URL (e.g., https://github.com/org/repo)",
+        help=(
+            "Repository URL for a repository-level runner "
+            "(e.g., https://github.com/org/repo)."
+        ),
     ),
-    runner_scope: str = typer.Option(
-        "repo", "--scope", "-s", help="Runner scope (repo, org, or enterprise)"
+    org: str | None = typer.Option(
+        None,
+        "--org",
+        "-o",
+        help=(
+            "Organization login for an organization-level runner "
+            "(e.g., my-org). Serves every repository its runner group "
+            "allows. Mutually exclusive with --repo-url."
+        ),
+    ),
+    runner_group: str | None = typer.Option(
+        None,
+        "--runner-group",
+        "-g",
+        help="Runner group to join (organization runners only; default: Default).",
+    ),
+    runner_scope: str | None = typer.Option(
+        None,
+        "--scope",
+        "-s",
+        help="repo or org; inferred from --repo-url / --org when omitted.",
     ),
     runner_workdir: str = typer.Option(
         "/tmp/.github/runner", "--workdir", "-w", help="Runner working directory"
@@ -216,7 +369,7 @@ def start(
         "-l",
         help=(
             "Local directory to mount as runner workdir. "
-            "Defaults to ~/.config/dataplat/github-runner/workdirs/<repository-id>"
+            "Defaults to ~/.config/dataplat/github-runner/workdirs/<target-id>"
         ),
     ),
     image: str = typer.Option(
@@ -233,8 +386,17 @@ def start(
         ),
     ),
 ):
-    """Start the GitHub Actions runner container."""
-    console.print("[blue]Starting GitHub Actions runner...[/blue]")
+    """Start the GitHub Actions runner container.
+
+    Register against one repository (--repo-url) or a whole organization
+    (--org, optionally --runner-group). Authentication uses the GitHub App
+    from GHA_APP_ID / GHA_APP_PRIVATE_KEY; organization registration needs
+    that App to hold "Self-hosted runners: Read and write" on the org.
+    """
+    target = resolve_runner_target(repo_url, org, runner_scope, runner_group)
+    console.print(
+        f"[blue]Starting GitHub Actions runner for {esc(target.label)}...[/blue]"
+    )
 
     # Check for required environment variables
     app_id = get_env_var("GHA_APP_ID")
@@ -257,7 +419,7 @@ def start(
     # Start new container
     console.print("Starting new GitHub Actions runner container...")
     ensure_image_present(image)
-    resolved_local_workdir = resolve_local_workdir(repo_url, local_workdir)
+    resolved_local_workdir = resolve_local_workdir(target.id, local_workdir)
 
     docker_cmd = [
         "docker",
@@ -284,13 +446,13 @@ def start(
         "-e",
         "APP_PRIVATE_KEY",
         "-e",
-        f"RUNNER_SCOPE={runner_scope}",
-        "-e",
         f"RUNNER_WORKDIR={runner_workdir}",
         "-e",
         f"DEBUG_OUTPUT={str(debug_output).lower()}",
-        "-e",
-        f"REPO_URL={repo_url}",
+    ]
+    for pair in target.docker_env():
+        docker_cmd += ["-e", pair]
+    docker_cmd += [
         "-v",
         "/var/run/docker.sock:/var/run/docker.sock",
         "-v",
@@ -304,13 +466,12 @@ def start(
         "APP_PRIVATE_KEY": app_private_key,
     }
     run_command(docker_cmd, env=docker_env)
-    record_repo_mount(repo_url, resolved_local_workdir)
+    record_mount(target.id, resolved_local_workdir)
     console.print("[green]✓ GitHub Actions runner started successfully[/green]")
     console.print(f"[dim]Container name: {esc(container_name)}[/dim]")
+    console.print(f"[dim]Target: {esc(target.label)}[/dim]")
     console.print(f"[dim]Local mount: {esc(resolved_local_workdir)}[/dim]")
-    console.print(
-        f"[dim]Mount record: {esc(get_repo_mount_record_path(repo_url))}[/dim]"
-    )
+    console.print(f"[dim]Mount record: {esc(get_mount_record_path(target.id))}[/dim]")
 
 
 @app.command()

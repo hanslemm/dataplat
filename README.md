@@ -373,6 +373,27 @@ also says: DuckDB does **not** block `DROP TABLE` on a dependent view — it
 leaves the view broken — while a foreign-key child does block it, and there is no
 `CASCADE`.
 
+## CI: GitHub runners
+
+`dp ci github runner` runs a self-hosted GitHub Actions runner in Docker,
+authenticated with a GitHub App (`GHA_APP_ID`, `GHA_APP_PRIVATE_KEY`). It can
+register against one repository or a whole organization:
+
+```bash
+# repository-level: serves this repository only
+dp ci github runner start -n my-runner -r https://github.com/my-org/repo
+# organization-level: serves every repository its runner group allows
+dp ci github runner start -n munin -o my-org -g my-group
+dp ci github runner status -n munin
+dp ci github runner stop -n munin
+```
+
+The scope is inferred from `--repo-url` / `--org`. Repository runners need the
+App's repository permission "Administration: Read and write" on that
+repository; organization runners need the organization permission "Self-hosted
+runners: Read and write", accepted on the installation by an org owner. The
+private key reaches docker through the process environment, never argv.
+
 ## Configuration reference
 
 | Variable | Purpose |

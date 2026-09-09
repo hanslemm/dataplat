@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- **`dp ci github runner start` can register an organization-level runner.**
+  New `--org/-o` (mutually exclusive with `--repo-url`) and `--runner-group/-g`;
+  `--scope` is now inferred from whichever target is given and only validated
+  when passed. Organization targets get `RUNNER_SCOPE=org`, `ORG_NAME`,
+  `APP_LOGIN` and `RUNNER_GROUP` and no `REPO_URL`; repository targets are
+  unchanged apart from an explicit `APP_LOGIN=<owner>`, the value the image
+  derived on its own before. Mount directories are keyed per target
+  (`github.com-<org>` next to `github.com-<org>-<repo>`), so both kinds can
+  coexist. Enterprise scope is rejected outright: GitHub Apps cannot register
+  enterprise runners, so the old `--scope enterprise` never worked.
+
 ### Fixed
 
 - **`dp db role list` failed outright on a PostgreSQL server with
