@@ -9,6 +9,7 @@ assertions deterministic across machines and CI.
 from __future__ import annotations
 
 import os
+import tempfile
 
 os.environ.pop("FORCE_COLOR", None)
 os.environ.pop("CLICOLOR", None)
@@ -42,7 +43,17 @@ os.environ["DEMO_PG_REASSIGN_OWNER"] = "demo_pg_root"
 os.environ["DEMO_RS_ENGINE"] = "redshift"
 os.environ["DEMO_RS_REASSIGN_OWNER"] = "admin"
 os.environ.pop("DP_DEFAULT_TARGET", None)
-os.environ.pop("DP_ENVRC_PATH", None)
+# dataplat.main calls load_envrc() at import time, and popping DP_ENVRC_PATH
+# alone only drops the developer's *override*: the lookup then falls through
+# to the global link (~/.config/dataplat/.envrc, created by `dp config init`)
+# and loads that developer's real targets, DP_DEFAULT_TARGET and credentials
+# into the suite. Point the override at an empty file instead so the loader
+# finds something and stops there. An empty file parses to no exports.
+with tempfile.NamedTemporaryFile(
+    prefix="dp-test-envrc-", suffix=".envrc", delete=False
+) as _empty_envrc:
+    pass
+os.environ["DP_ENVRC_PATH"] = _empty_envrc.name
 
 # Isolate the suite from connection/config env in the developer's shell.
 for _var in (
