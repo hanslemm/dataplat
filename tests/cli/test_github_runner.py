@@ -84,6 +84,8 @@ def test_runner_start_uses_fixed_mount_dir(monkeypatch, tmp_path: Path) -> None:
     runner_cli.start(
         runner_name="my-runner",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -115,6 +117,8 @@ def test_runner_start_records_explicit_mount_dir(monkeypatch, tmp_path: Path) ->
     runner_cli.start(
         runner_name="repo-runner",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -147,6 +151,8 @@ def test_runner_mount_default_is_shared_per_repository(
     runner_cli.start(
         runner_name="runner-a",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -157,6 +163,8 @@ def test_runner_mount_default_is_shared_per_repository(
     runner_cli.start(
         runner_name="runner-b",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -184,6 +192,8 @@ def test_runner_start_pins_dns_servers(monkeypatch, tmp_path: Path) -> None:
     runner_cli.start(
         runner_name="dns-runner",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -213,6 +223,8 @@ def test_runner_start_without_dns_omits_flag(monkeypatch, tmp_path: Path) -> Non
     runner_cli.start(
         runner_name="no-dns-runner",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -240,6 +252,8 @@ def test_runner_start_keeps_private_key_out_of_argv(
     runner_cli.start(
         runner_name="secret-runner",
         repo_url=repo_url,
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -486,6 +500,8 @@ def test_start_filters_on_the_exact_container_name(monkeypatch, tmp_path: Path) 
     runner_cli.start(
         runner_name="foo",
         repo_url="https://github.com/org/repo",
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -534,6 +550,8 @@ def test_start_leaves_a_longer_sibling_container_alone(
     runner_cli.start(
         runner_name="foo",
         repo_url="https://github.com/org/repo",
+        org=None,
+        runner_group=None,
         runner_scope="repo",
         runner_workdir="/tmp/.github/runner",
         debug_output=True,
@@ -647,6 +665,8 @@ def test_start_reports_markup_like_paths_literally(monkeypatch, tmp_path: Path) 
         runner_cli.start(
             runner_name="foo",
             repo_url="https://github.com/org/repo",
+            org=None,
+            runner_group=None,
             runner_scope="repo",
             runner_workdir="/tmp/.github/runner",
             debug_output=True,
@@ -683,3 +703,155 @@ def test_runner_cli_wiring(monkeypatch) -> None:
     )
     assert result.exit_code == 0
     assert "No runner container found" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Organization-level runners (no repository)
+# ---------------------------------------------------------------------------
+
+
+def _start_kwargs(**overrides):
+    base = dict(
+        runner_name="munin",
+        repo_url=None,
+        org=None,
+        runner_group=None,
+        runner_scope=None,
+        runner_workdir="/tmp/.github/runner",
+        debug_output=True,
+        local_workdir=None,
+        image=runner_cli.DEFAULT_IMAGE,
+        dns=runner_cli.DEFAULT_DNS,
+    )
+    base.update(overrides)
+    return base
+
+
+def _env_pairs(docker_run_cmd: list[str]) -> list[str]:
+    return [docker_run_cmd[i + 1] for i, a in enumerate(docker_run_cmd) if a == "-e"]
+
+
+def _org_start_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DP_GITHUB_RUNNER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GHA_APP_ID", "1185744")
+    monkeypatch.setenv("GHA_APP_PRIVATE_KEY", "private-key")
+
+
+def test_runner_start_org_scope_registers_without_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _org_start_env(monkeypatch, tmp_path)
+    commands, fake_run_command = _fake_run_command_factory()
+    monkeypatch.setattr(runner_cli, "run_command", fake_run_command)
+
+    runner_cli.start(**_start_kwargs(org="my-org", runner_group="dna"))
+
+    docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+    env = _env_pairs(docker_run_cmd)
+    assert "RUNNER_SCOPE=org" in env
+    assert "ORG_NAME=my-org" in env
+    # The image's app_token.sh needs APP_LOGIN set; it is the org login.
+    assert "APP_LOGIN=my-org" in env
+    assert "RUNNER_GROUP=dna" in env
+    assert not any(pair.startswith("REPO_URL=") for pair in env)
+    assert "RUNNER_NAME=munin" in env
+    # Mount is keyed by the organization, not a repository.
+    expected_mount = runner_cli.get_org_mount_dir("my-org").resolve()
+    assert f"{expected_mount}:/tmp/.github/runner" in docker_run_cmd
+    record = runner_cli.get_org_mount_record_path("my-org")
+    assert record.read_text().strip() == str(expected_mount)
+
+
+def test_runner_start_org_scope_without_group_uses_default(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _org_start_env(monkeypatch, tmp_path)
+    commands, fake_run_command = _fake_run_command_factory()
+    monkeypatch.setattr(runner_cli, "run_command", fake_run_command)
+
+    runner_cli.start(**_start_kwargs(org="my-org"))
+
+    env = _env_pairs(next(cmd for cmd in commands if cmd[:2] == ["docker", "run"]))
+    assert not any(pair.startswith("RUNNER_GROUP=") for pair in env)
+
+
+def test_runner_start_repo_scope_sets_repo_url_and_owner_login(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _org_start_env(monkeypatch, tmp_path)
+    commands, fake_run_command = _fake_run_command_factory()
+    monkeypatch.setattr(runner_cli, "run_command", fake_run_command)
+
+    runner_cli.start(**_start_kwargs(repo_url="https://github.com/my-org/repo"))
+
+    env = _env_pairs(next(cmd for cmd in commands if cmd[:2] == ["docker", "run"]))
+    assert "RUNNER_SCOPE=repo" in env
+    assert "REPO_URL=https://github.com/my-org/repo" in env
+    assert "APP_LOGIN=my-org" in env
+    assert not any(pair.startswith("ORG_NAME=") for pair in env)
+
+
+def test_resolve_runner_target_rejects_ambiguous_or_missing_target() -> None:
+    with pytest.raises(typer.BadParameter, match="not both"):
+        runner_cli.resolve_runner_target("https://github.com/o/r", "o", None, None)
+    with pytest.raises(typer.BadParameter, match="--repo-url .* or --org"):
+        runner_cli.resolve_runner_target(None, None, None, None)
+
+
+def test_resolve_runner_target_scope_must_agree_and_no_enterprise() -> None:
+    with pytest.raises(typer.BadParameter, match="does not match --org"):
+        runner_cli.resolve_runner_target(None, "my-org", "repo", None)
+    with pytest.raises(typer.BadParameter, match="Enterprise"):
+        runner_cli.resolve_runner_target(None, "my-org", "enterprise", None)
+    with pytest.raises(typer.BadParameter, match="--runner-group only applies"):
+        runner_cli.resolve_runner_target("https://github.com/o/r", None, None, "g")
+    # Explicit, matching scope is accepted (backwards compatible with -s repo).
+    target = runner_cli.resolve_runner_target(
+        "https://github.com/o/r", None, "repo", None
+    )
+    assert target.scope == "repo"
+
+
+def test_org_and_repo_targets_get_distinct_mount_ids() -> None:
+    org = runner_cli.RunnerTarget(scope="org", org="my-org")
+    repo = runner_cli.RunnerTarget(
+        scope="repo", repo_url="https://github.com/my-org/repo"
+    )
+    assert org.id == "github.com-my-org"
+    assert repo.id == "github.com-my-org-repo"
+    assert org.id != repo.id
+
+
+def test_runner_cli_org_wiring(monkeypatch, tmp_path: Path) -> None:
+    """`dp ci github runner start -n munin -o my-org -g dna` parses end to end."""
+    from typer.testing import CliRunner
+
+    import dataplat.main as main_module
+
+    monkeypatch.setattr(main_module, "load_envrc", lambda: None)
+    _org_start_env(monkeypatch, tmp_path)
+    _wide_console(monkeypatch)
+    commands: list[list[str]] = []
+
+    def fake_run_command(cmd, check=True, env=None):  # noqa: ARG001
+        commands.append(cmd)
+        if cmd[:2] == ["docker", "info"]:
+            return SimpleNamespace(stdout="27.0", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(runner_cli, "run_command", fake_run_command)
+    result = CliRunner().invoke(
+        main_module.app,
+        ["ci", "github", "runner", "start", "-n", "munin", "-o", "my-org", "-g", "dna"],
+    )
+    assert result.exit_code == 0, result.output
+    env = _env_pairs(next(cmd for cmd in commands if cmd[:2] == ["docker", "run"]))
+    assert "ORG_NAME=my-org" in env
+    assert "RUNNER_GROUP=dna" in env
+
+    # Missing both targets is a usage error, not a traceback.
+    result = CliRunner().invoke(
+        main_module.app, ["ci", "github", "runner", "start", "-n", "x"]
+    )
+    assert result.exit_code == 2
+    assert "--repo-url" in result.output
