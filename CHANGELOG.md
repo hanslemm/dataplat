@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **`dp bi superset users create` can take the username from the email.**
+  New `--derive-username/-U` makes `USERNAME` optional and derives it from the
+  local part of `--email`, so the same string is no longer typed twice:
+  `--email eva.germeshausen@betterdoc.de -U` creates `eva.germeshausen`. When
+  that local part is dotted it also supplies the names — `Eva Germeshausen`
+  instead of the `<username> User` the command fell back to — and an explicit
+  `--first-name`/`--last-name` still wins. A single-part address (`eva@…`)
+  says nothing about what a person is called, so it keeps the old defaults.
+
 ### Fixed
 
 - **Superset failures now carry the reason Superset gave.** Every error from
@@ -13,6 +24,13 @@
   characters`), falling back to the raw body for anything that is not the
   FAB envelope, collapsed to one line and capped. Only the body is read, so
   the bearer token stays as unreachable from an error as it is from the trace.
+
+- **`users create` names the account it would have collided with.** Username
+  and email are unique in Superset, and it reports a breach of either as a
+  bare 422. The collision is now found before the POST and reported as
+  `Superset already has a user with that username: id=7, username=ada,
+  email=ada@example.com`, matched case-insensitively, exiting 2 (invalid
+  input) instead of 5 (service failure).
 
 ## 0.6.0
 

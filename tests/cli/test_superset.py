@@ -72,6 +72,8 @@ class FakeSuperset:
         list_status: int = 200,
         list_reason: str = "",
         delete_status: int = 200,
+        create_status: int = 201,
+        create_body: dict[str, Any] | None = None,
     ) -> None:
         self.users = USERS if users is None else users
         self.roles = ROLES if roles is None else roles
@@ -79,6 +81,8 @@ class FakeSuperset:
         self.list_status = list_status
         self.list_reason = list_reason
         self.delete_status = delete_status
+        self.create_status = create_status
+        self.create_body = create_body
         self.created: list[dict[str, Any]] = []
         self.updated: list[tuple[str, dict[str, Any]]] = []
         self.deleted: list[str] = []
@@ -105,6 +109,10 @@ class FakeSuperset:
         if method == "GET" and path.endswith("/security/users/"):
             return self._page(self.users)
         if method == "POST" and path.endswith("/security/users/"):
+            if self.create_status >= 400:
+                # httpx derives the reason phrase from the status, so the
+                # rendered error is the one Superset would produce.
+                return httpx.Response(self.create_status, json=self.create_body or {})
             self.created.append(json.loads(request.content))
             return httpx.Response(201, json={"id": 99})
         if method == "PUT" and "/security/users/" in path:
@@ -382,6 +390,179 @@ def test_user_create_prompts_for_password_without_echo(api: FakeSuperset) -> Non
     assert result.exit_code == 0, result.output
     assert api.created[0]["password"] == "s3cret"
     assert "s3cret" not in result.output
+
+
+def test_user_create_reports_the_reason_superset_gave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected create must arrive with its cause attached.
+
+    "422 Unprocessable Entity" alone is true of a duplicate username, a refused
+    password and a field this client spelled wrong alike; only the body tells
+    the operator which one they hit.
+    """
+    _serve(
+        monkeypatch,
+        FakeSuperset(
+            create_status=422,
+            create_body={"message": {"username": ["Already exists"]}},
+        ),
+    )
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "newbie", "--password", "pw", "--email", "n@example.com"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "422" in result.output
+    assert "username: Already exists" in result.output
+
+
+def test_user_create_refuses_a_username_that_is_taken(api: FakeSuperset) -> None:
+    """The duplicate is named before the POST, not decoded from a 422 after it."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "ADA", "--password", "pw", "--email", "new@example.com"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "already has a user with that username" in result.output
+    assert "id=7" in result.output
+    assert api.created == []
+
+
+def test_user_create_refuses_an_email_that_is_taken(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "fresh", "--password", "pw", "--email", "Ada@Example.com"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "already has a user with that email" in result.output
+    assert "username=ada" in result.output
+    assert api.created == []
+
+
+def test_user_create_derives_username_and_names_from_the_email(
+    api: FakeSuperset,
+) -> None:
+    """``-U`` exists so the local part is never typed twice."""
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "users",
+            "create",
+            "--password",
+            "pw",
+            "--email",
+            "Eva.Germeshausen@betterdoc.de",
+            "-U",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.created == [
+        {
+            "username": "eva.germeshausen",
+            "first_name": "Eva",
+            "last_name": "Germeshausen",
+            "email": "Eva.Germeshausen@betterdoc.de",
+            "password": "pw",
+            "active": True,
+            "roles": [2],
+        }
+    ]
+
+
+def test_derived_username_without_a_dot_keeps_the_name_defaults(
+    api: FakeSuperset,
+) -> None:
+    """One name part is a username, not a first and last name."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "--password", "pw", "--email", "eva@betterdoc.de", "-U"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.created[0]["username"] == "eva"
+    assert api.created[0]["first_name"] == "eva"
+    assert api.created[0]["last_name"] == "User"
+
+
+def test_explicit_names_survive_the_derivation(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "users",
+            "create",
+            "--password",
+            "pw",
+            "--email",
+            "eva.germeshausen@betterdoc.de",
+            "--derive-username",
+            "--first-name",
+            "Eva-Maria",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.created[0]["first_name"] == "Eva-Maria"
+    assert api.created[0]["last_name"] == "Germeshausen"
+
+
+def test_user_create_needs_a_username_or_the_derive_flag(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "--password", "pw", "--email", "eva@betterdoc.de"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "--derive-username" in result.output
+    assert api.created == []
+
+
+def test_user_create_rejects_a_username_next_to_the_derive_flag(
+    api: FakeSuperset,
+) -> None:
+    """Two sources for one value would make the losing one silent."""
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "users",
+            "create",
+            "eva",
+            "--password",
+            "pw",
+            "--email",
+            "eva@betterdoc.de",
+            "-U",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "not both" in result.output
+    assert api.created == []
+
+
+def test_derivation_rejects_an_email_with_no_local_part(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "create", "--password", "pw", "--email", "@betterdoc.de", "-U"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Cannot derive a username" in result.output
+    assert api.created == []
 
 
 def test_user_create_unknown_role_is_reported(api: FakeSuperset) -> None:

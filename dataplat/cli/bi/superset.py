@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from enum import Enum
 
 import typer
@@ -14,7 +15,12 @@ from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import JsonOption, YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
-from dataplat.core.errors import AuthError, ConfigError, ServiceError
+from dataplat.core.errors import (
+    AuthError,
+    ConfigError,
+    ServiceError,
+    ValidationError,
+)
 from dataplat.services.superset.client import (
     build_client,
     get_auth_config_from_env,
@@ -173,9 +179,56 @@ def list_roles(
     console.print(table)
 
 
+def _resolve_identity(
+    username: str | None, email: str, derive: bool
+) -> tuple[str, str | None, str | None]:
+    """The username to create, plus the names ``--email`` implies.
+
+    ``None`` for a name means "no opinion", not "empty": a single-part local
+    address says nothing about what the person is called, so the command's own
+    defaults stand rather than being overwritten with a guess.
+    """
+    if derive and username:
+        raise ValidationError("Pass USERNAME or --derive-username, not both.")
+    if not derive:
+        if not username:
+            raise ValidationError(
+                "Provide USERNAME, or --derive-username to take it from --email."
+            )
+        return username, None, None
+
+    local = email.rsplit("@", 1)[0].strip().lower() if "@" in email else ""
+    if not local:
+        raise ValidationError(f"Cannot derive a username from --email {email!r}")
+
+    parts = [part for part in local.split(".") if part]
+    if len(parts) < 2:
+        return local, None, None
+    return local, parts[0].title(), " ".join(part.title() for part in parts[1:])
+
+
+def _conflicting_user(
+    users: Iterable[dict], *, username: str, email: str
+) -> tuple[dict, str] | None:
+    """The user a create would collide with, and the field that collides.
+
+    Superset holds both unique and reports the breach as a bare 422 naming
+    neither the field nor the account already holding it — so the collision is
+    found here, where the existing row can be shown.
+    """
+    for user in users:
+        if str(user.get("username", "")).lower() == username.lower():
+            return user, "username"
+        if str(user.get("email", "")).lower() == email.lower():
+            return user, "email"
+    return None
+
+
 @users_app.command("create")
 def create_user(
-    username: str = typer.Argument(..., help="Superset username to create"),
+    username: str | None = typer.Argument(
+        None, help="Superset username to create (omit it when passing -U)"
+    ),
     password: str = typer.Option(
         ...,
         "--password",
@@ -185,6 +238,16 @@ def create_user(
         confirmation_prompt=True,
     ),
     email: str = typer.Option(..., "--email", "-e", help="Email for the new user"),
+    derive_username: bool = typer.Option(
+        False,
+        "--derive-username",
+        "-U",
+        help=(
+            "Take the username from the local part of --email "
+            "(eva.germeshausen@betterdoc.de becomes eva.germeshausen), and the "
+            "names from its dotted segments."
+        ),
+    ),
     first_name: str | None = typer.Option(
         None, "--first-name", help="First name for the new user"
     ),
@@ -206,20 +269,41 @@ def create_user(
     active: bool = typer.Option(True, "--active/--inactive", help="User is active"),
 ):
     """Create a Superset user."""
+    # Before the auth context: telling someone their flags contradict each
+    # other does not need an environment to be configured first.
+    try:
+        resolved_username, derived_first, derived_last = _resolve_identity(
+            username, email, derive_username
+        )
+    except ValidationError as exc:
+        fail(exc, console=console)
+
     base_url, admin_username, admin_password = _load_auth_context()
 
     resolved_email = email
-    resolved_first_name = first_name or username
-    resolved_last_name = last_name or "User"
+    resolved_first_name = first_name or derived_first or resolved_username
+    resolved_last_name = last_name or derived_last or "User"
     role_names = role_name if role_name else ["Gamma"]
     group_names = group_name if group_name else []
 
     try:
         with build_client() as client:
             access_token = _login(client, base_url, admin_username, admin_password)
+            conflict = _conflicting_user(
+                _iter_users(client, base_url, access_token),
+                username=resolved_username,
+                email=resolved_email,
+            )
+            if conflict is not None:
+                existing, field = conflict
+                raise ValidationError(
+                    f"Superset already has a user with that {field}: "
+                    f"id={existing.get('id')}, username={existing.get('username')}, "
+                    f"email={existing.get('email')}"
+                )
             role_ids = _resolve_role_ids(client, base_url, access_token, role_names)
             payload = {
-                "username": username,
+                "username": resolved_username,
                 "first_name": resolved_first_name,
                 "last_name": resolved_last_name,
                 "email": resolved_email,
@@ -234,13 +318,13 @@ def create_user(
                 payload["groups"] = group_ids
 
             response = _create_user(client, base_url, access_token, payload)
-    except (AuthError, ServiceError, ConfigError) as exc:
+    except (AuthError, ServiceError, ConfigError, ValidationError) as exc:
         fail(exc, console=console)
 
     user_id = response.get("id") or response.get("result", {}).get("id")
     console.print(
         "[green]✓ Superset user created[/green] "
-        f"[dim](username={esc(username)}, id={esc(user_id)})[/dim]"
+        f"[dim](username={esc(resolved_username)}, id={esc(user_id)})[/dim]"
     )
 
 
