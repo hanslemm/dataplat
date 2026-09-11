@@ -58,6 +58,64 @@ def _trace_hooks() -> dict[str, list[Callable[..., None]]]:
     return {"request": [on_request], "response": [on_response]}
 
 
+# --- error reporting --------------------------------------------------------
+# Superset answers a rejected call with the reason in the body and nothing but
+# a number in the status line. Dropping the body leaves the operator holding
+# "422 Unprocessable Entity", which is true of a duplicate username, a password
+# the policy refuses and a field this client spelled wrong alike.
+
+_DETAIL_LIMIT = 400
+_UNPARSED = object()
+
+
+def _join(value: object) -> str:
+    """Flatten one field's errors; FAB sends a list even for a single one."""
+    if isinstance(value, list):
+        return "; ".join(str(item) for item in value)
+    return str(value)
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """The server's own account of a failure, as one capped line.
+
+    Only the body is read, so the ``Authorization: Bearer …`` every call sends
+    stays as unreachable from an error message as it is from the trace.
+    """
+    try:
+        payload: object = response.json()
+    except ValueError:
+        payload = _UNPARSED
+
+    message = payload.get("message") if isinstance(payload, dict) else None
+
+    if isinstance(message, dict):
+        # A schema rejection arrives per field: {"password": ["too short"]}.
+        text = "; ".join(f"{k}: {_join(v)}" for k, v in sorted(message.items()))
+    elif message is not None:
+        text = _join(message)
+    elif payload is _UNPARSED or payload:
+        # No FAB envelope: a gateway's HTML or a bare string still beats a
+        # status line. An empty body ({} or []) says nothing and is left out.
+        text = response.text
+    else:
+        text = ""
+
+    text = " ".join(text.split())
+    if len(text) > _DETAIL_LIMIT:
+        text = text[:_DETAIL_LIMIT].rstrip() + "…"
+    return text
+
+
+def _service_error(response: httpx.Response, action: str) -> ServiceError:
+    """The one shape a failed Superset call reports, detail included."""
+    detail = _error_detail(response)
+    return ServiceError(
+        f"Failed to {action} "
+        f"({response.status_code} {response.reason_phrase})"
+        + (f": {detail}" if detail else "")
+    )
+
+
 def build_client() -> httpx.Client:
     """The one way a Superset command gets an HTTP client.
 
@@ -224,10 +282,7 @@ def iter_security_items(
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise ServiceError(
-                "Failed to list Superset security items "
-                f"({exc.response.status_code} {exc.response.reason_phrase})"
-            ) from exc
+            raise _service_error(exc.response, "list Superset security items") from exc
 
         payload = response.json() or {}
         results, meta = _extract_results(payload)
@@ -329,10 +384,7 @@ def create_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise ServiceError(
-            "Failed to create Superset user "
-            f"({exc.response.status_code} {exc.response.reason_phrase})"
-        ) from exc
+        raise _service_error(exc.response, "create Superset user") from exc
     return response.json() if response.text else {}
 
 
@@ -351,10 +403,7 @@ def update_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise ServiceError(
-            "Failed to update Superset user "
-            f"({exc.response.status_code} {exc.response.reason_phrase})"
-        ) from exc
+        raise _service_error(exc.response, "update Superset user") from exc
     return response.json() if response.text else {}
 
 
@@ -370,7 +419,4 @@ def delete_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise ServiceError(
-            "Failed to delete Superset user "
-            f"({exc.response.status_code} {exc.response.reason_phrase})"
-        ) from exc
+        raise _service_error(exc.response, "delete Superset user") from exc

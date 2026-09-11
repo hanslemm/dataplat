@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from dataplat.core import trace
-from dataplat.core.errors import ConfigError
+from dataplat.core.errors import ConfigError, ServiceError
 from dataplat.services.superset import client
 
 
@@ -142,3 +142,130 @@ def test_traces_nothing_when_not_enabled(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# --- error detail ---------------------------------------------------------
+# Superset answers a rejected write with the reason in the body; a status line
+# alone ("422 Unprocessable Entity") is not diagnosable by the person who ran
+# the command, which is the only audience these errors have.
+
+
+def _failing(status: int, reason: bytes, **body: object) -> Callable:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            extensions={"reason_phrase": reason},
+            request=request,
+            **body,  # type: ignore[arg-type]
+        )
+
+    return handler
+
+
+def _call_create(handler: Callable) -> str:
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as c,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        client.create_user(c, BASE_URL, ACCESS_TOKEN, {"username": "eva"})
+    return str(excinfo.value)
+
+
+def test_create_user_error_keeps_the_status_line() -> None:
+    message = _call_create(_failing(422, b"Unprocessable Entity", json={}))
+
+    assert "Failed to create Superset user" in message
+    assert "422 Unprocessable Entity" in message
+    # Nothing to add, so nothing is appended -- no dangling separator.
+    assert message.endswith(")")
+
+
+def test_create_user_error_quotes_the_servers_message() -> None:
+    message = _call_create(
+        _failing(
+            422,
+            b"Unprocessable Entity",
+            json={
+                "message": (
+                    "duplicate key value violates unique constraint "
+                    '"ab_user_username_key"'
+                )
+            },
+        )
+    )
+
+    assert "ab_user_username_key" in message
+
+
+def test_create_user_error_flattens_per_field_validation() -> None:
+    """FAB answers a schema rejection with ``{field: [errors]}``."""
+    message = _call_create(
+        _failing(
+            422,
+            b"Unprocessable Entity",
+            json={
+                "message": {
+                    "password": ["Must be at least 10 characters"],
+                    "email": ["Not a valid email address."],
+                }
+            },
+        )
+    )
+
+    assert "email: Not a valid email address." in message
+    assert "password: Must be at least 10 characters" in message
+
+
+def test_create_user_error_falls_back_to_the_body_text() -> None:
+    """A proxy or a crash answers with something that is not the FAB shape."""
+    message = _call_create(
+        _failing(
+            502, b"Bad Gateway", text="<html>\n  <body>gateway down</body>\n</html>"
+        )
+    )
+
+    # One line: an error printed by Rich must not smear across the terminal.
+    assert "\n" not in message
+    assert "gateway down" in message
+
+
+def test_error_detail_is_capped() -> None:
+    message = _call_create(_failing(500, b"Server Error", text="x" * 5_000))
+
+    assert len(message) < 700
+    assert message.endswith("…")
+
+
+@pytest.mark.parametrize(
+    ("call", "action"),
+    [
+        (
+            lambda c: client.create_user(c, BASE_URL, ACCESS_TOKEN, {}),
+            "create Superset user",
+        ),
+        (
+            lambda c: client.update_user(c, BASE_URL, ACCESS_TOKEN, 7, {}),
+            "update Superset user",
+        ),
+        (
+            lambda c: client.delete_user(c, BASE_URL, ACCESS_TOKEN, 7),
+            "delete Superset user",
+        ),
+        (
+            lambda c: list(client.iter_roles(c, BASE_URL, ACCESS_TOKEN)),
+            "list Superset security items",
+        ),
+    ],
+    ids=["create", "update", "delete", "list"],
+)
+def test_every_call_reports_the_servers_reason(call: Callable, action: str) -> None:
+    """One helper builds these errors, so no call site can drop the body again."""
+    handler = _failing(403, b"Forbidden", json={"message": "sorry, no"})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as c,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        call(c)
+
+    assert f"Failed to {action} (403 Forbidden): sorry, no" == str(excinfo.value)

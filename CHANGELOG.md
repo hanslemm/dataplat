@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Superset failures now carry the reason Superset gave.** Every error from
+  the user, role and group calls was built from the status line alone, so a
+  create refused for a duplicate username, a password the policy rejects, or a
+  field this client spelled wrong all arrived as the same undiagnosable
+  `422 Unprocessable Entity`. The body's `message` is now appended —
+  flattened per field for a schema rejection (`password: Must be at least 10
+  characters`), falling back to the raw body for anything that is not the
+  FAB envelope, collapsed to one line and capped. Only the body is read, so
+  the bearer token stays as unreachable from an error as it is from the trace.
+
 ## 0.6.0
 
 ### Added
