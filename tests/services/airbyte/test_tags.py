@@ -15,8 +15,6 @@ nobody here can observe is how the Redshift bugs in this repo happened.
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -29,47 +27,15 @@ from dataplat.services.airbyte.tags import (
     normalize_tag,
     tag_id,
 )
-
-
-class _FakeResponse:
-    @property
-    def reason_phrase(self) -> str:
-        # Derived from httpx's own table rather than stored: this class stands in
-        # for an httpx.Response, and an attribute it invents by hand is one that
-        # can drift from the real thing.
-        return httpx.codes.get_reason_phrase(self.status_code)
-
-    def __init__(self, data, status_code=200, *, text=None, bad_json=False):
-        self.status_code = status_code
-        self._data = data
-        self._bad_json = bad_json
-        self.text = text if text is not None else (json.dumps(data) if data else "")
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "error",
-                request=httpx.Request("GET", "http://test"),
-                response=self,  # type: ignore[arg-type]
-            )
-
-    def json(self):
-        if self._bad_json:
-            raise ValueError("not json")
-        if self._data is None:
-            # A real Response parses its body, and a body that is not JSON
-            # raises rather than yielding None. Returning None here would hide
-            # an error body from anything that reads the parsed payload first.
-            return json.loads(self.text)
-        return self._data
+from tests._responses import response
 
 
 class _FakeClient:
-    def __init__(self, *responses: _FakeResponse):
+    def __init__(self, *responses: httpx.Response):
         self._responses = list(responses)
         self.calls: list[tuple[str, str, dict | None]] = []
 
-    def _next(self) -> _FakeResponse:
+    def _next(self) -> httpx.Response:
         return (
             self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
         )
@@ -145,13 +111,13 @@ def test_normalize_tag_passes_through_a_tag_with_no_id_at_all() -> None:
     ],
 )
 def test_list_tags_unwraps_every_shape_the_api_uses(payload) -> None:
-    client = _FakeClient(_FakeResponse(payload))
+    client = _FakeClient(response(payload))
 
     assert list_tags(client, "http://ab") == [{"tagId": "t1"}]  # type: ignore[arg-type]
 
 
 def test_list_tags_prefers_data_over_tags() -> None:
-    client = _FakeClient(_FakeResponse({"data": [{"tagId": "a"}], "tags": []}))
+    client = _FakeClient(response({"data": [{"tagId": "a"}], "tags": []}))
 
     assert list_tags(client, "http://ab") == [{"tagId": "a"}]  # type: ignore[arg-type]
 
@@ -164,13 +130,13 @@ def test_an_unrecognised_payload_yields_no_tags_rather_than_raising(payload) -> 
     yet" and goes on to create, which is recoverable. Raising here would fail an
     otherwise-fine connection update over a response shape.
     """
-    client = _FakeClient(_FakeResponse(payload))
+    client = _FakeClient(response(payload))
 
     assert list_tags(client, "http://ab") == []  # type: ignore[arg-type]
 
 
 def test_a_http_error_names_the_status_and_quotes_the_body() -> None:
-    client = _FakeClient(_FakeResponse(None, status_code=403, text="forbidden"))
+    client = _FakeClient(response(None, status_code=403, text="forbidden"))
 
     with pytest.raises(ServiceError) as exc:
         list_tags(client, "http://ab")  # type: ignore[arg-type]
@@ -180,7 +146,7 @@ def test_a_http_error_names_the_status_and_quotes_the_body() -> None:
 
 def test_an_empty_error_body_leaves_the_status_line_to_speak() -> None:
     """Nothing to add, so nothing is appended -- no dangling separator."""
-    client = _FakeClient(_FakeResponse(None, status_code=500, text="   "))
+    client = _FakeClient(response(None, status_code=500, text="   "))
 
     with pytest.raises(ServiceError) as exc:
         list_tags(client, "http://ab")  # type: ignore[arg-type]
@@ -190,7 +156,7 @@ def test_an_empty_error_body_leaves_the_status_line_to_speak() -> None:
 
 def test_a_long_error_body_is_truncated() -> None:
     """A stack trace or an HTML error page must not become the whole message."""
-    client = _FakeClient(_FakeResponse(None, status_code=500, text="x" * 5000))
+    client = _FakeClient(response(None, status_code=500, text="x" * 5000))
 
     with pytest.raises(ServiceError) as exc:
         list_tags(client, "http://ab")  # type: ignore[arg-type]
@@ -199,7 +165,7 @@ def test_a_long_error_body_is_truncated() -> None:
 
 
 def test_an_unparseable_body_is_reported_as_such() -> None:
-    client = _FakeClient(_FakeResponse(None, bad_json=True))
+    client = _FakeClient(response(text="not json"))
 
     with pytest.raises(ServiceError, match="parse"):
         list_tags(client, "http://ab")  # type: ignore[arg-type]
@@ -213,7 +179,7 @@ def test_an_unparseable_body_is_reported_as_such() -> None:
 def test_create_tag_sends_only_the_fields_it_was_given() -> None:
     """Optional fields are omitted, not sent as null — the API rejects nulls for
     workspaceId, and a colour nobody asked for would be chosen by the server."""
-    client = _FakeClient(_FakeResponse({"tagId": "t1"}))
+    client = _FakeClient(response({"tagId": "t1"}))
 
     create_tag(client, "http://ab", "prod")  # type: ignore[arg-type]
 
@@ -223,7 +189,7 @@ def test_create_tag_sends_only_the_fields_it_was_given() -> None:
 
 
 def test_create_tag_includes_workspace_and_colour_when_present() -> None:
-    client = _FakeClient(_FakeResponse({"tagId": "t1"}))
+    client = _FakeClient(response({"tagId": "t1"}))
 
     create_tag(client, "http://ab", "prod", "ws-1", "#fff")  # type: ignore[arg-type]
 
@@ -235,7 +201,7 @@ def test_create_tag_includes_workspace_and_colour_when_present() -> None:
 
 
 def test_create_tag_reports_a_rejected_creation() -> None:
-    client = _FakeClient(_FakeResponse(None, status_code=422, text="duplicate name"))
+    client = _FakeClient(response(None, status_code=422, text="duplicate name"))
 
     with pytest.raises(ServiceError) as exc:
         create_tag(client, "http://ab", "prod")  # type: ignore[arg-type]
@@ -252,7 +218,7 @@ def test_create_tag_reports_a_rejected_creation() -> None:
 
 
 def test_an_existing_tag_is_reused_rather_than_recreated() -> None:
-    client = _FakeClient(_FakeResponse({"data": [{"id": "t1", "name": "prod"}]}))
+    client = _FakeClient(response({"data": [{"id": "t1", "name": "prod"}]}))
 
     resolved = TagResolver(client, "http://ab").ensure("prod", None)  # type: ignore[arg-type]
 
@@ -265,7 +231,7 @@ def test_the_listing_is_fetched_once_for_the_whole_invocation() -> None:
     """The cache is the point: a connection update resolving five tags must not
     list the workspace five times."""
     client = _FakeClient(
-        _FakeResponse({"data": [{"id": "t1", "name": "a"}, {"id": "t2", "name": "b"}]})
+        response({"data": [{"id": "t1", "name": "a"}, {"id": "t2", "name": "b"}]})
     )
     resolver = TagResolver(client, "http://ab")  # type: ignore[arg-type]
 
@@ -278,8 +244,8 @@ def test_the_listing_is_fetched_once_for_the_whole_invocation() -> None:
 
 def test_a_missing_tag_is_created_and_then_cached() -> None:
     client = _FakeClient(
-        _FakeResponse({"data": []}),
-        _FakeResponse({"id": "new", "name": "prod"}),
+        response({"data": []}),
+        response({"id": "new", "name": "prod"}),
     )
     resolver = TagResolver(client, "http://ab")  # type: ignore[arg-type]
 
@@ -296,8 +262,8 @@ def test_a_tag_without_a_name_is_not_cached() -> None:
     """It could never be looked up by name, and caching it under None would
     collide with every other nameless tag."""
     client = _FakeClient(
-        _FakeResponse({"data": [{"id": "t1"}]}),
-        _FakeResponse({"id": "new", "name": "prod"}),
+        response({"data": [{"id": "t1"}]}),
+        response({"id": "new", "name": "prod"}),
     )
 
     TagResolver(client, "http://ab").ensure("prod", None)  # type: ignore[arg-type]
@@ -307,7 +273,7 @@ def test_a_tag_without_a_name_is_not_cached() -> None:
 
 def test_the_workspace_is_read_from_either_spelling() -> None:
     client = _FakeClient(
-        _FakeResponse({"data": [{"id": "t1", "name": "prod", "workspace_id": "ws-1"}]})
+        response({"data": [{"id": "t1", "name": "prod", "workspace_id": "ws-1"}]})
     )
 
     resolved = TagResolver(client, "http://ab").ensure("prod", "ws-1")  # type: ignore[arg-type]
@@ -339,8 +305,8 @@ def test_a_listing_that_omits_the_workspace_recreates_a_tag_that_exists() -> Non
     say so.
     """
     client = _FakeClient(
-        _FakeResponse({"data": [{"id": "t1", "name": "prod"}]}),
-        _FakeResponse({"id": "dupe", "name": "prod"}),
+        response({"data": [{"id": "t1", "name": "prod"}]}),
+        response({"id": "dupe", "name": "prod"}),
     )
 
     resolved = TagResolver(client, "http://ab").ensure("prod", "ws-1")  # type: ignore[arg-type]

@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -14,6 +15,25 @@ import dataplat.services.airbyte.client as airbyte_client
 from dataplat.core.errors import AuthError, ConfigError, ExitCode, ServiceError
 
 runner = CliRunner()
+
+
+def _response(data, status_code: int = 200) -> httpx.Response:
+    """A real ``httpx.Response``, not a stand-in for one.
+
+    Two hand-rolled fakes used to live here, each re-implementing json(), text,
+    headers and raise_for_status. They drifted: one returned ``None`` from
+    json() for a body that was not JSON, where a real response raises -- which
+    hid error bodies from the code under test and from the tests asserting on
+    them. A real response cannot drift from itself.
+
+    The request is supplied because ``raise_for_status`` needs one to build its
+    error; httpx raises a RuntimeError without it.
+    """
+    return httpx.Response(
+        status_code,
+        json=data if data is not None else {},
+        request=httpx.Request("GET", "http://test"),
+    )
 
 
 def _disable_envrc(monkeypatch) -> None:
@@ -26,36 +46,10 @@ def _mock_authenticated_client(monkeypatch):
     The CLI modules import build_authenticated_client directly, so we patch
     in each CLI module's namespace as well as the service module.
     """
-    import httpx
 
     import dataplat.cli.ingest.airbyte.connections as _airbyte_connections_cli
     import dataplat.cli.ingest.airbyte.definitions as _airbyte_definitions_cli
     import dataplat.cli.ingest.airbyte.workspaces as _airbyte_workspaces_cli
-
-    class FakeResponse:
-        @property
-        def reason_phrase(self) -> str:
-            # Derived from httpx's own table rather than stored: this class stands in
-            # for an httpx.Response, and an attribute it invents by hand is one that
-            # can drift from the real thing.
-            return httpx.codes.get_reason_phrase(self.status_code)
-
-        def __init__(self, data, status_code=200):
-            self.status_code = status_code
-            self._data = data
-            self.text = json.dumps(data) if data is not None else ""
-            self.headers = {"content-type": "application/json"}
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise httpx.HTTPStatusError(
-                    "error",
-                    request=httpx.Request("GET", "http://test"),
-                    response=self,
-                )
-
-        def json(self):
-            return self._data
 
     class FakeClient:
         def __init__(self):
@@ -70,7 +64,7 @@ def _mock_authenticated_client(monkeypatch):
             if "sources" in url and "definitions" not in url:
                 count = self._increment("sources")
                 if count == 1:
-                    return FakeResponse(
+                    return _response(
                         {
                             "data": [
                                 {
@@ -82,11 +76,11 @@ def _mock_authenticated_client(monkeypatch):
                             ]
                         }
                     )
-                return FakeResponse({"data": []})
+                return _response({"data": []})
             if "destinations" in url and "definitions" not in url:
                 count = self._increment("destinations")
                 if count == 1:
-                    return FakeResponse(
+                    return _response(
                         {
                             "data": [
                                 {
@@ -98,24 +92,24 @@ def _mock_authenticated_client(monkeypatch):
                             ]
                         }
                     )
-                return FakeResponse({"data": []})
+                return _response({"data": []})
             if "workspaces" in url:
                 count = self._increment("workspaces")
                 if count == 1:
-                    return FakeResponse(
+                    return _response(
                         {"data": [{"workspaceId": "ws1", "name": "Default"}]}
                     )
-                return FakeResponse({"data": []})
-            return FakeResponse({"data": []})
+                return _response({"data": []})
+            return _response({"data": []})
 
         def post(self, url, **kwargs):
-            return FakeResponse({"sourceId": "s1", "name": "Created"})
+            return _response({"sourceId": "s1", "name": "Created"})
 
         def patch(self, url, **kwargs):
-            return FakeResponse({"sourceId": "s1", "name": "Updated"})
+            return _response({"sourceId": "s1", "name": "Updated"})
 
         def delete(self, url, **kwargs):
-            return FakeResponse(None, status_code=204)
+            return _response(None, status_code=204)
 
         def close(self):
             pass
@@ -236,9 +230,9 @@ class _StateFakeClient:
         if url.endswith("/api/public/v1/connections"):
             # one page then empty, to stop pagination
             if self._conn_listed:
-                return _SFResponse({"data": []})
+                return _response({"data": []})
             self._conn_listed = True
-            return _SFResponse(
+            return _response(
                 {
                     "data": [
                         {
@@ -253,7 +247,7 @@ class _StateFakeClient:
                 }
             )
         if "/api/public/v1/connections/" in url:  # get_connection (single -c)
-            return _SFResponse(
+            return _response(
                 {
                     "connectionId": "c1",
                     "name": "Conn1",
@@ -264,18 +258,18 @@ class _StateFakeClient:
             )
         if url.endswith("/api/public/v1/jobs"):  # list_jobs (busy check)
             data = [{"jobId": 1, "status": "running"}] if self._running else []
-            return _SFResponse({"data": data})
-        return _SFResponse({"data": []})
+            return _response({"data": data})
+        return _response({"data": []})
 
     def post(self, url, json=None, **kw):
         self.posts.append((url, json or {}))
         if url.endswith("/api/v1/state/get"):
-            return _SFResponse(self._state)
+            return _response(self._state)
         if url.endswith("/api/v1/state/create_or_update"):
-            return _SFResponse({"ok": True})
+            return _response({"ok": True})
         if url.endswith("/api/public/v1/jobs"):  # refresh trigger
-            return _SFResponse({"jobId": 42})
-        return _SFResponse({})
+            return _response({"jobId": 42})
+        return _response({})
 
     def close(self):
         pass
@@ -283,27 +277,6 @@ class _StateFakeClient:
     @property
     def headers(self):
         return {}
-
-
-class _SFResponse:
-    def __init__(self, data, status_code=200):
-        import json as _json
-
-        self.status_code = status_code
-        self._data = data
-        self.text = _json.dumps(data) if data is not None else ""
-        self.headers = {"content-type": "application/json"}
-
-    def raise_for_status(self):
-        import httpx
-
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "e", request=httpx.Request("POST", "http://t"), response=self
-            )
-
-    def json(self):
-        return self._data
 
 
 def _patch_state_client(monkeypatch, client) -> None:
@@ -919,17 +892,17 @@ class _AirbyteFake:
 
     def get(self, url, **kwargs):
         if url in self._seen:
-            return _SFResponse({"data": []})
+            return _response({"data": []})
         self._seen.add(url)
-        return _SFResponse(self._payload("GET", url))
+        return _response(self._payload("GET", url))
 
     def post(self, url, json=None, **kwargs):
         self.posted.append((url, json))
-        return _SFResponse(self._payload("POST", url))
+        return _response(self._payload("POST", url))
 
     def delete(self, url, **kwargs):
         self.deleted.append(url)
-        return _SFResponse(self._payload("DELETE", url))
+        return _response(self._payload("DELETE", url))
 
     def close(self) -> None:
         pass

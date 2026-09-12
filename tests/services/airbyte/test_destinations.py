@@ -2,40 +2,14 @@
 
 from __future__ import annotations
 
-import json
-
-import httpx
 import pytest
 
 from dataplat.core.errors import ServiceError
 from dataplat.services.airbyte import destinations
+from tests._responses import response
 
 
 def _mock_client(response_data, status_code=200):
-    class FakeResponse:
-        @property
-        def reason_phrase(self) -> str:
-            # Derived from httpx's own table rather than stored: this class stands in
-            # for an httpx.Response, and an attribute it invents by hand is one that
-            # can drift from the real thing.
-            return httpx.codes.get_reason_phrase(self.status_code)
-
-        def __init__(self, data, code):
-            self.status_code = code
-            self._data = data
-            self.text = json.dumps(data) if data is not None else ""
-            self.headers = {"content-type": "application/json"}
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise httpx.HTTPStatusError(
-                    "error",
-                    request=httpx.Request("GET", "http://test"),
-                    response=self,
-                )
-
-        def json(self):
-            return self._data
 
     class FakeClient:
         def __init__(self):
@@ -50,22 +24,22 @@ def _mock_client(response_data, status_code=200):
             self._get_call_count += 1
             # Return empty data on subsequent calls to terminate pagination
             if self._get_call_count > 1:
-                return FakeResponse({"data": []}, 200)
-            return FakeResponse(response_data, status_code)
+                return response({"data": []}, 200)
+            return response(response_data, status_code)
 
         def post(self, url, **kwargs):
             self.last_url = url
             self.last_json = kwargs.get("json")
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
         def patch(self, url, **kwargs):
             self.last_url = url
             self.last_json = kwargs.get("json")
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
         def delete(self, url, **kwargs):
             self.last_url = url
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
     return FakeClient()
 
