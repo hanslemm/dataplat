@@ -66,7 +66,10 @@ duckdb = ["duckdb>=1.5.5"]
 cloud = ["boto3>=1.35.0", "plotext>=5.3.2"]
 ingest = ["httpx>=0.25.0", "textual>=0.64.0", "croniter>=2.0.0"]
 bi = ["httpx>=0.25.0"]
-all = ["dataplat[db,duckdb,cloud,ingest,bi]"]
+# `dp people` spans both, so it needs both: it is the one area that is only
+# interesting because it crosses areas.
+people = ["dataplat[db,bi]"]
+all = ["dataplat[db,duckdb,cloud,ingest,bi,people]"]
 
 [project.scripts]
 dp = "dataplat.main:app"

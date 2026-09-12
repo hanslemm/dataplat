@@ -189,6 +189,7 @@ def test_areas_mount_as_placeholders_in_registry_order() -> None:
             "db",
             "ingest",
             "bi",
+            "people",
             "cloud",
             "ci",
             "status",

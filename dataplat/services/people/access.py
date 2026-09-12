@@ -16,7 +16,6 @@ from dataplat.services.db.role import (
     fetch_memberships_out,
     resolve_role,
 )
-from dataplat.services.superset.client import user_group_ids, user_role_ids
 
 __all__ = ["db_memberships", "db_user_exists", "superset_access"]
 
@@ -58,10 +57,25 @@ def db_user_exists(cursor: Any, engine: SqlEngine, username: str) -> bool:
     return True
 
 
+def _names(items: object) -> tuple[str, ...]:
+    if not isinstance(items, list):
+        return ()
+    return tuple(
+        str(item.get("name"))
+        for item in items
+        if isinstance(item, dict) and item.get("name")
+    )
+
+
 def superset_access(
     users: Iterable[dict], username: str
-) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
-    """``(role_ids, group_ids)`` for ``username``, or ``None`` if there is no such user.
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """``(role_names, group_names)`` for ``username``, or ``None`` if absent.
+
+    Names rather than ids, because a plan is read by a person before it is
+    executed and "roles: 2, 5" tells nobody whether the copy is right. The
+    create call resolves names to ids through the same helpers that validate
+    them, so carrying ids here would buy nothing and cost the review.
 
     ``None`` rather than two empty tuples: "no such account" and "an account
     with nothing granted" lead to different decisions, and collapsing them
@@ -69,5 +83,5 @@ def superset_access(
     """
     for user in users:
         if str(user.get("username", "")).lower() == username.lower():
-            return tuple(user_role_ids(user)), tuple(user_group_ids(user))
+            return _names(user.get("roles")), _names(user.get("groups"))
     return None

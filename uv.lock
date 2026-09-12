@@ -192,6 +192,10 @@ ingest = [
     { name = "httpx" },
     { name = "textual" },
 ]
+people = [
+    { name = "httpx" },
+    { name = "psycopg", extra = ["binary"] },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -205,7 +209,8 @@ dev = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.35.0" },
     { name = "croniter", marker = "extra == 'ingest'", specifier = ">=2.0.0" },
-    { name = "dataplat", extras = ["db", "duckdb", "cloud", "ingest", "bi"], marker = "extra == 'all'" },
+    { name = "dataplat", extras = ["db", "bi"], marker = "extra == 'people'" },
+    { name = "dataplat", extras = ["db", "duckdb", "cloud", "ingest", "bi", "people"], marker = "extra == 'all'" },
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.5.5" },
     { name = "httpx", marker = "extra == 'bi'", specifier = ">=0.25.0" },
     { name = "httpx", marker = "extra == 'ingest'", specifier = ">=0.25.0" },
@@ -215,7 +220,7 @@ requires-dist = [
     { name = "textual", marker = "extra == 'ingest'", specifier = ">=0.64.0" },
     { name = "typer", specifier = ">=0.21.1" },
 ]
-provides-extras = ["db", "duckdb", "cloud", "ingest", "bi", "all"]
+provides-extras = ["db", "duckdb", "cloud", "ingest", "bi", "people", "all"]
 
 [package.metadata.requires-dev]
 dev = [

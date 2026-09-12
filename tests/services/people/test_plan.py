@@ -106,8 +106,12 @@ def test_to_create_is_what_execution_will_touch() -> None:
         HANS,
         [
             _facts(),
-            _facts(scope="betterdata", template="{first_initial}_{last}",
-                   reference_username="h_lemm", target_exists=True),
+            _facts(
+                scope="betterdata",
+                template="{first_initial}_{last}",
+                reference_username="h_lemm",
+                target_exists=True,
+            ),
         ],
     )
 

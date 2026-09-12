@@ -128,11 +128,22 @@ SUPERSET_USERS = [
 
 
 def test_a_superset_users_roles_and_groups_are_read() -> None:
-    assert superset_access(SUPERSET_USERS, "hans.lemm") == ((2, 5), (10,))
+    """Names, not ids: the plan is read by a person before it is executed.
+
+    Ids would make the plan unreviewable -- "roles: 2, 5" tells nobody whether
+    the copy is right -- and the create call resolves names anyway.
+    """
+    assert superset_access(SUPERSET_USERS, "hans.lemm") == (
+        ("Gamma", "sql_lab"),
+        ("analysts",),
+    )
 
 
 def test_a_superset_username_is_matched_case_insensitively() -> None:
-    assert superset_access(SUPERSET_USERS, "Hans.Lemm") == ((2, 5), (10,))
+    assert superset_access(SUPERSET_USERS, "Hans.Lemm") == (
+        ("Gamma", "sql_lab"),
+        ("analysts",),
+    )
 
 
 def test_an_absent_superset_user_is_none_rather_than_empty() -> None:
@@ -148,4 +159,6 @@ def test_the_reference_lookup_never_writes(engine: SqlEngine) -> None:
 
     db_memberships(cursor, engine, "someone")
 
-    assert all(sql.strip().upper().startswith(("SELECT", "WITH")) for sql in cursor.executed)
+    assert all(
+        sql.strip().upper().startswith(("SELECT", "WITH")) for sql in cursor.executed
+    )

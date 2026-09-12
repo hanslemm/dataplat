@@ -118,7 +118,14 @@ def installed(*sites: Path) -> Iterator[None]:
 
 
 def test_all_builtin_areas_present_in_order() -> None:
-    assert [m.name for m in all_areas()] == ["db", "ingest", "bi", "cloud", "ci"]
+    assert [m.name for m in all_areas()] == [
+        "db",
+        "ingest",
+        "bi",
+        "people",
+        "cloud",
+        "ci",
+    ]
 
 
 def test_every_deps_contract_comes_from_the_deps_module() -> None:
@@ -249,6 +256,7 @@ def test_all_areas_appends_plugins_after_the_builtins(tmp_path: Path) -> None:
             "db",
             "ingest",
             "bi",
+            "people",
             "cloud",
             "ci",
             "widget",
