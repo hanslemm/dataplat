@@ -302,8 +302,10 @@ class _RowsCursor:
     def __init__(self, batches: list[list[tuple]]) -> None:
         self._batches = list(batches)
         self._current: list[tuple] = []
+        self.executed: list[str] = []
 
     def execute(self, sql_text, params=None) -> None:
+        self.executed.append(str(sql_text))
         self._current = self._batches.pop(0) if self._batches else []
 
     def fetchall(self) -> list[tuple]:
@@ -311,11 +313,19 @@ class _RowsCursor:
 
 
 def test_redshift_list_roles_unions_users_and_groups() -> None:
-    # First execute -> users, second -> groups.
+    """``pg_group.grolist`` arrives as the array of member ids, and is counted here.
+
+    The previous version of this test fed a pre-counted integer -- what the
+    query would have returned had Redshift implemented ``array_length`` -- so
+    the fake agreed with the code and both were wrong: the command failed
+    against every real cluster with "function array_length(integer[], integer)
+    does not exist". Verified against a real Redshift: ``grolist`` comes back
+    already parsed, as ``[110, 111, ...]``.
+    """
     cursor = _RowsCursor(
         [
-            [("svc", True, False)],  # usename, usesuper, usecreatedb
-            [("reporting", 3)],  # groname, member count
+            [("svc", True, False, 110)],  # usename, usesuper, usecreatedb, usesysid
+            [("reporting", [110, 111, 112])],  # groname, grolist
         ]
     )
     rows = RedshiftDialect().list_roles(cursor)
@@ -323,6 +333,50 @@ def test_redshift_list_roles_unions_users_and_groups() -> None:
     assert by_name["svc"].can_login is True
     assert by_name["reporting"].can_login is False
     assert by_name["reporting"].members_count == 3
+
+
+def test_redshift_list_roles_counts_the_groups_a_user_belongs_to() -> None:
+    """The column read 0 for every Redshift user, which is not the same as none.
+
+    The same ``grolist`` that counts a group's members says which groups a user
+    is in, so the column can simply be true rather than a placeholder -- and it
+    is the answer ``--like`` needs when reproducing someone's access.
+    """
+    cursor = _RowsCursor(
+        [
+            [("h_lemm", False, False, 110), ("loner", False, False, 999)],
+            [("pii_users", [110, 111]), ("team_dna", [110]), ("other", [111])],
+        ]
+    )
+
+    rows = {r.name: r for r in RedshiftDialect().list_roles(cursor)}
+
+    assert rows["h_lemm"].member_of_count == 2
+    assert rows["loner"].member_of_count == 0
+
+
+def test_redshift_list_roles_asks_for_nothing_redshift_cannot_answer() -> None:
+    """The failure was server-side, so only the SQL itself can pin it.
+
+    No fake reproduces a function the leader node does not implement; asserting
+    on the text is what keeps a Postgres-only helper from being reintroduced
+    into the one dialect that cannot run it.
+    """
+    cursor = _RowsCursor([[], []])
+
+    RedshiftDialect().list_roles(cursor)
+
+    assert not any("array_length" in sql for sql in cursor.executed)
+
+
+def test_redshift_list_roles_counts_a_group_with_no_members_as_zero() -> None:
+    """An empty group answers NULL, not an empty array."""
+    cursor = _RowsCursor([[], [("nobody", None), ("also_nobody", [])]])
+
+    rows = {r.name: r for r in RedshiftDialect().list_roles(cursor)}
+
+    assert rows["nobody"].members_count == 0
+    assert rows["also_nobody"].members_count == 0
 
 
 class _CatalogCursor:
