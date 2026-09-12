@@ -24,6 +24,25 @@
 
 ### Fixed
 
+- **`dp db role list` works on Redshift again.** It asked for
+  `array_length(grolist, 1)`, which Redshift's leader node does not implement,
+  so the command failed outright against every real cluster with
+  `function array_length(integer[], integer) does not exist`. The member ids
+  come back and are counted here instead, which needs no engine-specific SQL.
+
+  The test covering this fed a pre-counted integer — what the query would have
+  returned had Redshift implemented the function — so the fake agreed with the
+  code and both were wrong together. It now uses the shape a real cluster
+  returns, and a second test asserts the SQL does not name `array_length`,
+  since a server-side failure is not reproducible from a fake.
+
+- **A Redshift user's group memberships are counted rather than reported as
+  zero.** The `Member of` column read 0 for every user, which is not the same
+  answer as "none" — and against a cluster where people do belong to groups it
+  is simply false. Redshift has no `pg_auth_members`, so memberships are read
+  from the group side: the same `grolist` rows, inverted.
+
+
 - **`--format json` no longer emits invalid JSON.** Twelve Airbyte commands
   printed their JSON through a Rich console, which wraps at the console width
   and folds a token longer than it *mid-token* — putting a newline inside a

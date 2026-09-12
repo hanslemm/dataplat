@@ -545,8 +545,28 @@ class RedshiftDialect(RoleDialect):
         from dataplat.services.db.role_admin import RoleSummary
 
         cursor.execute(
-            "SELECT usename, usesuper, usecreatedb FROM pg_user ORDER BY usename"
+            "SELECT usename, usesuper, usecreatedb, usesysid "
+            "FROM pg_user ORDER BY usename"
         )
+        users = cursor.fetchall()
+        # The member ids come back and are counted here, rather than asking the
+        # server for the count: Redshift's leader node does not implement
+        # array_length, so `array_length(grolist, 1)` failed this command
+        # against every real cluster. `grolist` arrives already parsed as a
+        # list of ids, and NULL for a group nobody is in.
+        cursor.execute("SELECT groname, grolist FROM pg_group ORDER BY groname")
+        groups = [
+            (groname, tuple(grolist or ())) for groname, grolist in cursor.fetchall()
+        ]
+
+        # Redshift has no pg_auth_members, so a user's memberships are read
+        # from the group side -- the same rows, inverted. The column used to
+        # read 0 for every user, which is not the same answer as "none".
+        member_of: dict[int, int] = {}
+        for _, members in groups:
+            for usesysid in members:
+                member_of[int(usesysid)] = member_of.get(int(usesysid), 0) + 1
+
         rows = [
             RoleSummary(
                 name=name,
@@ -554,15 +574,11 @@ class RedshiftDialect(RoleDialect):
                 superuser=bool(usesuper),
                 create_db=bool(usecreatedb),
                 create_role=False,
-                member_of_count=0,
+                member_of_count=member_of.get(int(usesysid), 0),
                 members_count=0,
             )
-            for name, usesuper, usecreatedb in cursor.fetchall()
+            for name, usesuper, usecreatedb, usesysid in users
         ]
-        cursor.execute(
-            "SELECT groname, COALESCE(array_length(grolist, 1), 0) "
-            "FROM pg_group ORDER BY groname"
-        )
         rows.extend(
             RoleSummary(
                 name=groname,
@@ -571,9 +587,9 @@ class RedshiftDialect(RoleDialect):
                 create_db=False,
                 create_role=False,
                 member_of_count=0,
-                members_count=int(count or 0),
+                members_count=len(members),
             )
-            for groname, count in cursor.fetchall()
+            for groname, members in groups
         )
         return rows
 
