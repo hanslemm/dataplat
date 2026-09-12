@@ -7,6 +7,7 @@ are all exercised — that is the only way a markup regression can be caught.
 
 from __future__ import annotations
 
+import csv
 import json
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from dataplat.cli import _prompt
+from dataplat.cli import _credentials, _prompt
 from dataplat.cli.bi import superset as superset_cli
 from dataplat.core.errors import ExitCode
 
@@ -712,3 +713,135 @@ def test_user_delete_keeps_going_after_a_failed_id(
     assert result.exit_code == ExitCode.SERVICE
     assert "user 7:" in result.output
     assert "user 8:" in result.output
+
+
+# ---------------------------------------------------------------------------
+# users set-password
+# ---------------------------------------------------------------------------
+# Superset has no password reset in its own UI for an admin acting on someone
+# else, and `users update` here only moves groups -- so an account whose
+# password is lost had nowhere to go but delete-and-recreate.
+
+
+def _creds_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setattr(_credentials, "CREDENTIALS_DIR", tmp_path / "credentials")
+
+
+def test_set_password_puts_only_the_password_for_the_named_user(
+    api: FakeSuperset,
+) -> None:
+    """Everything else about the account must survive a password change."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "ada", "--password", "n3w"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated == [("7", {"password": "n3w"})]
+
+
+def test_set_password_matches_the_username_case_insensitively(
+    api: FakeSuperset,
+) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "ADA", "--password", "n3w"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated == [("7", {"password": "n3w"})]
+
+
+def test_set_password_rejects_an_unknown_username(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "nobody", "--password", "n3w"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "no Superset user" in result.output
+    assert api.updated == []
+
+
+def test_set_password_prompts_without_echo(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "ada"],
+        input="s3cret\ns3cret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated[0][1]["password"] == "s3cret"
+    assert "s3cret" not in result.output
+
+
+def test_generated_password_is_recorded_and_never_printed(
+    api: FakeSuperset, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The password reaches a 0600 file, not the scrollback of a shared screen."""
+    _creds_dir(monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "ada", "--generate-password"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    sent = api.updated[0][1]["password"]
+    assert len(sent) == 32
+    assert sent not in result.output
+
+    written = list((tmp_path / "credentials").glob("dp-superset-credentials-*.csv"))
+    assert len(written) == 1
+    rows = list(csv.reader(written[0].read_text().splitlines()))
+    assert rows[0] == ["username", "password", "created_at", "superset_url"]
+    assert rows[1][0] == "ada"
+    assert rows[1][1] == sent
+    assert rows[1][3] == "https://superset.test"
+    assert written[0].stat().st_mode & 0o077 == 0
+
+
+def test_set_password_rejects_a_password_next_to_generate(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "set-password", "ada", "--password", "n3w", "--generate-password"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "not both" in result.output
+    assert api.updated == []
+
+
+def test_user_create_can_generate_its_password(
+    api: FakeSuperset, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The same generator, so a new account never needs a password invented."""
+    _creds_dir(monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "users",
+            "create",
+            "--email",
+            "eva.germeshausen@betterdoc.de",
+            "-U",
+            "-G",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    sent = api.created[0]["password"]
+    assert len(sent) == 32
+    assert sent not in result.output
+
+    written = list((tmp_path / "credentials").glob("dp-superset-credentials-*.csv"))
+    rows = list(csv.reader(written[0].read_text().splitlines()))
+    assert rows[1][0] == "eva.germeshausen"
+    assert rows[1][1] == sent

@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- **`dp bi superset users set-password`.** Superset's own UI gives an admin no
+  way to reset someone else's password, and `users update` here only moves
+  groups — so an account whose password was lost had nowhere to go but
+  delete-and-recreate. The new command resolves the username
+  case-insensitively and sends only the password, so nothing else about the
+  account can be disturbed by the write.
+
+- **`--generate-password/-G` on `users create` and `users set-password`.**
+  Generates the same 32-character URL-safe password `dp db role create` uses
+  and writes it to a 0600 CSV under the shared credentials directory, with its
+  own `dp-superset-credentials-*` name and a `superset_url` column. It is never
+  printed: a terminal is scrolled back through and screen-shared, and a
+  password that reaches one has to be treated as disclosed.
+
 ### Changed
+
 
 - **Every service failure now reads the same way, with the server's reason
   attached.** Airbyte and Superset had grown the same HTTP plumbing twice over
