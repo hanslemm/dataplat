@@ -34,9 +34,12 @@ dp
 │       └── templates      # source | destination | connection
 ├── bi                     # business intelligence
 │   └── superset
-│       ├── users          # list | create | update | delete
+│       ├── users          # list | create | update | delete | set-password
 │       ├── roles          # list
 │       └── groups         # list
+├── people                 # access across every area at once
+│   ├── onboard            # create accounts everywhere, copying a colleague
+│   └── offboard           # disable everywhere; drops nothing
 ├── cloud                  # cloud providers
 │   └── aws
 │       ├── secrets        # list | get | compare | set | edit | rename-key
@@ -410,6 +413,8 @@ private key reaches docker through the process environment, never argv.
 | `<NAME>_REASSIGN_OWNER` | Default owner for `dp db role drop` ownership transfer. |
 | `AIRBYTE_BASE_URL` + `AIRBYTE_CLIENT_ID`/`AIRBYTE_CLIENT_SECRET` (cloud) or `AIRBYTE_EMAIL`/`AIRBYTE_PASSWORD` (OSS) | Airbyte API access. |
 | `SUPERSET_BASE_URL`, `SUPERSET_ADMIN_USERNAME`, `SUPERSET_ADMIN_PASSWORD` | Superset API access. |
+| `<NAME>_USERNAME_TEMPLATE` | Username convention for `dp people` on this target, e.g. `bd_{first_initial}{last}`. **A target without one gets no accounts** — which is how an SSO-managed warehouse opts out. |
+| `SUPERSET_USERNAME_TEMPLATE` | The same for Superset. Defaults to `{local}` (the email name), since that is what Superset usernames almost always are. |
 | `DP_AWS_PROFILE` | Default AWS profile for `dp cloud aws` commands. |
 | `DP_AWS_PROFILE_ALIASES` | Short aliases, e.g. `prod=AdminAccess-Prod,qa=AdminAccess-QA`. |
 | `DP_AWS_REGION` | Default AWS region (falls back to `AWS_REGION`, then the profile). |
@@ -680,6 +685,52 @@ All writes show their targets and confirm (or `--yes`).
 dp cloud aws rds metrics --json
 dp cloud aws rds plot -m cpu -m connections --hours 12
 dp cloud aws redshift metrics -w my-workgroup
+```
+
+### Onboarding and offboarding
+
+Access spans three systems, and each names the same person differently. The
+conventions live in your `.envrc`, one per target, so nothing about them is
+baked into the tool:
+
+```bash
+DATAOCEAN_USERNAME_TEMPLATE="bd_{first_initial}{last}"   # bd_egermeshausen
+BETTERDATA_USERNAME_TEMPLATE="{first_initial}_{last}"    # e_germeshausen
+# SUPERSET_USERNAME_TEMPLATE defaults to {local}         # eva.germeshausen
+```
+
+Grants are not configured anywhere: they are copied from a colleague who
+already has the right access, per area.
+
+```bash
+dp people onboard eva.germeshausen@betterdoc.de \
+    --like hans.lemm@betterdoc.de --dry-run
+```
+
+```text
+Onboarding eva.germeshausen@betterdoc.de copying hans.lemm@betterdoc.de
+
+  Area          Username            Copies                                  Status
+  dataocean     bd_egermeshausen    dataocean_analytics, pii_users, …       create
+  betterdata    e_germeshausen      pii_users, pnc_users, team_dna          create
+  superset      eva.germeshausen    Gamma, Viewer                           exists
+
+! superset: eva.germeshausen would receive Admin (13 of 252 accounts) — few
+  accounts here have it, so check it is intended.
+```
+
+Drop `--dry-run` to apply it. Each area gets its own generated password — three
+systems that can be compromised separately should not share a secret — and all
+of them are written to one `0600` file rather than printed.
+
+Offboarding is the same shape and **destroys nothing**: the Superset account is
+deactivated, warehouse logins are disabled and memberships revoked, and
+everything those accounts own keeps its owner. Removal stays with the commands
+that already do it properly — `dp db role drop` (which reassigns ownership) and
+`dp bi superset users delete`.
+
+```bash
+dp people offboard someone.leaving@betterdoc.de --dry-run
 ```
 
 ### Airbyte

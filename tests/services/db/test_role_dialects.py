@@ -600,3 +600,53 @@ def test_redshift_held_grants_bails_when_savepoints_are_unavailable() -> None:
     cursor = _NoSavepoints({"pg_group": [("legacy", "ana")]})
 
     assert RedshiftDialect().held_grants(cursor, ("legacy",)) == {("legacy", "ana")}
+
+
+# ---------------------------------------------------------------------------
+# Disabling access without destroying it
+# ---------------------------------------------------------------------------
+# Offboarding disables rather than drops: a dropped role takes the ownership of
+# everything it owned with it, and h_lemm alone owns 459 relations. These are
+# the two operations that turn access off and leave the objects alone.
+
+
+def test_postgres_disables_a_login_with_nologin() -> None:
+    op = PostgresDialect().disable_login("bd_hlemm")
+
+    assert "NOLOGIN" in op.statement.as_string(None)
+    assert "bd_hlemm" in op.description
+
+
+def test_redshift_disables_a_login_by_disabling_its_password() -> None:
+    """Redshift has no NOLOGIN for users; PASSWORD DISABLE is the equivalent."""
+    op = RedshiftDialect().disable_login("h_lemm")
+
+    statement = op.statement.as_string(None)
+    assert "PASSWORD DISABLE" in statement
+    assert "NOLOGIN" not in statement
+
+
+def test_postgres_revokes_a_membership() -> None:
+    op = PostgresDialect().revoke_membership("bd_hlemm", "team_dna", ParentKind.role)
+
+    statement = op.statement.as_string(None)
+    assert "REVOKE" in statement
+    assert "team_dna" in statement
+    assert "bd_hlemm" in statement
+
+
+def test_redshift_removes_a_user_from_a_legacy_group() -> None:
+    """The inverse of ALTER GROUP ... ADD USER, not a REVOKE."""
+    op = RedshiftDialect().revoke_membership("h_lemm", "pii_users", ParentKind.group)
+
+    statement = op.statement.as_string(None)
+    assert "ALTER GROUP" in statement
+    assert "DROP USER" in statement
+
+
+def test_redshift_revokes_an_rbac_role() -> None:
+    op = RedshiftDialect().revoke_membership("h_lemm", "analyst", ParentKind.role)
+
+    statement = op.statement.as_string(None)
+    assert "REVOKE ROLE" in statement
+    assert "analyst" in statement

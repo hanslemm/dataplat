@@ -18,6 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dataplat.cli import _credentials
+from dataplat.cli.people import offboard as offboard_cli
 from dataplat.cli.people import onboard as onboard_cli
 from dataplat.cli.people.app import app as people_app
 from dataplat.core.errors import ExitCode
@@ -59,6 +60,8 @@ SUPERSET_GROUPS = [{"id": 10, "name": "analysts"}]
 class FakeSuperset:
     def __init__(self) -> None:
         self.created: list[dict] = []
+        self.updated: list[tuple[str, dict]] = []
+        self.deleted: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path, method = request.url.path, request.method
@@ -79,6 +82,12 @@ class FakeSuperset:
         if method == "POST" and path.endswith("/security/users/"):
             self.created.append(json.loads(request.content))
             return httpx.Response(201, json={"id": 99})
+        if method == "PUT" and "/security/users/" in path:
+            self.updated.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
+            return httpx.Response(200, json={})
+        if method == "DELETE" and "/security/users/" in path:
+            self.deleted.append(path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={})
         raise AssertionError(f"unexpected request: {method} {path}")
 
 
@@ -172,7 +181,10 @@ def warehouses(monkeypatch: pytest.MonkeyPatch) -> dict[str, _Cursor]:
     def _session(params):
         yield _Conn(cursors[params.dbname])
 
+    # Both commands import the session funnel, so both are swapped: a test
+    # that patched one would silently dial a real warehouse from the other.
     monkeypatch.setattr(onboard_cli, "db_session", _session)
+    monkeypatch.setattr(offboard_cli, "db_session", _session)
     return cursors
 
 
@@ -446,3 +458,84 @@ def test_nothing_is_created_without_a_confirmation(
     assert result.exit_code != 0
     assert superset.created == []
     assert not (creds / "credentials").exists()
+
+
+# ---------------------------------------------------------------------------
+# offboard
+# ---------------------------------------------------------------------------
+# Disable, do not destroy. A dropped role takes the ownership of everything it
+# owned with it -- one real account owns 459 relations -- and no CLI summary
+# makes that recoverable.
+
+
+def _offboard(*args: str):
+    return runner.invoke(
+        people_app,
+        ["offboard", "hans.lemm@betterdoc.de", *args],
+        env=WIDE,
+    )
+
+
+def test_offboard_turns_every_account_off(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard("--yes")
+
+    assert result.exit_code == 0, result.output
+    assert any("NOLOGIN" in s for s in warehouses["dataocean"].statements)
+    assert any("PASSWORD DISABLE" in s for s in warehouses["betterdata"].statements)
+    assert superset.updated == [("7", {"active": False})]
+
+
+def test_offboard_revokes_the_memberships(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    _offboard("--yes")
+
+    revoked = " ".join(warehouses["dataocean"].statements)
+    assert "REVOKE" in revoked
+    assert "team_dna" in revoked
+
+
+def test_offboard_destroys_nothing(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    """The whole point of the default: everything it owns keeps its owner."""
+    _offboard("--yes")
+
+    assert superset.deleted == []
+    for cursor in warehouses.values():
+        assert not any("DROP ROLE" in s or "DROP USER" in s for s in cursor.statements)
+
+
+def test_offboard_dry_run_changes_nothing(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard("--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert superset.updated == []
+    for cursor in warehouses.values():
+        assert not any(
+            s.strip().upper().startswith(("ALTER", "REVOKE")) for s in cursor.statements
+        )
+
+
+def test_offboard_skips_an_area_the_person_is_not_on(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    warehouses["betterdata"]._users = {}
+
+    result = _offboard("--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert "no account here" in result.output
+
+
+def test_offboard_needs_a_confirmation(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard()
+
+    assert result.exit_code != 0
+    assert superset.updated == []

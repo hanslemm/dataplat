@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import typer
 
+from dataplat.cli.people.offboard import offboard
 from dataplat.cli.people.onboard import onboard
 
 app = typer.Typer(
@@ -24,3 +25,4 @@ def people() -> None:
 
 
 app.command("onboard")(onboard)
+app.command("offboard")(offboard)
