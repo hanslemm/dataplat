@@ -35,6 +35,21 @@ SUPERSET_USERS: list[dict[str, Any]] = [
         "groups": [{"id": 10, "name": "analysts"}],
     }
 ]
+# Eleven ordinary colleagues, because the rule is "few accounts have this" and
+# a fixture of three cannot express one in ten. Gamma is universal here, the
+# analysts group is a third of the company, and anything held by one account
+# out of twelve is what the warning exists for.
+SUPERSET_USERS.extend(
+    [
+        {
+            "id": 100 + n,
+            "username": f"colleague{n}",
+            "roles": [{"id": 2, "name": "Gamma"}],
+            "groups": [{"id": 10, "name": "analysts"}] if n < 3 else [],
+        }
+        for n in range(11)
+    ]
+)
 SUPERSET_ROLES = [{"id": 1, "name": "Admin"}, {"id": 2, "name": "Gamma"}]
 SUPERSET_GROUPS = [{"id": 10, "name": "analysts"}]
 
@@ -292,3 +307,32 @@ def test_an_email_that_cannot_fill_the_template_is_refused(
 
     assert result.exit_code == ExitCode.INVALID_INPUT
     assert "last" in result.output
+
+
+def test_a_grant_hardly_anyone_holds_is_flagged_with_its_count(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    """`--like` copies a privilege level, and nobody reads the Copies column."""
+    SUPERSET_USERS[0]["roles"] = [
+        {"id": 2, "name": "Gamma"},
+        {"id": 1, "name": "Admin"},
+    ]
+    try:
+        result = _onboard("--dry-run")
+    finally:
+        SUPERSET_USERS[0]["roles"] = [{"id": 2, "name": "Gamma"}]
+
+    assert result.exit_code == 0, result.output
+    assert "Admin (1 of 12 accounts)" in result.output
+    assert "check it is intended" in result.output
+
+
+def test_an_ordinary_grant_is_not_flagged(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    """A warning that fires on the normal case is one people learn to skip."""
+    result = _onboard("--dry-run", "--no-db")
+
+    assert result.exit_code == 0, result.output
+    assert "check it is intended" not in result.output
+    assert "check them is intended" not in result.output

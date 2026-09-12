@@ -16,8 +16,15 @@ from dataplat.services.db.role import (
     fetch_memberships_out,
     resolve_role,
 )
+from dataplat.services.db.role_dialects import dialect_for
 
-__all__ = ["db_memberships", "db_user_exists", "superset_access"]
+__all__ = [
+    "db_membership_holders",
+    "db_memberships",
+    "db_user_exists",
+    "superset_access",
+    "superset_membership_holders",
+]
 
 
 def db_memberships(cursor: Any, engine: SqlEngine, username: str) -> tuple[str, ...]:
@@ -85,3 +92,29 @@ def superset_access(
         if str(user.get("username", "")).lower() == username.lower():
             return _names(user.get("roles")), _names(user.get("groups"))
     return None
+
+
+def db_membership_holders(cursor: Any, engine: SqlEngine) -> tuple[dict[str, int], int]:
+    """How many accounts hold each role, and how many accounts there are.
+
+    Only used to notice that a copied grant is an unusual one, so the counts
+    need to be indicative rather than exact -- which is why one listing answers
+    it instead of a membership query per role.
+    """
+    rows = dialect_for(engine).list_roles(cursor)
+    holders = {row.name: row.members_count for row in rows if not row.can_login}
+    population = sum(1 for row in rows if row.can_login)
+    return holders, population
+
+
+def superset_membership_holders(
+    users: Iterable[dict],
+) -> tuple[dict[str, int], int]:
+    """The same counts for Superset, from the listing already in hand."""
+    holders: dict[str, int] = {}
+    population = 0
+    for user in users:
+        population += 1
+        for name in (*_names(user.get("roles")), *_names(user.get("groups"))):
+            holders[name] = holders.get(name, 0) + 1
+    return holders, population

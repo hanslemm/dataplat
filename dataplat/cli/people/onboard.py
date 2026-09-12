@@ -26,9 +26,11 @@ from dataplat.core.errors import (
 )
 from dataplat.services.db.targets import load_targets
 from dataplat.services.people.access import (
+    db_membership_holders,
     db_memberships,
     db_user_exists,
     superset_access,
+    superset_membership_holders,
 )
 from dataplat.services.people.identity import (
     PersonIdentity,
@@ -101,6 +103,7 @@ def _db_facts(target, identity: PersonIdentity, reference: PersonIdentity) -> Ar
             else ()
         )
         target_exists = db_user_exists(cursor, params.engine, new_username)
+        holders, population = db_membership_holders(cursor, params.engine)
 
     return AreaFacts(
         scope=target.name,
@@ -109,6 +112,8 @@ def _db_facts(target, identity: PersonIdentity, reference: PersonIdentity) -> Ar
         reference_exists=reference_exists,
         reference_memberships=memberships,
         target_exists=target_exists,
+        holders=holders,
+        population=population,
     )
 
 
@@ -126,6 +131,7 @@ def _superset_facts(identity: PersonIdentity, reference: PersonIdentity) -> Area
 
     access = superset_access(users, reference_username)
     target_exists = superset_access(users, new_username) is not None
+    holders, population = superset_membership_holders(users)
 
     return AreaFacts(
         scope=SUPERSET_SCOPE,
@@ -137,6 +143,8 @@ def _superset_facts(identity: PersonIdentity, reference: PersonIdentity) -> Area
             *(access[1] if access else ()),
         ),
         target_exists=target_exists,
+        holders=holders,
+        population=population,
     )
 
 
@@ -172,6 +180,25 @@ def render_plan(plan: OnboardPlan) -> None:
                 else "[green]create[/green]",
             )
         console.print(table)
+
+    # Copying a colleague copies their privilege level, and the person running
+    # this reads a username and a status -- not a membership list. Only for
+    # accounts that would actually be created: warning about an account nobody
+    # is touching is noise, and noise is how a warning stops being read.
+    for account in plan.to_create:
+        if not account.unusual:
+            continue
+        it = "it" if len(account.unusual) == 1 else "them"
+        rare = ", ".join(
+            f"{name} ({held} of {account.population} accounts)"
+            for name, held in account.unusual
+        )
+        console.print(
+            f"[yellow]![/yellow] {cell(account.scope)}: "
+            f"{cell(account.username)} would receive "
+            f"[yellow]{cell(rare)}[/yellow] — few accounts here have {it}, "
+            f"so check {it} is intended."
+        )
 
     for scope, why in plan.skipped:
         console.print(f"[dim]skipped {cell(scope)}: {cell(why)}[/dim]")
