@@ -85,6 +85,12 @@ BUILTIN_AREAS: tuple[AreaMount, ...] = (
         deps=AREAS["bi"],
     ),
     AreaMount(
+        name="people",
+        help_text="People (access across warehouses and BI)",
+        target="dataplat.cli.people.app:app",
+        deps=AREAS["people"],
+    ),
+    AreaMount(
         name="cloud",
         help_text="Cloud-provider tools (AWS)",
         target="dataplat.cli.cloud.app:app",

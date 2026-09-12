@@ -56,6 +56,15 @@ AREAS: dict[str, AreaDeps] = {
         modules=("httpx",),
         enabled_by=("SUPERSET_BASE_URL",),
     ),
+    "people": AreaDeps(
+        area="people",
+        extra="people",
+        # Both halves: onboarding is only interesting because it spans them.
+        modules=("psycopg", "httpx"),
+        # Either variable marks it enabled -- a company running only a
+        # warehouse, or only Superset, still onboards people into it.
+        enabled_by=("DP_TARGETS", "SUPERSET_BASE_URL"),
+    ),
     "cloud": AreaDeps(
         area="cloud",
         extra="cloud",
