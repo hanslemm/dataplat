@@ -4,6 +4,39 @@
 
 ### Added
 
+- **`dp people onboard` and `dp people offboard`** — one command for the access
+  that used to be four manual steps in three systems.
+
+  `dp people onboard eva.germeshausen@betterdoc.de --like hans.lemm@betterdoc.de`
+  creates an account on every configured warehouse target and in Superset,
+  copying the named colleague's memberships per area. Two things stay out of
+  the tool because they belong to the company: usernames come from a
+  `<PREFIX>_USERNAME_TEMPLATE` each target declares for itself (two warehouses
+  here use two different conventions), and grants are copied rather than
+  configured. A target that declares no template gets no accounts, which is how
+  an SSO-managed warehouse opts out.
+
+  `--dry-run` renders the whole cross-area plan first, which is the only time
+  the full intent is visible at once: three systems have no transaction between
+  them. Each area gets its own generated password, written to one `0600` file
+  and never printed, and a credential is recorded the instant its account
+  exists. A failure in one area never rolls back another; what succeeded is
+  kept and reported, and the exit code comes from the first failure.
+
+  Copying a colleague copies their privilege level, so a grant that few
+  accounts hold is flagged with its count — `Admin (13 of 252 accounts)`. The
+  first version of that rule asked whether *most* accounts lacked the grant;
+  measured against a real Superset, two roles out of forty were held by a
+  majority, so it fired on nearly everything. One in ten is where it stayed
+  worth reading.
+
+  `offboard` disables and revokes but drops nothing: a dropped role takes the
+  ownership of everything it owned with it, and one real account owns 459
+  relations. Removal stays with `dp db role drop` and
+  `dp bi superset users delete`, which handle it properly.
+
+### Added
+
 - **`dp bi superset users set-password`.** Superset's own UI gives an admin no
   way to reset someone else's password, and `users update` here only moves
   groups — so an account whose password was lost had nowhere to go but

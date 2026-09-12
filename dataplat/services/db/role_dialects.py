@@ -98,6 +98,19 @@ class RoleDialect(ABC):
         member_is_role: bool = False,
     ) -> SqlOp: ...
 
+    def disable_login(self, name: str) -> SqlOp:
+        """Turn an account off without destroying it.
+
+        Offboarding's default, and a dialect operation rather than one
+        statement because the engines disagree about what "cannot log in"
+        even means.
+        """
+        raise NotImplementedError
+
+    def revoke_membership(self, name: str, parent: str, kind: ParentKind) -> SqlOp:
+        """The inverse of :meth:`grant_membership`, and as engine-specific."""
+        raise NotImplementedError
+
     @abstractmethod
     def grant_role_to(
         self,
@@ -296,6 +309,23 @@ class PostgresDialect(RoleDialect):
             ),
         )
 
+    def disable_login(self, name: str) -> SqlOp:
+        return SqlOp(
+            description=f"ALTER ROLE {name} NOLOGIN",
+            statement=sql.SQL("ALTER ROLE {role} NOLOGIN").format(
+                role=sql.Identifier(name),
+            ),
+        )
+
+    def revoke_membership(self, name: str, parent: str, kind: ParentKind) -> SqlOp:
+        return SqlOp(
+            description=f"REVOKE {parent} FROM {name}",
+            statement=sql.SQL("REVOKE {parent} FROM {role}").format(
+                parent=sql.Identifier(parent),
+                role=sql.Identifier(name),
+            ),
+        )
+
     def grant_role_to(
         self,
         name: str,
@@ -413,6 +443,35 @@ class RedshiftDialect(RoleDialect):
             statement=sql.SQL("GRANT ROLE {r} TO {u}").format(
                 r=sql.Identifier(parent),
                 u=grantee,
+            ),
+        )
+
+    def disable_login(self, name: str) -> SqlOp:
+        # Redshift users have no NOLOGIN. Disabling the password is the
+        # documented equivalent, and leaves everything the user owns alone --
+        # which for one real account is 459 relations.
+        return SqlOp(
+            description=f"ALTER USER {name} PASSWORD DISABLE",
+            statement=sql.SQL("ALTER USER {user} PASSWORD DISABLE").format(
+                user=sql.Identifier(name),
+            ),
+        )
+
+    def revoke_membership(self, name: str, parent: str, kind: ParentKind) -> SqlOp:
+        if kind == ParentKind.group:
+            # The inverse of ALTER GROUP ... ADD USER, not a REVOKE.
+            return SqlOp(
+                description=f"ALTER GROUP {parent} DROP USER {name}",
+                statement=sql.SQL("ALTER GROUP {g} DROP USER {u}").format(
+                    g=sql.Identifier(parent),
+                    u=sql.Identifier(name),
+                ),
+            )
+        return SqlOp(
+            description=f"REVOKE ROLE {parent} FROM {name}",
+            statement=sql.SQL("REVOKE ROLE {r} FROM {u}").format(
+                r=sql.Identifier(parent),
+                u=sql.Identifier(name),
             ),
         )
 

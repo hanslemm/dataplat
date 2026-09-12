@@ -17,7 +17,16 @@ from dataclasses import dataclass, field
 
 from dataplat.services.people.identity import PersonIdentity, render_username
 
-__all__ = ["AreaAccount", "AreaFacts", "OnboardPlan", "build_onboard_plan"]
+__all__ = [
+    "AreaAccount",
+    "AreaFacts",
+    "OffboardAccount",
+    "OffboardFacts",
+    "OffboardPlan",
+    "OnboardPlan",
+    "build_offboard_plan",
+    "build_onboard_plan",
+]
 
 
 @dataclass(frozen=True)
@@ -151,4 +160,69 @@ def build_onboard_plan(
         reference=reference,
         accounts=tuple(accounts),
         skipped=tuple(skipped),
+    )
+
+
+@dataclass(frozen=True)
+class OffboardFacts:
+    """What one area answered about the person being offboarded."""
+
+    scope: str
+    template: str | None
+    username: str
+    exists: bool
+    memberships: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OffboardAccount:
+    """One account to turn off, and the memberships to take back."""
+
+    scope: str
+    username: str
+    memberships: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OffboardPlan:
+    identity: PersonIdentity
+    accounts: tuple[OffboardAccount, ...]
+    skipped: tuple[tuple[str, str], ...]
+
+    @property
+    def nothing_to_do(self) -> bool:
+        return not self.accounts
+
+
+def build_offboard_plan(
+    identity: PersonIdentity, facts: Iterable[OffboardFacts]
+) -> OffboardPlan:
+    """Turn per-area facts into the list of accounts to disable.
+
+    Same two skips as onboarding, for the same reason: an area that declares no
+    template has no accounts of ours on it, and an area the person was never on
+    has nothing to take away. Both are stated rather than passed over, because
+    "we did not touch that warehouse" is exactly what someone auditing an
+    offboarding needs to know.
+    """
+    accounts: list[OffboardAccount] = []
+    skipped: list[tuple[str, str]] = []
+
+    for fact in facts:
+        if fact.template is None:
+            skipped.append((fact.scope, "no username template configured"))
+            continue
+        if not fact.exists:
+            skipped.append((fact.scope, f"{identity.email} has no account here"))
+            continue
+        accounts.append(
+            OffboardAccount(
+                scope=fact.scope,
+                username=fact.username,
+                memberships=fact.memberships,
+            )
+        )
+
+    return OffboardPlan(
+        identity=identity, accounts=tuple(accounts), skipped=tuple(skipped)
     )
