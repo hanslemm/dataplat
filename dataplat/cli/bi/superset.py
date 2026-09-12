@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 
 import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._credentials import (
+    credentials_default_path,
+    file_mode_secure,
+    generate_password,
+    open_credentials_file,
+)
 from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import JsonOption, YesOption
 from dataplat.cli._prompt import confirm_or_exit
@@ -224,18 +233,138 @@ def _conflicting_user(
     return None
 
 
+def _user_named(users: Iterable[dict], username: str) -> dict | None:
+    """The user holding ``username``, matched the way Superset matches it."""
+    for user in users:
+        if str(user.get("username", "")).lower() == username.lower():
+            return user
+    return None
+
+
+def _password_or_prompt(password: str | None, generate: bool) -> tuple[str, bool]:
+    """The password to send, and whether this tool invented it.
+
+    Prompting is done here rather than by ``prompt=True`` on the option: an
+    option that prompts whenever it is missing would also prompt when
+    ``--generate-password`` has already answered the question.
+    """
+    if generate and password is not None:
+        raise ValidationError("Pass --password or --generate-password, not both.")
+    if generate:
+        return generate_password(), True
+    if password is not None:
+        return password, False
+    return typer.prompt("Password", hide_input=True, confirmation_prompt=True), False
+
+
+def _record_credential(username: str, password: str, base_url: str) -> Path:
+    """Write a generated password to a 0600 file and say where it went.
+
+    A generated password is never printed. It is read once, by whoever hands
+    the account over, from a file only they can read — a terminal is shared,
+    scrolled back through, and screen-shared, and a password that reached it
+    has to be treated as disclosed.
+    """
+    path = credentials_default_path(prefix="dp-superset-credentials")
+    creds_file, is_new = open_credentials_file(path)
+    try:
+        writer = csv.writer(creds_file)
+        if is_new:
+            writer.writerow(["username", "password", "created_at", "superset_url"])
+        writer.writerow(
+            [
+                username,
+                password,
+                datetime.now(UTC).isoformat(timespec="seconds"),
+                base_url,
+            ]
+        )
+        creds_file.flush()
+    finally:
+        creds_file.close()
+    return path
+
+
+def _report_credential(path: Path) -> None:
+    console.print(f"[dim]Password written to {esc(path)}[/dim]")
+    if not file_mode_secure(path):
+        console.print(
+            f"[yellow]![/yellow] [dim]{esc(path)} is readable by others; "
+            "chmod 600 it.[/dim]"
+        )
+
+
+@users_app.command("set-password")
+def set_user_password(
+    username: str = typer.Argument(..., help="Superset username whose password to set"),
+    password: str | None = typer.Option(
+        None,
+        "--password",
+        help="New password (omit to be prompted without echo).",
+    ),
+    generate: bool = typer.Option(
+        False,
+        "--generate-password",
+        "-G",
+        help=(
+            "Generate a strong password and write it to a 0600 file instead of "
+            "prompting. It is never printed."
+        ),
+    ),
+):
+    """Set an existing Superset user's password."""
+    base_url, admin_username, admin_password = _load_auth_context()
+
+    try:
+        new_password, generated = _password_or_prompt(password, generate)
+    except ValidationError as exc:
+        fail(exc, console=console)
+
+    try:
+        with build_client() as client:
+            access_token = _login(client, base_url, admin_username, admin_password)
+            user = _user_named(_iter_users(client, base_url, access_token), username)
+            if user is None:
+                raise ValidationError(f"There is no Superset user named {username!r}.")
+            user_id = user.get("id")
+            if not isinstance(user_id, int):
+                raise ServiceError(f"Superset user {username!r} has no usable id")
+            # Only the password: a PUT carrying fields it was not asked to
+            # change is a PUT that can undo someone else's edit.
+            _update_user(
+                client, base_url, access_token, user_id, {"password": new_password}
+            )
+    except (AuthError, ServiceError, ConfigError, ValidationError) as exc:
+        fail(exc, console=console)
+
+    console.print(
+        "[green]✓ Superset password updated[/green] "
+        f"[dim](username={esc(user.get('username'))}, id={esc(user_id)})[/dim]"
+    )
+    if generated:
+        _report_credential(
+            _record_credential(str(user.get("username")), new_password, base_url)
+        )
+
+
 @users_app.command("create")
 def create_user(
     username: str | None = typer.Argument(
         None, help="Superset username to create (omit it when passing -U)"
     ),
-    password: str = typer.Option(
-        ...,
+    password: str | None = typer.Option(
+        None,
         "--password",
         help="Password for the new user (omit to be prompted without echo).",
-        prompt=True,
-        hide_input=True,
-        confirmation_prompt=True,
+    ),
+    generate: bool = typer.Option(
+        False,
+        "--generate-password",
+        "-G",
+        help=(
+            "Generate a strong password and write it to a 0600 file instead of "
+            "prompting. It is never printed."
+        ),
     ),
     email: str = typer.Option(..., "--email", "-e", help="Email for the new user"),
     derive_username: bool = typer.Option(
@@ -279,6 +408,11 @@ def create_user(
         fail(exc, console=console)
 
     base_url, admin_username, admin_password = _load_auth_context()
+
+    try:
+        password, generated = _password_or_prompt(password, generate)
+    except ValidationError as exc:
+        fail(exc, console=console)
 
     resolved_email = email
     resolved_first_name = first_name or derived_first or resolved_username
@@ -326,6 +460,8 @@ def create_user(
         "[green]✓ Superset user created[/green] "
         f"[dim](username={esc(resolved_username)}, id={esc(user_id)})[/dim]"
     )
+    if generated:
+        _report_credential(_record_credential(resolved_username, password, base_url))
 
 
 @users_app.command("update")

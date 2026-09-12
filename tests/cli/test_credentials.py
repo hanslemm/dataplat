@@ -10,7 +10,7 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
-from dataplat.cli.db import _credentials
+from dataplat.cli import _credentials
 
 
 def test_credentials_default_path_is_not_the_working_directory(

@@ -28,6 +28,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dataplat.cli._credentials import (
+    credentials_default_path,
+    file_mode_secure,
+    generate_password,
+    open_credentials_file,
+)
 from dataplat.cli._exit import fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
@@ -46,11 +52,6 @@ from dataplat.cli.db._common import (
     engine_or_exit,
     resolve_params_or_exit,
 )
-from dataplat.cli.db._credentials import (
-    credentials_default_path,
-    file_mode_secure,
-    open_credentials_file,
-)
 from dataplat.core.errors import ValidationError
 from dataplat.services.db.capabilities import Capability, require_capability
 from dataplat.services.db.connection import SqlEngine
@@ -59,7 +60,6 @@ from dataplat.services.db.role_admin import (
     CreateRoleSpec,
     SqlOp,
     build_create_plan,
-    generate_password,
     list_databases,
     parse_csv_flag,
 )

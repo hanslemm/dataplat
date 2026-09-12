@@ -35,6 +35,12 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from dataplat.cli._credentials import (
+    credentials_default_path,
+    file_mode_secure,
+    generate_password,
+    open_credentials_file,
+)
 from dataplat.cli._exit import fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
@@ -54,11 +60,6 @@ from dataplat.cli.db._common import (
     engine_or_exit,
     resolve_params_or_exit,
 )
-from dataplat.cli.db._credentials import (
-    credentials_default_path,
-    file_mode_secure,
-    open_credentials_file,
-)
 from dataplat.cli.db._grantees import (  # noqa: F401  (re-export)
     GranteeKind,
     parent_kind_for,
@@ -69,7 +70,6 @@ from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role_admin import (
     GrantPlan,
     build_grant_plan,
-    generate_password,
     parse_csv_flag,
     resolve_grantee_kinds,
 )

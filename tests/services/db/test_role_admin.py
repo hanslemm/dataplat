@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+from dataplat.cli._credentials import generate_password
 from dataplat.services.db.role_admin import (
     CreateRoleSpec,
     MissingReassignOwnerError,
     build_create_plan,
     build_drop_plan,
-    generate_password,
     list_roles,
     parse_csv_flag,
     resolve_reassign_owner,

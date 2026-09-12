@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, LiteralString
 
 import pytest
 
+from dataplat.cli._credentials import generate_password
 from dataplat.core.errors import ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.role import (
@@ -52,7 +53,6 @@ from dataplat.services.db.role_admin import (
     build_create_plan,
     build_drop_plan,
     build_grant_plan,
-    generate_password,
     list_databases,
     list_roles,
     resolve_grantee_kinds,

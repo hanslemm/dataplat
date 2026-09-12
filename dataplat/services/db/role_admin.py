@@ -13,7 +13,6 @@ Two scopes per plan:
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -90,23 +89,6 @@ class DropPlan:
     pre_cluster_ops: list[SqlOp] = field(default_factory=list)
     per_database_ops: dict[str, list[SqlOp]] = field(default_factory=dict)
     cluster_ops: list[SqlOp] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Password
-# ---------------------------------------------------------------------------
-
-
-def generate_password(length: int = 32) -> str:
-    """Return a URL-safe random password.
-
-    ``secrets.token_urlsafe`` returns ~1.3 chars per byte; we slice to the
-    requested length so the output is predictable for output formatting.
-    """
-    if length < 16:
-        raise ValueError("password length must be >= 16")
-    raw = secrets.token_urlsafe(length)
-    return raw[:length]
 
 
 # ---------------------------------------------------------------------------
