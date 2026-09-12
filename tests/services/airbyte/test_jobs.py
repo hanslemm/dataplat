@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -12,35 +10,11 @@ from dataplat.services.airbyte.jobs import (
     list_jobs,
     trigger_job,
 )
-
-
-class _FakeResponse:
-    @property
-    def reason_phrase(self) -> str:
-        # Derived from httpx's own table rather than stored: this class stands in
-        # for an httpx.Response, and an attribute it invents by hand is one that
-        # can drift from the real thing.
-        return httpx.codes.get_reason_phrase(self.status_code)
-
-    def __init__(self, data, status_code=200):
-        self.status_code = status_code
-        self._data = data
-        self.text = json.dumps(data) if data is not None else ""
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "error",
-                request=httpx.Request("GET", "http://test"),
-                response=self,
-            )
-
-    def json(self):
-        return self._data
+from tests._responses import response
 
 
 class _FakeClient:
-    def __init__(self, response: _FakeResponse):
+    def __init__(self, response: httpx.Response):
         self._response = response
         self.calls: list[tuple[str, str, dict]] = []
 
@@ -58,7 +32,7 @@ class _FakeClient:
 
 
 def test_list_jobs_passes_filters() -> None:
-    client = _FakeClient(_FakeResponse({"data": [{"jobId": 1}]}))
+    client = _FakeClient(response({"data": [{"jobId": 1}]}))
 
     jobs = list_jobs(
         client,  # type: ignore[arg-type]
@@ -79,7 +53,7 @@ def test_list_jobs_passes_filters() -> None:
 
 
 def test_get_job() -> None:
-    client = _FakeClient(_FakeResponse({"jobId": 7, "status": "running"}))
+    client = _FakeClient(response({"jobId": 7, "status": "running"}))
 
     job = get_job(client, "http://ab", "7")  # type: ignore[arg-type]
 
@@ -88,7 +62,7 @@ def test_get_job() -> None:
 
 
 def test_cancel_job_uses_delete() -> None:
-    client = _FakeClient(_FakeResponse({"jobId": 7, "status": "cancelled"}))
+    client = _FakeClient(response({"jobId": 7, "status": "cancelled"}))
 
     cancel_job(client, "http://ab", "7")  # type: ignore[arg-type]
 
@@ -96,7 +70,7 @@ def test_cancel_job_uses_delete() -> None:
 
 
 def test_trigger_job_posts_job_type() -> None:
-    client = _FakeClient(_FakeResponse({"jobId": 9}))
+    client = _FakeClient(response({"jobId": 9}))
 
     trigger_job(client, "http://ab", "c1", "reset")  # type: ignore[arg-type]
 
@@ -106,7 +80,7 @@ def test_trigger_job_posts_job_type() -> None:
 
 
 def test_error_raises_service_error() -> None:
-    client = _FakeClient(_FakeResponse({"message": "boom"}, status_code=500))
+    client = _FakeClient(response({"message": "boom"}, status_code=500))
 
     with pytest.raises(ServiceError, match="list jobs"):
         list_jobs(client, "http://ab")  # type: ignore[arg-type]

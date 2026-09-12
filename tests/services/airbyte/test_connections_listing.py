@@ -13,8 +13,6 @@ proxy answering HTML, and a body that is neither.
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -25,54 +23,13 @@ from dataplat.services.airbyte.connections import (
     list_connections,
     patch_connection,
 )
-
-
-class _FakeResponse:
-    @property
-    def reason_phrase(self) -> str:
-        # Derived from httpx's own table rather than stored: this class stands in
-        # for an httpx.Response, and an attribute it invents by hand is one that
-        # can drift from the real thing.
-        return httpx.codes.get_reason_phrase(self.status_code)
-
-    def __init__(
-        self,
-        data=None,
-        status_code=200,
-        *,
-        text=None,
-        headers=None,
-        bad_json=False,
-    ):
-        self.status_code = status_code
-        self._data = data
-        self._bad_json = bad_json
-        self.headers = {"content-type": "application/json", **(headers or {})}
-        self.text = text if text is not None else json.dumps(data or {})
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "error",
-                request=httpx.Request("GET", "http://test"),
-                response=self,  # type: ignore[arg-type]
-            )
-
-    def json(self):
-        if self._bad_json:
-            raise ValueError("not json")
-        if self._data is None:
-            # A real Response parses its body, and a body that is not JSON
-            # raises rather than yielding None. Returning None here would hide
-            # an error body from anything that reads the parsed payload first.
-            return json.loads(self.text)
-        return self._data
+from tests._responses import response
 
 
 class _FakeClient:
     """Returns each queued response once, then repeats the last."""
 
-    def __init__(self, *responses: _FakeResponse):
+    def __init__(self, *responses: httpx.Response):
         self._responses = list(responses)
         self.calls: list[tuple[str, str, dict | None]] = []
 
@@ -90,8 +47,8 @@ class _FakeClient:
         return self._next()
 
 
-def _page(*ids: str) -> _FakeResponse:
-    return _FakeResponse({"data": [{"connectionId": i} for i in ids]})
+def _page(*ids: str) -> httpx.Response:
+    return response({"data": [{"connectionId": i} for i in ids]})
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +57,7 @@ def _page(*ids: str) -> _FakeResponse:
 
 
 def test_pages_until_the_server_runs_out() -> None:
-    client = _FakeClient(_page("a", "b"), _page("c"), _FakeResponse({"data": []}))
+    client = _FakeClient(_page("a", "b"), _page("c"), response({"data": []}))
 
     found = [c["connectionId"] for c in list_connections(client, "http://ab", limit=2)]  # type: ignore[arg-type]
 
@@ -109,7 +66,7 @@ def test_pages_until_the_server_runs_out() -> None:
 
 def test_the_offset_advances_by_the_page_size() -> None:
     """A fixed offset would re-request page one forever."""
-    client = _FakeClient(_page("a"), _page("b"), _FakeResponse({"data": []}))
+    client = _FakeClient(_page("a"), _page("b"), response({"data": []}))
 
     list(list_connections(client, "http://ab", limit=1))  # type: ignore[arg-type]
 
@@ -118,7 +75,7 @@ def test_the_offset_advances_by_the_page_size() -> None:
 
 
 def test_deleted_connections_are_excluded_by_the_request() -> None:
-    client = _FakeClient(_FakeResponse({"data": []}))
+    client = _FakeClient(response({"data": []}))
 
     list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
 
@@ -126,7 +83,7 @@ def test_deleted_connections_are_excluded_by_the_request() -> None:
 
 
 def test_an_empty_first_page_yields_nothing_and_stops() -> None:
-    client = _FakeClient(_FakeResponse({"data": []}))
+    client = _FakeClient(response({"data": []}))
 
     assert list(list_connections(client, "http://ab")) == []  # type: ignore[arg-type]
     assert len(client.calls) == 1
@@ -134,7 +91,7 @@ def test_an_empty_first_page_yields_nothing_and_stops() -> None:
 
 @pytest.mark.parametrize("payload", [{}, {"data": None}, {"other": []}])
 def test_a_payload_without_data_stops_paging(payload) -> None:
-    client = _FakeClient(_FakeResponse(payload))
+    client = _FakeClient(response(payload))
 
     assert list(list_connections(client, "http://ab")) == []  # type: ignore[arg-type]
 
@@ -152,7 +109,7 @@ def test_a_gateway_redirect_is_named_rather_than_followed(status: int) -> None:
     proxy setting and neither is guessable from "unexpected response".
     """
     client = _FakeClient(
-        _FakeResponse(status_code=status, headers={"location": "https://sso/login"})
+        response(status_code=status, headers={"location": "https://sso/login"})
     )
 
     with pytest.raises(ServiceError) as exc:
@@ -163,7 +120,7 @@ def test_a_gateway_redirect_is_named_rather_than_followed(status: int) -> None:
 
 
 def test_a_redirect_without_a_location_still_reports_the_status() -> None:
-    client = _FakeClient(_FakeResponse(status_code=302, headers={"location": ""}))
+    client = _FakeClient(response(status_code=302, headers={"location": ""}))
 
     with pytest.raises(ServiceError, match="location=unknown"):
         list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
@@ -172,7 +129,7 @@ def test_a_redirect_without_a_location_still_reports_the_status() -> None:
 def test_an_html_body_is_refused_before_it_is_parsed() -> None:
     """A proxy's login page is valid HTTP 200 and not a connection listing."""
     client = _FakeClient(
-        _FakeResponse(
+        response(
             text="<html>Sign in</html>",
             headers={"content-type": "text/html; charset=utf-8"},
         )
@@ -186,7 +143,7 @@ def test_an_html_body_is_refused_before_it_is_parsed() -> None:
 
 
 def test_a_missing_content_type_is_reported_as_unknown() -> None:
-    client = _FakeClient(_FakeResponse(text="junk", headers={"content-type": ""}))
+    client = _FakeClient(response(text="junk", headers={"content-type": ""}))
 
     with pytest.raises(ServiceError, match="content-type=unknown"):
         list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
@@ -195,7 +152,7 @@ def test_a_missing_content_type_is_reported_as_unknown() -> None:
 def test_json_content_type_with_a_charset_is_accepted() -> None:
     """`application/json; charset=utf-8` is the common spelling and must pass."""
     client = _FakeClient(
-        _FakeResponse(
+        response(
             {"data": []}, headers={"content-type": "application/json; charset=utf-8"}
         )
     )
@@ -204,7 +161,14 @@ def test_json_content_type_with_a_charset_is_accepted() -> None:
 
 
 def test_a_body_that_is_not_json_after_all_is_reported() -> None:
-    client = _FakeClient(_FakeResponse(bad_json=True, text="garbage"))
+    # The header has to be said out loud now: a real response carrying plain
+    # text announces text/plain, and the code checks the content type before it
+    # tries to parse. The scenario this test is about -- a body that *claims*
+    # JSON and is not -- is only reachable by claiming it, which the old fake
+    # did silently for every response it ever returned.
+    client = _FakeClient(
+        response(text="garbage", headers={"content-type": "application/json"})
+    )
 
     with pytest.raises(ServiceError) as exc:
         list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
@@ -214,7 +178,7 @@ def test_a_body_that_is_not_json_after_all_is_reported() -> None:
 
 
 def test_an_http_error_names_the_status() -> None:
-    client = _FakeClient(_FakeResponse(status_code=401, text="unauthorized"))
+    client = _FakeClient(response(status_code=401, text="unauthorized"))
 
     with pytest.raises(ServiceError) as exc:
         list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
@@ -230,14 +194,14 @@ def test_an_http_error_names_the_status() -> None:
 
 
 def test_get_connection_addresses_the_connection_by_id() -> None:
-    client = _FakeClient(_FakeResponse({"connectionId": "c1"}))
+    client = _FakeClient(response({"connectionId": "c1"}))
 
     assert get_connection(client, "http://ab", "c1")["connectionId"] == "c1"  # type: ignore[arg-type]
     assert client.calls[0][1] == "http://ab/api/public/v1/connections/c1"
 
 
 def test_get_connection_reports_a_missing_connection() -> None:
-    client = _FakeClient(_FakeResponse(status_code=404, text="not found"))
+    client = _FakeClient(response(status_code=404, text="not found"))
 
     with pytest.raises(ServiceError) as exc:
         get_connection(client, "http://ab", "gone")  # type: ignore[arg-type]
@@ -246,7 +210,7 @@ def test_get_connection_reports_a_missing_connection() -> None:
 
 
 def test_patch_sends_only_the_updates_it_was_given() -> None:
-    client = _FakeClient(_FakeResponse({"connectionId": "c1"}))
+    client = _FakeClient(response({"connectionId": "c1"}))
 
     patch_connection(client, "http://ab", "c1", {"name": "new"})  # type: ignore[arg-type]
 
@@ -257,7 +221,7 @@ def test_patch_sends_only_the_updates_it_was_given() -> None:
 
 
 def test_patch_reports_a_rejected_update() -> None:
-    client = _FakeClient(_FakeResponse(status_code=422, text="bad cron"))
+    client = _FakeClient(response(status_code=422, text="bad cron"))
 
     with pytest.raises(ServiceError) as exc:
         patch_connection(client, "http://ab", "c1", {"schedule": "nonsense"})  # type: ignore[arg-type]
@@ -268,7 +232,7 @@ def test_patch_reports_a_rejected_update() -> None:
 
 
 def test_patch_reports_an_empty_error_body_as_a_bare_status() -> None:
-    client = _FakeClient(_FakeResponse(status_code=500, text=""))
+    client = _FakeClient(response(status_code=500, text=""))
 
     with pytest.raises(ServiceError) as exc:
         patch_connection(client, "http://ab", "c1", {})  # type: ignore[arg-type]

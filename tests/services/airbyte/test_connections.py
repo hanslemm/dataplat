@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -13,33 +11,10 @@ from dataplat.services.airbyte.connections import (
     get_connection_state,
     update_connection_state,
 )
+from tests._responses import response
 
 
 def _mock_client(response_data, status_code=200):
-    class FakeResponse:
-        @property
-        def reason_phrase(self) -> str:
-            # Derived from httpx's own table rather than stored: this class stands in
-            # for an httpx.Response, and an attribute it invents by hand is one that
-            # can drift from the real thing.
-            return httpx.codes.get_reason_phrase(self.status_code)
-
-        def __init__(self, data, code):
-            self.status_code = code
-            self._data = data
-            self.text = json.dumps(data) if data is not None else ""
-            self.headers = {"content-type": "application/json"}
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise httpx.HTTPStatusError(
-                    "error",
-                    request=httpx.Request("GET", "http://test"),
-                    response=self,
-                )
-
-        def json(self):
-            return self._data
 
     class FakeClient:
         def __init__(self):
@@ -54,22 +29,22 @@ def _mock_client(response_data, status_code=200):
             self._get_call_count += 1
             # Return empty data on subsequent calls to terminate pagination
             if self._get_call_count > 1:
-                return FakeResponse({"data": []}, 200)
-            return FakeResponse(response_data, status_code)
+                return response({"data": []}, 200)
+            return response(response_data, status_code)
 
         def post(self, url, **kwargs):
             self.last_url = url
             self.last_json = kwargs.get("json")
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
         def patch(self, url, **kwargs):
             self.last_url = url
             self.last_json = kwargs.get("json")
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
         def delete(self, url, **kwargs):
             self.last_url = url
-            return FakeResponse(response_data, status_code)
+            return response(response_data, status_code)
 
     return FakeClient()
 
@@ -138,33 +113,8 @@ def test_delete_connection_error():
 # Tests for get_connection_state and update_connection_state
 
 
-class _FakeResponse:
-    @property
-    def reason_phrase(self) -> str:
-        # Derived from httpx's own table rather than stored: this class stands in
-        # for an httpx.Response, and an attribute it invents by hand is one that
-        # can drift from the real thing.
-        return httpx.codes.get_reason_phrase(self.status_code)
-
-    def __init__(self, data, status_code=200):
-        self.status_code = status_code
-        self._data = data
-        self.text = json.dumps(data) if data is not None else ""
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "error",
-                request=httpx.Request("POST", "http://test"),
-                response=self,
-            )
-
-    def json(self):
-        return self._data
-
-
 class _FakeClient:
-    def __init__(self, response: _FakeResponse):
+    def __init__(self, response: httpx.Response):
         self._response = response
         self.calls: list[tuple[str, str, dict]] = []
 
@@ -175,7 +125,7 @@ class _FakeClient:
 
 def test_get_connection_state_posts_connection_id() -> None:
     state = {"connectionId": "c1", "stateType": "stream", "streamState": []}
-    client = _FakeClient(_FakeResponse(state))
+    client = _FakeClient(response(state))
 
     result = get_connection_state(client, "http://ab", "c1")  # type: ignore[arg-type]
 
@@ -188,7 +138,7 @@ def test_get_connection_state_posts_connection_id() -> None:
 
 def test_update_connection_state_wraps_payload() -> None:
     new_state = {"connectionId": "c1", "stateType": "stream", "streamState": []}
-    client = _FakeClient(_FakeResponse({"ok": True}))
+    client = _FakeClient(response({"ok": True}))
 
     update_connection_state(client, "http://ab", "c1", new_state)  # type: ignore[arg-type]
 
@@ -198,14 +148,14 @@ def test_update_connection_state_wraps_payload() -> None:
 
 
 def test_get_connection_state_error_raises() -> None:
-    client = _FakeClient(_FakeResponse({"message": "boom"}, status_code=500))
+    client = _FakeClient(response({"message": "boom"}, status_code=500))
 
     with pytest.raises(ServiceError, match="connection state"):
         get_connection_state(client, "http://ab", "c1")  # type: ignore[arg-type]
 
 
 def test_update_connection_state_error_raises() -> None:
-    client = _FakeClient(_FakeResponse({"message": "boom"}, status_code=500))
+    client = _FakeClient(response({"message": "boom"}, status_code=500))
 
     with pytest.raises(ServiceError, match="connection state"):
         update_connection_state(  # type: ignore[arg-type]
