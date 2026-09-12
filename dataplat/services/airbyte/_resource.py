@@ -10,17 +10,7 @@ from collections.abc import Iterator
 
 import httpx
 
-from dataplat.core.errors import ServiceError
-
-
-def _raise_for_status(response: httpx.Response, action: str) -> None:
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            f"Failed to {action} (status={response.status_code}, body={snippet})"
-        ) from exc
+from dataplat.services._http import raise_for_status
 
 
 def list_resources(
@@ -46,7 +36,7 @@ def list_resources(
             f"{base_url}/api/public/v1/{resource}",
             params=params,
         )
-        _raise_for_status(response, f"list {resource}")
+        raise_for_status(response, f"list {resource}")
 
         payload = response.json() or {}
         data = payload.get("data") or []
@@ -61,7 +51,7 @@ def get_resource(
 ) -> dict:
     """GET /api/public/v1/{resource}/{id}"""
     response = client.get(f"{base_url}/api/public/v1/{resource}/{resource_id}")
-    _raise_for_status(response, f"get {resource[:-1]}")
+    raise_for_status(response, f"get {resource[:-1]}")
     return response.json()
 
 
@@ -84,7 +74,7 @@ def create_resource(
             "configuration": configuration,
         },
     )
-    _raise_for_status(response, f"create {resource[:-1]}")
+    raise_for_status(response, f"create {resource[:-1]}")
     return response.json()
 
 
@@ -100,7 +90,7 @@ def update_resource(
         f"{base_url}/api/public/v1/{resource}/{resource_id}",
         json=updates,
     )
-    _raise_for_status(response, f"update {resource[:-1]}")
+    raise_for_status(response, f"update {resource[:-1]}")
     return response.json()
 
 
@@ -110,4 +100,4 @@ def delete_resource(
     """DELETE /api/public/v1/{resource}/{id}, expect 204"""
     response = client.delete(f"{base_url}/api/public/v1/{resource}/{resource_id}")
     if response.status_code != 204:
-        _raise_for_status(response, f"delete {resource[:-1]}")
+        raise_for_status(response, f"delete {resource[:-1]}")

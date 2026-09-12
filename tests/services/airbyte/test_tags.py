@@ -32,6 +32,13 @@ from dataplat.services.airbyte.tags import (
 
 
 class _FakeResponse:
+    @property
+    def reason_phrase(self) -> str:
+        # Derived from httpx's own table rather than stored: this class stands in
+        # for an httpx.Response, and an attribute it invents by hand is one that
+        # can drift from the real thing.
+        return httpx.codes.get_reason_phrase(self.status_code)
+
     def __init__(self, data, status_code=200, *, text=None, bad_json=False):
         self.status_code = status_code
         self._data = data
@@ -49,6 +56,11 @@ class _FakeResponse:
     def json(self):
         if self._bad_json:
             raise ValueError("not json")
+        if self._data is None:
+            # A real Response parses its body, and a body that is not JSON
+            # raises rather than yielding None. Returning None here would hide
+            # an error body from anything that reads the parsed payload first.
+            return json.loads(self.text)
         return self._data
 
 
@@ -163,15 +175,17 @@ def test_a_http_error_names_the_status_and_quotes_the_body() -> None:
     with pytest.raises(ServiceError) as exc:
         list_tags(client, "http://ab")  # type: ignore[arg-type]
 
-    assert "status=403" in str(exc.value)
-    assert "forbidden" in str(exc.value)
+    assert str(exc.value) == "Failed to list tags (403 Forbidden): forbidden"
 
 
-def test_an_empty_error_body_says_so_rather_than_showing_nothing() -> None:
+def test_an_empty_error_body_leaves_the_status_line_to_speak() -> None:
+    """Nothing to add, so nothing is appended -- no dangling separator."""
     client = _FakeClient(_FakeResponse(None, status_code=500, text="   "))
 
-    with pytest.raises(ServiceError, match="body=empty"):
+    with pytest.raises(ServiceError) as exc:
         list_tags(client, "http://ab")  # type: ignore[arg-type]
+
+    assert str(exc.value) == "Failed to list tags (500 Internal Server Error)"
 
 
 def test_a_long_error_body_is_truncated() -> None:
@@ -226,7 +240,9 @@ def test_create_tag_reports_a_rejected_creation() -> None:
     with pytest.raises(ServiceError) as exc:
         create_tag(client, "http://ab", "prod")  # type: ignore[arg-type]
 
-    assert "status=422" in str(exc.value)
+    assert str(exc.value) == (
+        "Failed to create tag (422 Unprocessable Entity): duplicate name"
+    )
     assert "duplicate name" in str(exc.value)
 
 
@@ -309,9 +325,18 @@ def test_a_listing_that_omits_the_workspace_recreates_a_tag_that_exists() -> Non
     spellings and falls back to None — the two keys never meet, and a tag that
     already exists is created again.
 
-    Pinned, not fixed. Making the lookup fall back to the None-keyed entry would
-    reuse a tag across workspaces, which is worse and just as unverifiable
-    without an Airbyte to ask. See the note at the top of this module.
+    Pinned, not fixed — and now with the evidence that says why it can stay
+    pinned. Probed against the production Airbyte on 2026-09-12: all 27 tags
+    came back carrying ``workspaceId``, the key set being exactly
+    ``{tagId, name, color, workspaceId}``, and no two tags shared a name. So
+    this branch is defensive, not live, and the duplicate it would create is
+    unreachable there.
+
+    Making the lookup fall back to the None-keyed entry would reuse a tag
+    across workspaces, which is worse than creating a duplicate and stays
+    unverifiable: the fallback only ever runs on a listing this Airbyte does
+    not produce. If a future version drops the field, this test is what will
+    say so.
     """
     client = _FakeClient(
         _FakeResponse({"data": [{"id": "t1", "name": "prod"}]}),

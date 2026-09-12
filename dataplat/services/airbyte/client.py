@@ -5,66 +5,16 @@ from __future__ import annotations
 import base64
 import os
 import time
-from collections.abc import Callable
 from zoneinfo import ZoneInfo
 
 import httpx
 from croniter import croniter
 
 from dataplat.core.errors import AuthError, ConfigError
-from dataplat.core.trace import CATEGORY_HTTP, is_enabled, trace, trace_http
+from dataplat.core.trace import CATEGORY_HTTP, trace
+from dataplat.services._http import build_client, error_detail
 
 _TOKEN_CACHE: dict[str, str | float | None] = {"token": None, "expires_at": 0.0}
-
-# --- request tracing --------------------------------------------------------
-# Wired into the one place this area builds a client, as httpx event hooks,
-# rather than around each call: the hooks see every request — the token
-# exchange below included — and no call site has to remember anything. They
-# also cannot leak the Authorization header, because they never look at headers.
-#
-# `dataplat.services.superset.client` carries a twin of this. Two copies is one
-# too many; they belong in a shared HTTP seam that does not exist yet, and a
-# third service is the point at which it should.
-
-# perf_counter at request time, stashed on the Request so the response hook can
-# report a duration. httpx's own `response.elapsed` cannot serve: it is set when
-# the body is read, which happens *after* the response hooks run, and under
-# httpx.MockTransport it is never set at all.
-_TRACE_STARTED = "_dp_trace_started"
-
-
-def _trace_hooks() -> dict[str, list[Callable[..., None]]]:
-    """Event hooks that trace method, URL, status and duration to stderr.
-
-    Two lines per request, not the single combined line
-    :func:`~dataplat.core.trace.trace_http` also supports, because httpx has no
-    hook for a *failed* send: a connect error, a TLS refusal or a hang would
-    otherwise trace nothing at all, and those are exactly the failures someone
-    turns ``--verbose`` on for. The pre-flight line is the record that the
-    request was attempted; a line without its ``-> status`` partner is the
-    signal.
-    """
-
-    def on_request(request: httpx.Request) -> None:
-        if not is_enabled():
-            return
-        setattr(request, _TRACE_STARTED, time.perf_counter())
-        trace_http(request.method, str(request.url))
-
-    def on_response(response: httpx.Response) -> None:
-        if not is_enabled():
-            return
-        started = getattr(response.request, _TRACE_STARTED, None)
-        trace_http(
-            response.request.method,
-            str(response.request.url),
-            status=response.status_code,
-            elapsed_ms=None
-            if started is None
-            else (time.perf_counter() - started) * 1000,
-        )
-
-    return {"request": [on_request], "response": [on_response]}
 
 
 def parse_jwt_exp(token: str) -> int | None:
@@ -186,9 +136,10 @@ def get_access_token(
         )
         return token
     except httpx.HTTPStatusError as exc:
+        detail = error_detail(exc.response)
         raise AuthError(
             f"Failed to get access token: {exc.response.status_code} "
-            f"{exc.response.reason_phrase}"
+            f"{exc.response.reason_phrase}" + (f": {detail}" if detail else "")
         ) from exc
     except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
         raise AuthError(f"Failed to connect to Airbyte token endpoint: {exc}") from exc
@@ -222,9 +173,10 @@ def login_airbyte_oss(
         )
         return token
     except httpx.HTTPStatusError as exc:
+        detail = error_detail(exc.response)
         raise AuthError(
             f"Failed to login to Airbyte OSS: {exc.response.status_code} "
-            f"{exc.response.reason_phrase}"
+            f"{exc.response.reason_phrase}" + (f": {detail}" if detail else "")
         ) from exc
     except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
         raise AuthError(
@@ -273,11 +225,10 @@ def build_authenticated_client() -> tuple[httpx.Client, str]:
 
     # Default timeout guards every request (several endpoints used to pass no
     # timeout and could hang forever); transport retries cover connect blips.
-    client = httpx.Client(
+    client = build_client(
         follow_redirects=False,
         timeout=httpx.Timeout(60.0),
         transport=httpx.HTTPTransport(retries=2),
-        event_hooks=_trace_hooks(),
     )
     use_cloud = bool(client_id and client_secret)
 

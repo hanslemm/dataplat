@@ -79,11 +79,8 @@ def test_build_client_wires_the_trace_hooks() -> None:
 def _traced_client(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> httpx.Client:
-    """A client with the real hooks and a transport the test controls."""
-    return httpx.Client(
-        transport=httpx.MockTransport(handler),
-        event_hooks=client._trace_hooks(),
-    )
+    """A client from the real factory, with a transport the test controls."""
+    return client.build_client(transport=httpx.MockTransport(handler))
 
 
 def _login_handler(request: httpx.Request) -> httpx.Response:
@@ -145,9 +142,11 @@ def test_traces_nothing_when_not_enabled(
 
 
 # --- error detail ---------------------------------------------------------
-# Superset answers a rejected write with the reason in the body; a status line
-# alone ("422 Unprocessable Entity") is not diagnosable by the person who ran
-# the command, which is the only audience these errors have.
+# How a detail line is built is the shared seam's subject, and is tested in
+# tests/services/test_http.py. What matters here is that every Superset call
+# site goes through it: a status line alone ("422 Unprocessable Entity") is not
+# diagnosable by the person who ran the command, which is the only audience
+# these errors have.
 
 
 def _failing(status: int, reason: bytes, **body: object) -> Callable:
@@ -160,80 +159,6 @@ def _failing(status: int, reason: bytes, **body: object) -> Callable:
         )
 
     return handler
-
-
-def _call_create(handler: Callable) -> str:
-    with (
-        httpx.Client(transport=httpx.MockTransport(handler)) as c,
-        pytest.raises(ServiceError) as excinfo,
-    ):
-        client.create_user(c, BASE_URL, ACCESS_TOKEN, {"username": "eva"})
-    return str(excinfo.value)
-
-
-def test_create_user_error_keeps_the_status_line() -> None:
-    message = _call_create(_failing(422, b"Unprocessable Entity", json={}))
-
-    assert "Failed to create Superset user" in message
-    assert "422 Unprocessable Entity" in message
-    # Nothing to add, so nothing is appended -- no dangling separator.
-    assert message.endswith(")")
-
-
-def test_create_user_error_quotes_the_servers_message() -> None:
-    message = _call_create(
-        _failing(
-            422,
-            b"Unprocessable Entity",
-            json={
-                "message": (
-                    "duplicate key value violates unique constraint "
-                    '"ab_user_username_key"'
-                )
-            },
-        )
-    )
-
-    assert "ab_user_username_key" in message
-
-
-def test_create_user_error_flattens_per_field_validation() -> None:
-    """FAB answers a schema rejection with ``{field: [errors]}``."""
-    message = _call_create(
-        _failing(
-            422,
-            b"Unprocessable Entity",
-            json={
-                "message": {
-                    "password": ["Must be at least 10 characters"],
-                    "email": ["Not a valid email address."],
-                }
-            },
-        )
-    )
-
-    assert "email: Not a valid email address." in message
-    assert "password: Must be at least 10 characters" in message
-
-
-def test_create_user_error_falls_back_to_the_body_text() -> None:
-    """A proxy or a crash answers with something that is not the FAB shape."""
-    message = _call_create(
-        _failing(
-            502, b"Bad Gateway", text="<html>\n  <body>gateway down</body>\n</html>"
-        )
-    )
-
-    # One line: an error printed by Rich must not smear across the terminal.
-    assert "\n" not in message
-    assert "gateway down" in message
-
-
-def test_error_detail_is_capped() -> None:
-    message = _call_create(_failing(500, b"Server Error", text="x" * 5_000))
-
-    assert len(message) < 700
-    assert message.endswith("…")
 
 
 @pytest.mark.parametrize(

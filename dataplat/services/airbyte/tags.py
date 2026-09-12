@@ -5,19 +5,13 @@ from __future__ import annotations
 import httpx
 
 from dataplat.core.errors import ServiceError
+from dataplat.services._http import raise_for_status
 
 
 def list_tags(client: httpx.Client, base_url: str) -> list[dict]:
     """List available Airbyte tags."""
     response = client.get(f"{base_url}/api/public/v1/tags", timeout=60)
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to list tags "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "list tags")
 
     try:
         payload = response.json()
@@ -48,14 +42,7 @@ def create_tag(
         payload["color"] = color
 
     response = client.post(f"{base_url}/api/public/v1/tags", json=payload, timeout=60)
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to create tag "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "create tag")
     return response.json()
 
 

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
-import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import httpx
 
-from dataplat.core.errors import AuthError, ConfigError, ServiceError
-from dataplat.core.trace import is_enabled, trace_http
+from dataplat.core.errors import AuthError, ConfigError
+from dataplat.services._http import build_client, error_detail, service_error
 
 
 @dataclass(frozen=True)
@@ -22,109 +21,29 @@ class SupersetAuthConfig:
     password: str
 
 
-# --- request tracing --------------------------------------------------------
-# A twin of `dataplat.services.airbyte.client`'s hooks; see that module for why
-# they are hooks and why there are two lines per request. Two copies is one too
-# many — they belong in a shared HTTP seam, which does not exist yet.
-_TRACE_STARTED = "_dp_trace_started"
+# Tracing and error wording live in the seam every service shares; this module
+# keeps only what is specific to Superset. ``build_client`` is re-exported
+# because commands import it from here, and because it is what makes tracing
+# hold by construction.
 
-
-def _trace_hooks() -> dict[str, list[Callable[..., None]]]:
-    """Event hooks that trace method, URL, status and duration to stderr.
-
-    Headers are never read, so the ``Authorization: Bearer …`` every call below
-    sends cannot reach the trace.
-    """
-
-    def on_request(request: httpx.Request) -> None:
-        if not is_enabled():
-            return
-        setattr(request, _TRACE_STARTED, time.perf_counter())
-        trace_http(request.method, str(request.url))
-
-    def on_response(response: httpx.Response) -> None:
-        if not is_enabled():
-            return
-        started = getattr(response.request, _TRACE_STARTED, None)
-        trace_http(
-            response.request.method,
-            str(response.request.url),
-            status=response.status_code,
-            elapsed_ms=None
-            if started is None
-            else (time.perf_counter() - started) * 1000,
-        )
-
-    return {"request": [on_request], "response": [on_response]}
-
-
-# --- error reporting --------------------------------------------------------
-# Superset answers a rejected call with the reason in the body and nothing but
-# a number in the status line. Dropping the body leaves the operator holding
-# "422 Unprocessable Entity", which is true of a duplicate username, a password
-# the policy refuses and a field this client spelled wrong alike.
-
-_DETAIL_LIMIT = 400
-_UNPARSED = object()
-
-
-def _join(value: object) -> str:
-    """Flatten one field's errors; FAB sends a list even for a single one."""
-    if isinstance(value, list):
-        return "; ".join(str(item) for item in value)
-    return str(value)
-
-
-def _error_detail(response: httpx.Response) -> str:
-    """The server's own account of a failure, as one capped line.
-
-    Only the body is read, so the ``Authorization: Bearer …`` every call sends
-    stays as unreachable from an error message as it is from the trace.
-    """
-    try:
-        payload: object = response.json()
-    except ValueError:
-        payload = _UNPARSED
-
-    message = payload.get("message") if isinstance(payload, dict) else None
-
-    if isinstance(message, dict):
-        # A schema rejection arrives per field: {"password": ["too short"]}.
-        text = "; ".join(f"{k}: {_join(v)}" for k, v in sorted(message.items()))
-    elif message is not None:
-        text = _join(message)
-    elif payload is _UNPARSED or payload:
-        # No FAB envelope: a gateway's HTML or a bare string still beats a
-        # status line. An empty body ({} or []) says nothing and is left out.
-        text = response.text
-    else:
-        text = ""
-
-    text = " ".join(text.split())
-    if len(text) > _DETAIL_LIMIT:
-        text = text[:_DETAIL_LIMIT].rstrip() + "…"
-    return text
-
-
-def _service_error(response: httpx.Response, action: str) -> ServiceError:
-    """The one shape a failed Superset call reports, detail included."""
-    detail = _error_detail(response)
-    return ServiceError(
-        f"Failed to {action} "
-        f"({response.status_code} {response.reason_phrase})"
-        + (f": {detail}" if detail else "")
-    )
-
-
-def build_client() -> httpx.Client:
-    """The one way a Superset command gets an HTTP client.
-
-    It exists so tracing holds by construction. Six command bodies each called
-    ``httpx.Client()`` directly, and a seventh would have been written the same
-    way and silently traced nothing — the failure mode of an opt-in diagnostic
-    is that it is quietly absent exactly where it was needed.
-    """
-    return httpx.Client(event_hooks=_trace_hooks())
+__all__ = [
+    "auth_headers",
+    "build_client",
+    "create_user",
+    "delete_user",
+    "extract_id_list",
+    "get_auth_config_from_env",
+    "iter_groups",
+    "iter_roles",
+    "iter_security_items",
+    "iter_users",
+    "login",
+    "resolve_group_ids",
+    "resolve_role_ids",
+    "update_user",
+    "user_group_ids",
+    "user_role_ids",
+]
 
 
 def get_auth_config_from_env() -> SupersetAuthConfig:
@@ -162,9 +81,11 @@ def login(
             raise AuthError("No access_token in Superset login response")
         return access_token
     except httpx.HTTPStatusError as exc:
+        detail = error_detail(exc.response)
         raise AuthError(
             "Failed to login to Superset "
             f"({exc.response.status_code} {exc.response.reason_phrase})"
+            + (f": {detail}" if detail else "")
         ) from exc
     except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
         raise AuthError(f"Failed to connect to Superset login endpoint: {exc}") from exc
@@ -282,7 +203,7 @@ def iter_security_items(
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise _service_error(exc.response, "list Superset security items") from exc
+            raise service_error(exc.response, "list Superset security items") from exc
 
         payload = response.json() or {}
         results, meta = _extract_results(payload)
@@ -384,7 +305,7 @@ def create_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise _service_error(exc.response, "create Superset user") from exc
+        raise service_error(exc.response, "create Superset user") from exc
     return response.json() if response.text else {}
 
 
@@ -403,7 +324,7 @@ def update_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise _service_error(exc.response, "update Superset user") from exc
+        raise service_error(exc.response, "update Superset user") from exc
     return response.json() if response.text else {}
 
 
@@ -419,4 +340,4 @@ def delete_user(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise _service_error(exc.response, "delete Superset user") from exc
+        raise service_error(exc.response, "delete Superset user") from exc

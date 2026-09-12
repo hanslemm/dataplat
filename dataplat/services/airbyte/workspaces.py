@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 
-from dataplat.core.errors import ServiceError
+from dataplat.services._http import raise_for_status
 
 
 def list_workspaces(
@@ -19,14 +19,7 @@ def list_workspaces(
             f"{base_url}/api/public/v1/workspaces",
             params={"limit": limit, "offset": offset},
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            snippet = (response.text or "").strip()[:500]
-            raise ServiceError(
-                "Failed to list workspaces "
-                f"(status={response.status_code}, body={snippet})"
-            ) from exc
+        raise_for_status(response, "list workspaces")
 
         payload = response.json() or {}
         data = payload.get("data") or []
@@ -39,11 +32,5 @@ def list_workspaces(
 def get_workspace(client: httpx.Client, base_url: str, workspace_id: str) -> dict:
     """GET /api/public/v1/workspaces/{workspace_id}"""
     response = client.get(f"{base_url}/api/public/v1/workspaces/{workspace_id}")
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            f"Failed to get workspace (status={response.status_code}, body={snippet})"
-        ) from exc
+    raise_for_status(response, "get workspace")
     return response.json()

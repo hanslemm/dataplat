@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 
-from dataplat.core.errors import ServiceError
+from dataplat.services._http import raise_for_status
 
 
 def list_source_definitions(
@@ -23,14 +23,7 @@ def list_source_definitions(
             f"{base_url}/api/public/v1/workspaces/{workspace_id}/definitions/sources",
             params={"limit": limit, "offset": offset},
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            snippet = (response.text or "").strip()[:500]
-            raise ServiceError(
-                "Failed to list source definitions "
-                f"(status={response.status_code}, body={snippet})"
-            ) from exc
+        raise_for_status(response, "list source definitions")
 
         payload = response.json() or {}
         data = payload.get("data") or []
@@ -56,14 +49,7 @@ def list_destination_definitions(
             f"{base_url}/api/public/v1/workspaces/{workspace_id}/definitions/destinations",
             params={"limit": limit, "offset": offset},
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            snippet = (response.text or "").strip()[:500]
-            raise ServiceError(
-                "Failed to list destination definitions "
-                f"(status={response.status_code}, body={snippet})"
-            ) from exc
+        raise_for_status(response, "list destination definitions")
 
         payload = response.json() or {}
         data = payload.get("data") or []
