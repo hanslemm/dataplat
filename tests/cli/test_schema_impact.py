@@ -96,7 +96,9 @@ def _airbyte(
     connections: list[dict[str, Any]],
 ) -> None:
     monkeypatch.setattr(
-        cli, "build_authenticated_client", lambda: (_FakeAirbyte(), "https://airbyte.test")
+        cli,
+        "build_authenticated_client",
+        lambda: (_FakeAirbyte(), "https://airbyte.test"),
     )
     monkeypatch.setattr(cli, "list_destinations", lambda c, b: iter(destinations))
     monkeypatch.setattr(cli, "list_connections", lambda c, b: iter(connections))

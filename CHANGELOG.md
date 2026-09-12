@@ -22,6 +22,18 @@
   without Airbyte still gets the Superset half, and each skipped system says
   why. `--json` for machine use.
 
+### Fixed
+
+- **`dp ingest airbyte connections sync --wait` without `--connection-id`**
+  authenticated against Airbyte before reporting the contradiction, and exited
+  past the cleanup that closes the client, leaking it. The combination cannot
+  work whatever Airbyte answers, so it is now refused before anything is
+  opened, and with exit code 2 (invalid input) rather than 1.
+
+  Found by writing the first tests for the mutating connection commands:
+  `sync`, `reset` and `delete` had none at all, and two of the three destroy
+  data.
+
 ## 0.8.0
 
 ### Added

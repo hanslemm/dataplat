@@ -1723,3 +1723,141 @@ def test_workspaces_get_reports_a_service_failure(monkeypatch) -> None:
 
     assert result.exit_code == ExitCode.SERVICE
     assert "404 Not Found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# The mutating connection commands
+# ---------------------------------------------------------------------------
+# delete, reset and sync had no tests at all. Two of them destroy data.
+
+
+def test_sync_refuses_wait_without_a_connection_before_authenticating(
+    monkeypatch,
+) -> None:
+    """An argument error must not cost a round trip to Airbyte.
+
+    --wait without --connection-id cannot work whatever Airbyte says, and the
+    check used to run *after* the client was built -- so a contradiction
+    between two flags was reported only once authentication had succeeded, and
+    the client that authenticated was left unclosed on the way out.
+    """
+    _disable_envrc(monkeypatch)
+    opened: list[bool] = []
+
+    def factory():
+        opened.append(True)
+        raise AssertionError("should not authenticate for an argument error")
+
+    import dataplat.cli.ingest.airbyte.connections as _conns
+
+    monkeypatch.setattr(_conns, "build_authenticated_client", factory)
+
+    result = runner.invoke(
+        main_module.app, ["ingest", "airbyte", "connections", "sync", "--wait"]
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert opened == []
+
+
+def test_sync_triggers_a_job_for_one_connection(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+    _patch_state_client(monkeypatch, client)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "sync", "-c", "c1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [p for u, p in client.posts if u.endswith("/api/public/v1/jobs")] == [
+        {"connectionId": "c1", "jobType": "sync"}
+    ]
+
+
+def test_sync_dry_run_triggers_nothing(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+    _patch_state_client(monkeypatch, client)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "sync", "-c", "c1", "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [p for u, p in client.posts if u.endswith("/api/public/v1/jobs")] == []
+
+
+def test_reset_needs_a_confirmation(monkeypatch) -> None:
+    """It drops the destination's data for the connection."""
+    _disable_envrc(monkeypatch)
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+    _patch_state_client(monkeypatch, client)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "reset", "-c", "c1"],
+    )
+
+    assert result.exit_code != 0
+    assert client.posts == []
+
+
+def test_reset_triggers_a_reset_job(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+    _patch_state_client(monkeypatch, client)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "reset", "-c", "c1", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [p for u, p in client.posts if u.endswith("/api/public/v1/jobs")] == [
+        {"connectionId": "c1", "jobType": "reset"}
+    ]
+
+
+def test_clear_is_a_different_job_type(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+    _patch_state_client(monkeypatch, client)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "reset", "-c", "c1", "--clear", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [p for u, p in client.posts if u.endswith("/api/public/v1/jobs")] == [
+        {"connectionId": "c1", "jobType": "clear"}
+    ]
+
+
+def test_delete_needs_a_confirmation(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "delete", "-c", "c1"],
+    )
+
+    assert result.exit_code != 0
+    assert "deleted" not in result.output
+
+
+def test_delete_removes_the_connection(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "connections", "delete", "-c", "c1", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "deleted" in result.output

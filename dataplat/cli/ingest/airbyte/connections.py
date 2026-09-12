@@ -28,7 +28,7 @@ from dataplat.cli.ingest.airbyte.enums import (
     ScheduleType,
     SchemaUpdatesBehavior,
 )
-from dataplat.core.errors import AuthError, ConfigError
+from dataplat.core.errors import AuthError, ConfigError, ExitCode
 from dataplat.services.airbyte.client import (
     build_authenticated_client,
     split_cron_timezone,
@@ -963,14 +963,18 @@ def sync(
     yes: bool = YesOption,
 ):
     """Trigger a sync for a connection."""
+    # Before the client is built: --wait without --connection-id cannot work
+    # whatever Airbyte says, so reporting it should not cost a round trip and an
+    # authentication that might fail first. It also used to exit past the
+    # `finally` below, leaving the client it had just opened unclosed.
+    if wait and not connection_id:
+        console.print("[red]--wait is only supported with --connection-id[/red]")
+        raise typer.Exit(code=ExitCode.INVALID_INPUT)
+
     try:
         client, base_url = build_authenticated_client()
     except (ConfigError, AuthError) as exc:
         fail(exc, console=console)
-
-    if wait and not connection_id:
-        console.print("[red]--wait is only supported with --connection-id[/red]")
-        raise typer.Exit(code=2)
 
     try:
         if connection_id and dry_run:
