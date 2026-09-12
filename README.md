@@ -19,6 +19,7 @@ dp
 │   ├── kill               # cancel/terminate queries by PID            [1]
 │   ├── role               # list | show | create | grant | drop        [1]
 │   ├── schema             # list | create | drop | grant | revoke | alter [2]
+│   │                      # impact — what outside the DB depends on it
 │   ├── top-tables         # rank big tables (--drop-sql, --drop)
 │   └── dbt-orphans        # scan/rename | revert | purge (--older-than) [1]
 ├── ingest                 # data ingestion
@@ -238,6 +239,7 @@ all — every connection is the same implicit user, `duckdb`.
 | `top-tables` | ✓ | ✓ | ✓ | works, but ranks by estimated rows and shows no sizes — [see below](#duckdb-top-tables-sizes-are-estimates) |
 | `schema list` / `create` / `drop` | ✓ | ✓ ³ | ✓ ⁴ | — |
 | `schema grant` / `revoke` | ✓ | ✓ | ✗ | it has no `GRANT` statement at all — the keyword does not parse, because there are no users or roles to grant anything to |
+| `schema impact` | ✓ | ✓ | ✓ | it opens no database connection: the answer comes from Superset and Airbyte |
 | `schema alter` | ✓ | ✓ ⁵ | ✗ | it does not implement `ALTER SCHEMA` ("Altering schemas is not yet supported"), and has neither owners nor quotas to alter |
 | `role list` / `show` / `create` / `grant` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
 | `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
@@ -686,6 +688,25 @@ dp cloud aws rds metrics --json
 dp cloud aws rds plot -m cpu -m connections --hours 12
 dp cloud aws redshift metrics -w my-workgroup
 ```
+
+### Before dropping a schema
+
+`schema drop` shows what a schema contains. It cannot show what *elsewhere*
+depends on it, which is the half that surprises people:
+
+```bash
+dp db schema impact borg
+```
+
+Superset datasets are matched two ways, and the second is the one that matters:
+a virtual dataset can name a schema only inside its SQL, where no schema filter
+in Superset will ever show it. On the instance this was built against, `borg`
+has 20 datasets whose `schema` field says so — and **111 more that reference it
+only in SQL**. Airbyte destinations landing in the schema are reported with the
+connections that write through them (`raw`: one destination, 37 connections).
+
+Add `--json` to feed it to something else. Both systems are optional: with only
+one configured, you still get that half of the answer.
 
 ### Onboarding and offboarding
 

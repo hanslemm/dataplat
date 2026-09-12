@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`dp db schema impact <schema>`** — what outside the database depends on a
+  schema, asked of the systems that already know. `schema drop` can show what a
+  schema contains; it has never been able to show what would break, which is a
+  dashboard nobody opened this week or an ingestion that lands at 03:00.
+
+  Superset datasets are matched on their `schema` field **and** on qualified
+  names inside their SQL, because a virtual dataset can reference a schema
+  without the field ever saying so — and no schema filter in Superset's own UI
+  reveals those. On the instance this was built against the difference is not
+  marginal: `borg` has 20 datasets whose field names it and **111 more that
+  reference it only in SQL**. Airbyte destinations configured to land in the
+  schema are reported with the connections writing through them; `raw` has one
+  destination and 37 connections.
+
+  Opens no database connection, and is honest about partial answers: a platform
+  without Airbyte still gets the Superset half, and each skipped system says
+  why. `--json` for machine use.
+
 ## 0.8.0
 
 ### Added

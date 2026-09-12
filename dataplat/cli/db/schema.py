@@ -12,6 +12,7 @@ from dataplat.cli.db.schema_alter import alter_command
 from dataplat.cli.db.schema_create import create_command
 from dataplat.cli.db.schema_drop import drop_command
 from dataplat.cli.db.schema_grant import grant_command, revoke_command
+from dataplat.cli.db.schema_impact import impact_command
 from dataplat.cli.db.schema_list import list_command
 
 app = typer.Typer(
@@ -31,6 +32,10 @@ app.command(
     "drop",
     help="Drop one or more schemas, showing owner and object counts first.",
 )(drop_command)
+app.command(
+    "impact",
+    help="Show what outside the database depends on a schema.",
+)(impact_command)
 app.command(
     "grant",
     help="Grant schema privileges to users, groups, or roles.",
