@@ -28,6 +28,13 @@ from dataplat.services.airbyte.connections import (
 
 
 class _FakeResponse:
+    @property
+    def reason_phrase(self) -> str:
+        # Derived from httpx's own table rather than stored: this class stands in
+        # for an httpx.Response, and an attribute it invents by hand is one that
+        # can drift from the real thing.
+        return httpx.codes.get_reason_phrase(self.status_code)
+
     def __init__(
         self,
         data=None,
@@ -54,6 +61,11 @@ class _FakeResponse:
     def json(self):
         if self._bad_json:
             raise ValueError("not json")
+        if self._data is None:
+            # A real Response parses its body, and a body that is not JSON
+            # raises rather than yielding None. Returning None here would hide
+            # an error body from anything that reads the parsed payload first.
+            return json.loads(self.text)
         return self._data
 
 
@@ -207,8 +219,9 @@ def test_an_http_error_names_the_status() -> None:
     with pytest.raises(ServiceError) as exc:
         list(list_connections(client, "http://ab"))  # type: ignore[arg-type]
 
-    assert "status=401" in str(exc.value)
-    assert "unauthorized" in str(exc.value)
+    assert str(exc.value) == (
+        "Failed to list connections (401 Unauthorized): unauthorized"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +242,7 @@ def test_get_connection_reports_a_missing_connection() -> None:
     with pytest.raises(ServiceError) as exc:
         get_connection(client, "http://ab", "gone")  # type: ignore[arg-type]
 
-    assert "status=404" in str(exc.value)
+    assert str(exc.value) == "Failed to get connection (404 Not Found): not found"
 
 
 def test_patch_sends_only_the_updates_it_was_given() -> None:
@@ -249,15 +262,18 @@ def test_patch_reports_a_rejected_update() -> None:
     with pytest.raises(ServiceError) as exc:
         patch_connection(client, "http://ab", "c1", {"schedule": "nonsense"})  # type: ignore[arg-type]
 
-    assert "status=422" in str(exc.value)
-    assert "bad cron" in str(exc.value)
+    assert str(exc.value) == (
+        "Failed to update connection (422 Unprocessable Entity): bad cron"
+    )
 
 
-def test_patch_reports_an_empty_error_body_as_empty() -> None:
+def test_patch_reports_an_empty_error_body_as_a_bare_status() -> None:
     client = _FakeClient(_FakeResponse(status_code=500, text=""))
 
-    with pytest.raises(ServiceError, match="body=empty"):
+    with pytest.raises(ServiceError) as exc:
         patch_connection(client, "http://ab", "c1", {})  # type: ignore[arg-type]
+
+    assert str(exc.value) == "Failed to update connection (500 Internal Server Error)"
 
 
 # ---------------------------------------------------------------------------

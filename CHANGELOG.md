@@ -2,7 +2,33 @@
 
 ## Unreleased
 
+### Changed
+
+- **Every service failure now reads the same way, with the server's reason
+  attached.** Airbyte and Superset had grown the same HTTP plumbing twice over
+  — two identical sets of tracing hooks, two `_raise_for_status` helpers,
+  eighteen inline `response.text[:500]` snippets — and three different
+  sentences for the same event. Both client modules had carried a comment
+  saying this belonged in a shared seam "that does not exist yet" since 0.5.0;
+  `dataplat/services/_http.py` is that seam, and it is 243 lines lighter than
+  what it replaced.
+
+  Airbyte errors change wording as a result: `Failed to list connections
+  (status=401, body=unauthorized)` is now `Failed to list connections (401
+  Unauthorized): unauthorized`. The reason phrase is carried rather than a bare
+  number, the detail is collapsed to one line (a raw body with newlines used to
+  smear a Rich-printed error across the terminal) and capped, and an empty body
+  appends nothing instead of the literal `body=empty`. Timeouts, retries and
+  redirect policy deliberately stay with each service: those differ per API and
+  burying them in the seam would hide them.
+
 ### Fixed
+
+- **Airbyte authentication failures say what the server said.** Both the cloud
+  token exchange and the OSS login reported only a status, so a 401 from a
+  gateway and a 401 from Airbyte were indistinguishable. Both now carry the
+  body.
+
 
 - **Adding a tag to an Airbyte connection can no longer delete another one.**
   `merge_tags` dropped any entry it could not identify, and its result is

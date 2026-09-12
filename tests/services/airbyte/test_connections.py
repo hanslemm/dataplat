@@ -17,6 +17,13 @@ from dataplat.services.airbyte.connections import (
 
 def _mock_client(response_data, status_code=200):
     class FakeResponse:
+        @property
+        def reason_phrase(self) -> str:
+            # Derived from httpx's own table rather than stored: this class stands in
+            # for an httpx.Response, and an attribute it invents by hand is one that
+            # can drift from the real thing.
+            return httpx.codes.get_reason_phrase(self.status_code)
+
         def __init__(self, data, code):
             self.status_code = code
             self._data = data
@@ -132,6 +139,13 @@ def test_delete_connection_error():
 
 
 class _FakeResponse:
+    @property
+    def reason_phrase(self) -> str:
+        # Derived from httpx's own table rather than stored: this class stands in
+        # for an httpx.Response, and an attribute it invents by hand is one that
+        # can drift from the real thing.
+        return httpx.codes.get_reason_phrase(self.status_code)
+
     def __init__(self, data, status_code=200):
         self.status_code = status_code
         self._data = data

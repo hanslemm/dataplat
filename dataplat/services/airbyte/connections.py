@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 
 from dataplat.core.errors import ServiceError
+from dataplat.services._http import raise_for_status
 
 
 def list_connections(client: httpx.Client, base_url: str, limit: int = 100):
@@ -23,14 +24,7 @@ def list_connections(client: httpx.Client, base_url: str, limit: int = 100):
                 f"(status={response.status_code}, location={location or 'unknown'})"
             )
 
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            snippet = (response.text or "").strip()[:500]
-            raise ServiceError(
-                "Failed to list connections "
-                f"(status={response.status_code}, body={snippet})"
-            ) from exc
+        raise_for_status(response, "list connections")
 
         content_type = response.headers.get("content-type", "").lower()
         if "application/json" not in content_type:
@@ -62,13 +56,7 @@ def get_connection(client: httpx.Client, base_url: str, connection_id: str) -> d
         f"{base_url}/api/public/v1/connections/{connection_id}",
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            f"Failed to get connection (status={response.status_code}, body={snippet})"
-        ) from exc
+    raise_for_status(response, "get connection")
     return response.json()
 
 
@@ -112,14 +100,7 @@ def patch_connection(
         json=updates,
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to update connection "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "update connection")
     return response.json()
 
 
@@ -172,14 +153,7 @@ def update_connection_web_backend(
         json=payload,
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to update connection via web_backend "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "update connection via web_backend")
     return response.json()
 
 
@@ -194,14 +168,7 @@ def get_connection_state(
         json={"connectionId": connection_id},
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to get connection state "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "get connection state")
     return response.json()
 
 
@@ -218,14 +185,7 @@ def update_connection_state(
         json=payload,
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to update connection state "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "update connection state")
     return response.json()
 
 
@@ -236,28 +196,14 @@ def trigger_sync_job(client: httpx.Client, base_url: str, connection_id: str) ->
         json={"connectionId": connection_id, "jobType": "sync"},
         timeout=60,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to trigger sync job "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "trigger sync job")
     return response.json()
 
 
 def get_job(client: httpx.Client, base_url: str, job_id: str) -> dict:
     """Get Airbyte job details by ID."""
     response = client.get(f"{base_url}/api/public/v1/jobs/{job_id}", timeout=60)
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to get job status "
-            f"(status={response.status_code}, body={snippet or 'empty'})"
-        ) from exc
+    raise_for_status(response, "get job status")
     return response.json()
 
 
@@ -292,14 +238,7 @@ def create_connection(
         f"{base_url}/api/public/v1/connections",
         json=payload,
     )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        snippet = (response.text or "").strip()[:500]
-        raise ServiceError(
-            "Failed to create connection "
-            f"(status={response.status_code}, body={snippet})"
-        ) from exc
+    raise_for_status(response, "create connection")
     return response.json()
 
 
@@ -307,11 +246,4 @@ def delete_connection(client: httpx.Client, base_url: str, connection_id: str) -
     """DELETE /api/public/v1/connections/{connection_id}, expect 204"""
     response = client.delete(f"{base_url}/api/public/v1/connections/{connection_id}")
     if response.status_code != 204:
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            snippet = (response.text or "").strip()[:500]
-            raise ServiceError(
-                "Failed to delete connection "
-                f"(status={response.status_code}, body={snippet})"
-            ) from exc
+        raise_for_status(response, "delete connection")
