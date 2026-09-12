@@ -24,6 +24,15 @@
 
 ### Fixed
 
+- **`--format json` no longer emits invalid JSON.** Twelve Airbyte commands
+  printed their JSON through a Rich console, which wraps at the console width
+  and folds a token longer than it *mid-token* — putting a newline inside a
+  string literal. `dp ingest airbyte workspaces list --format json | jq` broke
+  on any connector URL, token or long name, while looking correct on screen.
+  They now use `typer.echo`, as the rest of the CLI already did. A test pins
+  the rule for every future command, and `workspaces get` — which emits JSON
+  and had no test at all — is covered.
+
 - **Airbyte authentication failures say what the server said.** Both the cloud
   token exchange and the OSS login reported only a status, so a 401 from a
   gateway and a 401 from Airbyte were indistinguishable. Both now carry the

@@ -41,7 +41,7 @@ def list_workspaces_cmd(
             return
 
         if format == "json":
-            console.print(cell(json.dumps(workspaces, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(workspaces, indent=2, ensure_ascii=False))
             return
 
         table = Table(
@@ -80,7 +80,7 @@ def get_workspace_cmd(
 
     try:
         workspace = get_workspace(client, base_url, workspace_id)
-        console.print(cell(json.dumps(workspace, indent=2, ensure_ascii=False)))
+        typer.echo(json.dumps(workspace, indent=2, ensure_ascii=False))
     except ServiceError as exc:
         fail(exc, console=console)
     finally:

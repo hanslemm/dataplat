@@ -45,7 +45,7 @@ def list_source_definitions_cmd(
             return
 
         if format == "json":
-            console.print(cell(json.dumps(definitions, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(definitions, indent=2, ensure_ascii=False))
             return
 
         table = Table(
@@ -101,7 +101,7 @@ def list_destination_definitions_cmd(
             return
 
         if format == "json":
-            console.print(cell(json.dumps(definitions, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(definitions, indent=2, ensure_ascii=False))
             return
 
         table = Table(

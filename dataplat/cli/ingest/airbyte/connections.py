@@ -1073,7 +1073,7 @@ def get_connection_cmd(
 
     try:
         conn = get_connection(client, base_url, connection_id)
-        console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
+        typer.echo(json.dumps(conn, indent=2, ensure_ascii=False))
     except Exception as exc:
         console.print(f"[red]Error getting connection: {esc(exc)}[/red]")
         raise typer.Exit(code=exit_code_for(exc))
@@ -1144,7 +1144,7 @@ def create_connection_cmd(
             else None,
             status=status.value if status else None,
         )
-        console.print(cell(json.dumps(conn, indent=2, ensure_ascii=False)))
+        typer.echo(json.dumps(conn, indent=2, ensure_ascii=False))
     except Exception as exc:
         console.print(f"[red]Error creating connection: {esc(exc)}[/red]")
         raise typer.Exit(code=exit_code_for(exc))

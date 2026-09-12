@@ -1600,3 +1600,126 @@ def test_importing_connections_does_not_load_textual() -> None:
         [sys.executable, "-c", probe], capture_output=True, text=True
     )
     assert result.returncode == 0, f"textual was imported: {result.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# --format json must survive the terminal it is printed to
+# ---------------------------------------------------------------------------
+# Rich wraps at the console width, and a token longer than that width is folded
+# mid-token -- which puts a newline inside a JSON string literal. The output
+# then looks right on screen and is unparseable the moment it is piped, which
+# is the only reason --format json exists. Airbyte payloads carry exactly such
+# tokens: connector config URLs, tokens and uuids.
+
+LONG_TOKEN = (
+    "https://example.com/very/long/path/that/exceeds/any/sane/console/width"
+    "?token=abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _narrow(monkeypatch, module) -> None:
+    """Force the module console to a width the token cannot fit in.
+
+    Not ``CliRunner(env={"COLUMNS": ...})``: tests/conftest.py pins COLUMNS=200
+    for the whole process and that wins, so an env-based version of this test
+    passes without ever rendering narrow — which is exactly how this bug
+    survived having tests around it.
+    """
+    monkeypatch.setattr(module.console, "width", 40)
+
+
+def _serve_workspaces(monkeypatch, workspaces: list[dict]) -> None:
+    import dataplat.cli.ingest.airbyte.workspaces as cli
+
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+    _narrow(monkeypatch, cli)
+    monkeypatch.setattr(cli, "list_workspaces", lambda client, base_url: workspaces)
+    monkeypatch.setattr(
+        cli, "get_workspace", lambda client, base_url, ws_id: workspaces[0]
+    )
+
+
+def test_workspaces_list_json_is_parseable_in_a_narrow_terminal(monkeypatch) -> None:
+    payload = [{"workspaceId": "ws1", "name": LONG_TOKEN}]
+    _serve_workspaces(monkeypatch, payload)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "workspaces", "list", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == payload
+
+
+def test_workspaces_list_json_is_byte_identical(monkeypatch) -> None:
+    """--json is a pipe, not a view: no styling, no wrapping, no repr quoting."""
+    payload = [{"workspaceId": "ws1", "name": LONG_TOKEN}]
+    _serve_workspaces(monkeypatch, payload)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "workspaces", "list", "--format", "json"],
+    )
+
+    assert result.stdout == json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def test_workspaces_get_json_is_parseable_in_a_narrow_terminal(monkeypatch) -> None:
+    """``workspaces get`` emits JSON only, and had no test at all."""
+    payload = [{"workspaceId": "ws1", "name": LONG_TOKEN}]
+    _serve_workspaces(monkeypatch, payload)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "workspaces", "get", "-w", "ws1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == payload[0]
+
+
+def test_workspaces_list_reports_an_empty_listing(monkeypatch) -> None:
+    _serve_workspaces(monkeypatch, [])
+
+    result = runner.invoke(main_module.app, ["ingest", "airbyte", "workspaces", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "No workspaces found" in result.output
+
+
+def test_workspaces_list_reports_a_service_failure(monkeypatch) -> None:
+    import dataplat.cli.ingest.airbyte.workspaces as cli
+
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    def boom(client, base_url):
+        raise ServiceError("Failed to list workspaces (503 Service Unavailable): down")
+
+    monkeypatch.setattr(cli, "list_workspaces", boom)
+
+    result = runner.invoke(main_module.app, ["ingest", "airbyte", "workspaces", "list"])
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "503 Service Unavailable" in result.output
+
+
+def test_workspaces_get_reports_a_service_failure(monkeypatch) -> None:
+    import dataplat.cli.ingest.airbyte.workspaces as cli
+
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    def boom(client, base_url, workspace_id):
+        raise ServiceError("Failed to get workspace (404 Not Found): no such workspace")
+
+    monkeypatch.setattr(cli, "get_workspace", boom)
+
+    result = runner.invoke(
+        main_module.app, ["ingest", "airbyte", "workspaces", "get", "-w", "nope"]
+    )
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "404 Not Found" in result.output
