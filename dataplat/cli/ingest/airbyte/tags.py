@@ -8,7 +8,6 @@ import typer
 from rich.console import Console
 
 from dataplat.cli._exit import fail
-from dataplat.cli._render import cell
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.airbyte.client import build_authenticated_client
 from dataplat.services.airbyte.tags import create_tag, list_tags
@@ -27,7 +26,7 @@ def list_tags_cmd():
 
     try:
         tags = list_tags(client, base_url)
-        console.print(cell(json.dumps(tags, indent=2, ensure_ascii=False)))
+        typer.echo(json.dumps(tags, indent=2, ensure_ascii=False))
     except ServiceError as exc:
         fail(exc, console=console)
     finally:
@@ -52,7 +51,7 @@ def create_tag_cmd(
 
     try:
         tag = create_tag(client, base_url, name, workspace_id, color)
-        console.print(cell(json.dumps(tag, indent=2, ensure_ascii=False)))
+        typer.echo(json.dumps(tag, indent=2, ensure_ascii=False))
     except ServiceError as exc:
         fail(exc, console=console)
     finally:

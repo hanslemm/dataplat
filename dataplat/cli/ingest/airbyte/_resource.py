@@ -87,7 +87,7 @@ def make_resource_app(
                 return
 
             if format == "json":
-                console.print(cell(json.dumps(items, indent=2, ensure_ascii=False)))
+                typer.echo(json.dumps(items, indent=2, ensure_ascii=False))
                 return
 
             table = Table(
@@ -122,7 +122,7 @@ def make_resource_app(
     ):
         with airbyte_client() as (client, base_url):
             item = get_fn(client, base_url, resource_id)
-            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(item, indent=2, ensure_ascii=False))
 
     get_cmd.__doc__ = f"Get {kind} details."
 
@@ -144,7 +144,7 @@ def make_resource_app(
             item = create_fn(
                 client, base_url, name, workspace_id, definition_id, configuration
             )
-            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(item, indent=2, ensure_ascii=False))
 
     create_cmd.__doc__ = f"Create a new Airbyte {kind}."
 
@@ -170,7 +170,7 @@ def make_resource_app(
 
         with airbyte_client() as (client, base_url):
             item = update_fn(client, base_url, resource_id, updates)
-            console.print(cell(json.dumps(item, indent=2, ensure_ascii=False)))
+            typer.echo(json.dumps(item, indent=2, ensure_ascii=False))
 
     update_cmd.__doc__ = f"Update an Airbyte {kind}."
 
