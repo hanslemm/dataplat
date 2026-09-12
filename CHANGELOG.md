@@ -34,6 +34,24 @@
   `sync`, `reset` and `delete` had none at all, and two of the three destroy
   data.
 
+### Changed
+
+- **Tests use real `httpx.Response` objects instead of ten hand-rolled stand-ins
+  for one.** Nine modules each carried a class duck-typing it, and a tenth lived
+  inside a fake client. They drifted in ways that cost something: every one
+  broke when the shared HTTP seam read `reason_phrase`; one returned `None` from
+  `json()` where a real response raises, hiding error bodies from the code under
+  test *and* from the assertions written about them; and all of them claimed
+  `content-type: application/json` for every response, including plain-text
+  ones, so a test named for "a body that claims JSON and is not" only reached
+  that branch because its fake lied on its behalf. 412 lines of fake replaced by
+  180 of test, one helper, and behaviour that cannot drift from the real thing.
+
+- **`dp ingest airbyte connections` coverage 57% → 69%**, the repository 89% →
+  90%. `create` and `update` join `sync`, `reset` and `delete` in having tests:
+  the cron validation, the timezone rules, an empty `--prefix` clearing rather
+  than being ignored, and every confirmation gate.
+
 ## 0.8.0
 
 ### Added

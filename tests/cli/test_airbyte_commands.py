@@ -225,6 +225,7 @@ class _StateFakeClient:
         self._running = running
         self._conn_listed = False
         self.posts: list[tuple[str, dict]] = []
+        self.patches: list[tuple[str, dict]] = []
 
     def get(self, url, params=None, **kw):
         if url.endswith("/api/public/v1/connections"):
@@ -270,6 +271,10 @@ class _StateFakeClient:
         if url.endswith("/api/public/v1/jobs"):  # refresh trigger
             return _response({"jobId": 42})
         return _response({})
+
+    def patch(self, url, json=None, **kw):
+        self.patches.append((url, json or {}))
+        return _response({"connectionId": "c1"})
 
     def close(self):
         pass
@@ -1834,3 +1839,215 @@ def test_delete_removes_the_connection(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "deleted" in result.output
+
+
+# ---------------------------------------------------------------------------
+# connections update
+# ---------------------------------------------------------------------------
+# The largest command in the CLI and the least covered. Its validation runs
+# before any client is built, so most of these need no Airbyte at all -- which
+# is the point: a contradiction between flags should cost nothing to report.
+
+
+def _update(*args: str, monkeypatch, client=None):
+    _disable_envrc(monkeypatch)
+    if client is not None:
+        _patch_state_client(monkeypatch, client)
+    return runner.invoke(
+        main_module.app, ["ingest", "airbyte", "connections", "update", *args]
+    )
+
+
+def test_cron_schedule_without_a_cron_expression_is_refused(monkeypatch) -> None:
+    result = _update("-c", "c1", "--schedule-type", "cron", monkeypatch=monkeypatch)
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "--cron required" in result.output
+
+
+def test_an_unparseable_cron_expression_is_refused(monkeypatch) -> None:
+    result = _update("-c", "c1", "--cron", "not a cron", monkeypatch=monkeypatch)
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Invalid cron" in result.output
+
+
+def test_an_unknown_timezone_is_refused(monkeypatch) -> None:
+    result = _update(
+        "-c",
+        "c1",
+        "--cron",
+        "0 0 12 ? * *",
+        "--cron-timezone",
+        "Mars/Olympus_Mons",
+        monkeypatch=monkeypatch,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Invalid cron timezone" in result.output
+
+
+def test_a_timezone_needs_the_web_backend(monkeypatch) -> None:
+    """The public API has nowhere to put it, so asking for it is refused."""
+    result = _update(
+        "-c",
+        "c1",
+        "--cron",
+        "0 0 12 ? * * Europe/Berlin",
+        monkeypatch=monkeypatch,
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "--use-web-backend" in result.output
+
+
+def test_a_cron_expression_implies_a_cron_schedule(monkeypatch) -> None:
+    """--schedule-type would be the only thing --cron could mean."""
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "-c", "c1", "--cron", "0 0 12 ? * *", monkeypatch=monkeypatch, client=client
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.patches[0][1]["schedule"] == {
+        "scheduleType": "cron",
+        "cronExpression": "0 0 12 ? * *",
+    }
+
+
+def test_an_empty_prefix_clears_it_rather_than_being_ignored(monkeypatch) -> None:
+    """`--prefix ""` is a value, not an absent option."""
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update("-c", "c1", "--prefix", "", monkeypatch=monkeypatch, client=client)
+
+    assert result.exit_code == 0, result.output
+    assert client.patches[0][1] == {"prefix": ""}
+
+
+def test_a_status_change_is_sent_as_itself(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "-c", "c1", "--status", "inactive", monkeypatch=monkeypatch, client=client
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.patches[0][1] == {"status": "inactive"}
+
+
+def test_a_dry_run_updates_nothing(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "-c",
+        "c1",
+        "--status",
+        "inactive",
+        "--dry-run",
+        monkeypatch=monkeypatch,
+        client=client,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.patches == []
+
+
+def test_tag_from_cron_without_a_cron_is_refused(monkeypatch) -> None:
+    result = _update("-c", "c1", "--tag-from-cron", monkeypatch=monkeypatch)
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "--tag-from-cron requires --cron" in result.output
+
+
+# ---------------------------------------------------------------------------
+# connections create
+# ---------------------------------------------------------------------------
+
+
+def _create(*args: str, monkeypatch):
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+    return runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "connections",
+            "create",
+            "--source-id",
+            "s1",
+            "--destination-id",
+            "d1",
+            *args,
+        ],
+    )
+
+
+def test_create_refuses_a_cron_schedule_with_no_expression(monkeypatch) -> None:
+    result = _create("--schedule-type", "cron", monkeypatch=monkeypatch)
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "--cron required" in result.output
+
+
+def test_create_refuses_an_unparseable_cron(monkeypatch) -> None:
+    result = _create("--cron", "whenever", monkeypatch=monkeypatch)
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "Invalid cron" in result.output
+
+
+def test_create_emits_the_connection_as_json(monkeypatch) -> None:
+    """The command's whole output is JSON, so it has to parse."""
+    result = _create("--name", "new one", monkeypatch=monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)
+
+
+def test_create_sends_what_it_was_given(monkeypatch) -> None:
+    import dataplat.cli.ingest.airbyte.connections as _conns
+
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+    sent: dict = {}
+
+    def spy(client, base_url, **kwargs):
+        sent.update(kwargs)
+        return {"connectionId": "c9"}
+
+    monkeypatch.setattr(_conns, "create_connection", spy)
+
+    result = runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "connections",
+            "create",
+            "--source-id",
+            "s1",
+            "--destination-id",
+            "d1",
+            "--name",
+            "nightly",
+            "--cron",
+            "0 0 3 ? * * Europe/Berlin",
+            "--status",
+            "inactive",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sent["source_id"] == "s1"
+    assert sent["destination_id"] == "d1"
+    assert sent["name"] == "nightly"
+    assert sent["status"] == "inactive"
+    # The timezone travels in its own field, never inline in the expression.
+    assert sent["schedule"] == {
+        "scheduleType": "cron",
+        "cronExpression": "0 0 3 ? * *",
+        "cronTimeZone": "Europe/Berlin",
+    }
