@@ -15,6 +15,7 @@ from dataplat.services.people.access import (
     db_memberships,
     db_user_exists,
     superset_access,
+    superset_membership_holders,
 )
 
 
@@ -162,3 +163,45 @@ def test_the_reference_lookup_never_writes(engine: SqlEngine) -> None:
     assert all(
         sql.strip().upper().startswith(("SELECT", "WITH")) for sql in cursor.executed
     )
+
+
+# ---------------------------------------------------------------------------
+# How common a membership is
+# ---------------------------------------------------------------------------
+
+
+class _RolesCursor:
+    """Serves the one listing `list_roles` makes, per engine."""
+
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+        self._batches: list[list[tuple]] = []
+
+    def execute(self, sql_text: Any, params: Any = None) -> None:
+        text = str(sql_text)
+        if "pg_group" in text:
+            self._batches = [[r for r in self._rows if isinstance(r[1], list)]]
+        elif "pg_user" in text or "pg_roles" in text:
+            self._batches = [[r for r in self._rows if not isinstance(r[1], list)]]
+
+    def fetchall(self) -> list[tuple]:
+        return self._batches[0] if self._batches else []
+
+
+def test_superset_membership_holders_counts_roles_and_groups() -> None:
+    users = [
+        {"username": "a", "roles": [{"name": "Gamma"}], "groups": [{"name": "x"}]},
+        {
+            "username": "b",
+            "roles": [{"name": "Gamma"}, {"name": "Admin"}],
+            "groups": [],
+        },
+        {"username": "c", "roles": [{"name": "Gamma"}], "groups": []},
+    ]
+
+    holders, population = superset_membership_holders(users)
+
+    assert holders["Gamma"] == 3
+    assert holders["Admin"] == 1
+    assert holders["x"] == 1
+    assert population == 3
