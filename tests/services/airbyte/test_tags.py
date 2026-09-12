@@ -361,21 +361,47 @@ def test_re_adding_an_existing_tag_changes_nothing() -> None:
     assert merge_tags(existing, [{"tagId": "a", "name": "prod"}]) == existing
 
 
-def test_a_tag_carrying_no_id_is_dropped_from_the_merge() -> None:
-    """Documents a risk, and is deliberately not a fix.
+def test_a_tag_carrying_no_id_is_kept_rather_than_deleted() -> None:
+    """The merged list is a connection's *complete* tag set, so dropping deletes.
 
-    The merged list is written back as a connection's *complete* tag set
-    (`connections.py`: `"tags": merge_tags(existing_tags, new_tags)`), and
-    `existing_tags` is whatever the connection payload held. So an entry the
-    merge cannot identify does not merely fail to merge — it is removed from the
-    connection, and adding one tag silently deletes another.
+    ``connections.py`` writes `"tags": merge_tags(existing_tags, new_tags)` back
+    as the whole set, and ``existing_tags`` is whatever the connection payload
+    held. An entry this code cannot identify used to be dropped, which did not
+    merely fail to merge it — it removed the tag from the connection, so adding
+    one tag silently deleted another.
 
-    Every tag Airbyte returns should carry an id, which is why this is a latent
-    risk and not a live bug. It is pinned here so the behaviour is visible, and
-    left alone because both alternatives — passing an id-less tag back to the API,
-    or failing the update — need an Airbyte to choose between, and there is none.
+    Keeping it is the safe half of the trade: if Airbyte rejects an id-less
+    entry the update fails loudly and says why, and a loud failure beats a
+    silent deletion. Whether Airbyte accepts it is exactly what cannot be
+    settled without one, and does not need to be: either outcome is better
+    than losing the tag.
     """
     merged = merge_tags([{"name": "orphan"}, {"tagId": "a"}], [{"tagId": "b"}])
 
-    assert [t.get("tagId") for t in merged] == ["a", "b"]
-    assert not any(t.get("name") == "orphan" for t in merged)
+    assert [t.get("name") for t in merged if not t.get("tagId")] == ["orphan"]
+    assert [t.get("tagId") for t in merged if t.get("tagId")] == ["a", "b"]
+
+
+def test_an_unidentifiable_tag_keeps_its_first_seen_position() -> None:
+    """Order is the contract the identified entries already had."""
+    merged = merge_tags([{"name": "orphan"}, {"tagId": "a"}], [])
+
+    assert [t.get("tagId") or t.get("name") for t in merged] == ["orphan", "a"]
+
+
+def test_the_same_unidentifiable_tag_is_not_added_twice() -> None:
+    """Name is the only handle these have; two of one name is one tag."""
+    merged = merge_tags([{"name": "orphan"}], [{"name": "orphan"}])
+
+    assert len(merged) == 1
+
+
+def test_a_tag_with_neither_id_nor_name_is_still_kept() -> None:
+    """Pathological, and still not ours to delete.
+
+    Two of them are two entries: with no handle to compare them by, collapsing
+    them would be the same silent loss under a different name.
+    """
+    merged = merge_tags([{"color": "red"}, {"color": "blue"}], [])
+
+    assert len(merged) == 2
