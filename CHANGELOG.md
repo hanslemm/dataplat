@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Adding a tag to an Airbyte connection can no longer delete another one.**
+  `merge_tags` dropped any entry it could not identify, and its result is
+  written back as the connection's *complete* tag set — so an unidentifiable
+  tag was not merely unmerged, it was removed, and adding one tag silently
+  deleted another. Entries are now kept, identified by id, then name, then
+  position, so deduplication never collapses two tags it cannot prove are the
+  same. If Airbyte rejects an id-less entry the update now fails loudly and
+  says why, which is the better half of the trade: a visible failure beats a
+  silent deletion. Flagged as a latent risk in 0.6.0 and pinned by a test;
+  that test now asserts the fix.
+
 ## 0.7.0
 
 ### Added

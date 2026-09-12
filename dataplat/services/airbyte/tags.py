@@ -114,11 +114,29 @@ class TagResolver:
 
 
 def merge_tags(existing: list[dict], additional: list[dict]) -> list[dict]:
-    """Union two tag lists by tag id, preserving first-seen order."""
-    merged: dict[str, dict] = {}
-    for tag in existing + additional:
+    """Union two tag lists by tag id, preserving first-seen order.
+
+    An entry carrying no id is kept rather than dropped. This list is written
+    back as a connection's *complete* tag set (``connections.py``), so dropping
+    one does not merely fail to merge it — it deletes it from the connection,
+    and adding one tag would silently remove another. Keeping it risks Airbyte
+    rejecting the update, which is a loud failure that says why; losing a tag
+    is a silent one nobody sees until the tag is missed.
+
+    Identity falls back in that order: id, then name, then position — each
+    entry keeps a handle of its own, so deduplication never collapses two tags
+    it cannot prove are the same.
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for index, tag in enumerate(existing + additional):
         tag = normalize_tag(tag)
         tid = tag_id(tag)
+        name = tag.get("name")
         if tid:
-            merged[tid] = tag
+            key = ("id", str(tid))
+        elif name:
+            key = ("name", str(name))
+        else:
+            key = ("position", str(index))
+        merged[key] = tag
     return list(merged.values())
