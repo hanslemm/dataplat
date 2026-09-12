@@ -9,6 +9,7 @@ was written.
 from __future__ import annotations
 
 import contextlib
+import csv
 import json
 from typing import Any
 
@@ -16,6 +17,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+from dataplat.cli import _credentials
 from dataplat.cli.people import onboard as onboard_cli
 from dataplat.cli.people.app import app as people_app
 from dataplat.core.errors import ExitCode
@@ -336,3 +338,111 @@ def test_an_ordinary_grant_is_not_flagged(
     assert result.exit_code == 0, result.output
     assert "check it is intended" not in result.output
     assert "check them is intended" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+# Three systems and no transaction between them, so the rules are: record a
+# credential the instant its account exists, never roll back across areas, and
+# report every area's outcome.
+
+
+def _written(tmp_path) -> list[list[str]]:
+    files = list((tmp_path / "credentials").glob("dp-onboard-*.csv"))
+    assert len(files) == 1, files
+    return list(csv.reader(files[0].read_text().splitlines()))
+
+
+@pytest.fixture
+def creds(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    monkeypatch.setattr(_credentials, "CREDENTIALS_DIR", tmp_path / "credentials")
+    return tmp_path
+
+
+def test_every_area_gets_its_account(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    result = _onboard("--yes")
+
+    assert result.exit_code == 0, result.output
+    for cursor in warehouses.values():
+        assert any("CREATE USER" in s or "CREATE ROLE" in s for s in cursor.statements)
+    assert superset.created[0]["username"] == "eva.germeshausen"
+
+
+def test_the_copied_memberships_are_granted(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    _onboard("--yes")
+
+    granted = " ".join(warehouses["dataocean"].statements)
+    assert "team_dna" in granted
+    assert "pii_users" in granted
+    # Superset resolves its names to the ids the API takes.
+    assert superset.created[0]["roles"] == [2]
+
+
+def test_each_area_gets_a_password_of_its_own(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    """Three systems that can be compromised separately get three secrets."""
+    _onboard("--yes")
+
+    rows = _written(creds)[1:]
+    passwords = {row[1] for row in rows}
+    assert len(passwords) == 3
+    assert all(len(p) == 32 for p in passwords)
+
+
+def test_the_credentials_file_records_every_area_and_stays_private(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    result = _onboard("--yes")
+
+    rows = _written(creds)
+    assert rows[0] == ["username", "password", "created_at", "scope"]
+    assert {row[0] for row in rows[1:]} == {
+        "bd_egermeshausen",
+        "e_germeshausen",
+        "eva.germeshausen",
+    }
+    assert {row[3] for row in rows[1:]} == {"dataocean", "betterdata", "superset"}
+
+    written = next((creds / "credentials").glob("dp-onboard-*.csv"))
+    assert written.stat().st_mode & 0o077 == 0
+    for row in rows[1:]:
+        assert row[1] not in result.output
+
+
+def test_an_area_that_fails_does_not_take_the_others_with_it(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    """No rollback across areas: what succeeded stays, and is reported."""
+    failing = warehouses["betterdata"]
+    original = failing.execute
+
+    def boom(query, params=None):
+        if hasattr(query, "as_string"):
+            raise RuntimeError("cluster is read-only")
+        original(query, params)
+
+    failing.execute = boom  # type: ignore[method-assign]
+
+    result = _onboard("--yes")
+
+    assert result.exit_code != 0
+    assert "betterdata" in result.output
+    recorded = {row[3] for row in _written(creds)[1:]}
+    assert recorded == {"dataocean", "superset"}
+    assert superset.created  # the area after the failure still ran
+
+
+def test_nothing_is_created_without_a_confirmation(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset, creds
+) -> None:
+    result = _onboard()
+
+    assert result.exit_code != 0
+    assert superset.created == []
+    assert not (creds / "credentials").exists()

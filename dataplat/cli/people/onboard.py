@@ -9,13 +9,25 @@ written down here, because both belong to the company, not to the tool.
 
 from __future__ import annotations
 
+import csv
+from datetime import UTC, datetime
+from pathlib import Path
+
+import psycopg
 import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from dataplat.cli._exit import fail
+from dataplat.cli._credentials import (
+    credentials_default_path,
+    file_mode_secure,
+    generate_password,
+    open_credentials_file,
+)
+from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
+from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell
 from dataplat.cli.db._common import ConnCliParams, db_session, resolve_params_or_exit
 from dataplat.core.errors import (
@@ -24,6 +36,8 @@ from dataplat.core.errors import (
     ServiceError,
     ValidationError,
 )
+from dataplat.services.db.role_admin import CreateRoleSpec, build_create_plan
+from dataplat.services.db.role_dialects import ParentKind, dialect_for
 from dataplat.services.db.targets import load_targets
 from dataplat.services.people.access import (
     db_membership_holders,
@@ -38,16 +52,36 @@ from dataplat.services.people.identity import (
     render_username,
     username_template,
 )
-from dataplat.services.people.plan import AreaFacts, OnboardPlan, build_onboard_plan
+from dataplat.services.people.plan import (
+    AreaAccount,
+    AreaFacts,
+    OnboardPlan,
+    build_onboard_plan,
+)
 from dataplat.services.superset.client import (
     build_client,
     get_auth_config_from_env,
+)
+from dataplat.services.superset.client import (
+    create_user as _create_user,
+)
+from dataplat.services.superset.client import (
+    iter_groups as _iter_groups,
+)
+from dataplat.services.superset.client import (
+    iter_roles as _iter_roles,
 )
 from dataplat.services.superset.client import (
     iter_users as _iter_users,
 )
 from dataplat.services.superset.client import (
     login as _login,
+)
+from dataplat.services.superset.client import (
+    resolve_group_ids as _resolve_group_ids,
+)
+from dataplat.services.superset.client import (
+    resolve_role_ids as _resolve_role_ids,
 )
 
 console = Console()
@@ -207,6 +241,139 @@ def render_plan(plan: OnboardPlan) -> None:
         console.print("\n[yellow]Nothing to create[/yellow]")
 
 
+def _create_db_account(target, account: AreaAccount, password: str) -> None:
+    """Create one warehouse account with the memberships the plan copied.
+
+    Composes what `dp db role create` composes -- CreateRoleSpec through
+    build_create_plan -- rather than writing SQL here. Onboarding grants only
+    memberships, so every statement is cluster-level and commits together: the
+    account and its access exist at the same instant, or neither does.
+    """
+    params = resolve_params_or_exit(ConnCliParams(target=target.name))
+    dialect = dialect_for(params.engine)
+
+    with db_session(params) as conn:
+        cursor = conn.cursor()
+        # The parents came from the reference user on this same target, so they
+        # exist; their *kind* is what Redshift needs and only the catalog knows.
+        parent_kinds = {}
+        for parent in account.memberships:
+            kind = dialect.resolve_parent_kind(cursor, parent)
+            if kind is not ParentKind.absent:
+                parent_kinds[parent] = kind
+
+        spec = CreateRoleSpec(
+            name=account.username,
+            password=password,
+            member_of=tuple(parent_kinds),
+        )
+        plan = build_create_plan(
+            spec,
+            databases=[params.dbname],
+            dialect=dialect,
+            parent_kinds=parent_kinds,
+        )
+        for op in plan.cluster_ops:
+            cursor.execute(op.statement)
+        conn.commit()
+
+
+def _create_superset_account(
+    identity: PersonIdentity, account: AreaAccount, password: str
+) -> None:
+    """Create the Superset user, resolving the copied names to ids.
+
+    The plan carries names because a person reads it; the API takes ids. Which
+    names are roles and which are groups is Superset's own business, so it is
+    settled here by asking both catalogs rather than by splitting the plan.
+    """
+    cfg = get_auth_config_from_env()
+    with build_client() as client:
+        token = _login(client, cfg.base_url, cfg.username, cfg.password)
+
+        role_names = {
+            str(r.get("name")) for r in _iter_roles(client, cfg.base_url, token)
+        }
+        group_names = {
+            str(g.get("name")) for g in _iter_groups(client, cfg.base_url, token)
+        }
+        wanted_roles = [m for m in account.memberships if m in role_names]
+        wanted_groups = [
+            m for m in account.memberships if m in group_names and m not in role_names
+        ]
+
+        payload: dict = {
+            "username": account.username,
+            "first_name": (identity.first or account.username).title(),
+            "last_name": (identity.last or "User").title(),
+            "email": identity.email,
+            "password": password,
+            "active": True,
+            "roles": _resolve_role_ids(client, cfg.base_url, token, wanted_roles),
+        }
+        if wanted_groups:
+            payload["groups"] = _resolve_group_ids(
+                client, cfg.base_url, token, wanted_groups
+            )
+        _create_user(client, cfg.base_url, token, payload)
+
+
+def _execute(plan: OnboardPlan, targets: dict, path: Path) -> list[BaseException]:
+    """Create every planned account, recording each credential as it lands.
+
+    No rollback across areas. Three systems with no transaction between them
+    means a failure in the third cannot undo the first two, and pretending
+    otherwise would leave the operator with a summary that is not true. What
+    succeeded is kept, recorded, and reported; the exit code comes from the
+    first failure.
+    """
+    failures: list[BaseException] = []
+    creds_file, is_new = open_credentials_file(path)
+    try:
+        writer = csv.writer(creds_file)
+        if is_new:
+            writer.writerow(["username", "password", "created_at", "scope"])
+
+        for account in plan.to_create:
+            # One password per area: three systems that can be compromised
+            # separately should not share a secret.
+            password = generate_password()
+            try:
+                if account.scope == SUPERSET_SCOPE:
+                    _create_superset_account(plan.identity, account, password)
+                else:
+                    _create_db_account(targets[account.scope], account, password)
+            except (
+                AuthError,
+                ConfigError,
+                ServiceError,
+                ValidationError,
+                psycopg.Error,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                console.print(f"[red]✗ {cell(account.scope)}: {cell(exc)}[/red]")
+                failures.append(exc)
+                continue
+
+            writer.writerow(
+                [
+                    account.username,
+                    password,
+                    datetime.now(UTC).isoformat(timespec="seconds"),
+                    account.scope,
+                ]
+            )
+            creds_file.flush()
+            console.print(
+                f"[green]✓ {cell(account.scope)}[/green] "
+                f"[dim]{cell(account.username)}[/dim]"
+            )
+    finally:
+        creds_file.close()
+    return failures
+
+
 def onboard(
     email: str = typer.Argument(..., help="Email of the person to onboard"),
     like: str = typer.Option(
@@ -251,3 +418,24 @@ def onboard(
 
     if dry_run or plan.nothing_to_do:
         return
+
+    confirm_or_exit(
+        yes=yes,
+        prompt=f"\nCreate {len(plan.to_create)} account(s)?",
+        console=console,
+    )
+
+    path = credentials_default_path(prefix="dp-onboard")
+    failures = _execute(
+        plan, {t.name: t for t in _selected_targets(targets).values()}, path
+    )
+
+    console.print(f"\n[dim]Credentials written to {cell(path)}[/dim]")
+    if not file_mode_secure(path):
+        console.print(
+            f"[yellow]![/yellow] [dim]{cell(path)} is readable by others; "
+            "chmod 600 it.[/dim]"
+        )
+
+    if failures:
+        raise typer.Exit(code=exit_code_for(failures[0]))
