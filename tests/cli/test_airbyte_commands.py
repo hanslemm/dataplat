@@ -2236,3 +2236,160 @@ def test_tags_list_reports_missing_configuration(monkeypatch) -> None:
 
     assert result.exit_code == ExitCode.CONFIG
     assert "AIRBYTE_BASE_URL" in result.output
+
+
+# --- bulk update ----------------------------------------------------------
+# Without --connection-id, update walks every active connection. The gate and
+# the per-connection failure handling are what make that safe to run.
+
+
+def test_bulk_update_needs_a_confirmation(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update("--status", "inactive", monkeypatch=monkeypatch, client=client)
+
+    assert result.exit_code != 0
+    assert client.patches == []
+
+
+def test_bulk_update_walks_every_matching_connection(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "--status", "inactive", "-y", monkeypatch=monkeypatch, client=client
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [payload for _, payload in client.patches] == [{"status": "inactive"}]
+    assert "Updated: 1" in result.output
+
+
+def test_bulk_dry_run_changes_nothing(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "--status", "inactive", "--dry-run", monkeypatch=monkeypatch, client=client
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.patches == []
+    assert "dry run" in result.output
+
+
+def test_a_connection_that_fails_does_not_stop_the_rest(monkeypatch) -> None:
+    """One connection's failure is a warning, not the end of the run."""
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    def boom(url, json=None, **kw):
+        raise RuntimeError("connection is locked")
+
+    monkeypatch.setattr(client, "patch", boom)
+
+    result = _update(
+        "--status", "inactive", "-y", monkeypatch=monkeypatch, client=client
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: Failed to update" in result.output
+    assert "Updated: 0" in result.output
+
+
+def test_a_source_filter_that_matches_nothing_says_so(monkeypatch) -> None:
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "--status",
+        "inactive",
+        "--source-id",
+        "other",
+        "-y",
+        monkeypatch=monkeypatch,
+        client=client,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No matching active connections" in result.output
+    assert client.patches == []
+
+
+def test_a_single_update_skips_a_connection_the_filter_excludes(monkeypatch) -> None:
+    """-c names one connection; --source-id can still veto it."""
+    client = _StateFakeClient(state=dict(_STREAM_STATE))
+
+    result = _update(
+        "-c",
+        "c1",
+        "--status",
+        "inactive",
+        "--source-id",
+        "other",
+        monkeypatch=monkeypatch,
+        client=client,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipping" in result.output
+    assert client.patches == []
+
+
+# --- list filters ---------------------------------------------------------
+# Every filter is applied client-side over the paginated listing, so each one
+# is a chance to hide a connection that should have been shown.
+
+_CONNECTIONS_PAGE = {
+    "data": [
+        {
+            "connectionId": "c1",
+            "name": "active one",
+            "status": "active",
+            "sourceId": "s1",
+            "destinationId": "d1",
+            "workspaceId": "ws1",
+        },
+        {
+            "connectionId": "c2",
+            "name": "paused one",
+            "status": "inactive",
+            "sourceId": "s2",
+            "destinationId": "d2",
+            "workspaceId": "ws2",
+        },
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "kept", "dropped"),
+    [
+        ("--status", "active", "active one", "paused one"),
+        ("--source-id", "s2", "paused one", "active one"),
+        ("--destination-id", "d1", "active one", "paused one"),
+        ("--workspace-id", "ws2", "paused one", "active one"),
+    ],
+    ids=["status", "source", "destination", "workspace"],
+)
+def test_each_list_filter_keeps_only_what_it_names(
+    monkeypatch, flag: str, value: str, kept: str, dropped: str
+) -> None:
+    client = _AirbyteFake({"GET /connections": _CONNECTIONS_PAGE})
+
+    result = _invoke(
+        monkeypatch,
+        client,
+        ["ingest", "airbyte", "connections", "list", flag, value],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert kept in result.stdout
+    assert dropped not in result.stdout
+
+
+def test_list_json_is_machine_readable(monkeypatch) -> None:
+    client = _AirbyteFake({"GET /connections": _CONNECTIONS_PAGE})
+
+    result = _invoke(
+        monkeypatch, client, ["ingest", "airbyte", "connections", "list", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert {c["connectionId"] for c in json.loads(result.stdout)} == {"c1", "c2"}
