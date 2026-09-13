@@ -334,3 +334,281 @@ def test_rollback_summary_escapes_version_ids(monkeypatch) -> None:
     assert "[/x]curr" in result.stdout
     assert "[bold]pr" in result.stdout
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Choosing where the value comes from
+# ---------------------------------------------------------------------------
+# Every one of these refuses before a client is built. A secret written from
+# the wrong source is not an error anyone sees: it is a value that is simply
+# wrong from then on.
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["set", "my/secret"], id="none"),
+        pytest.param(
+            ["set", "my/secret", "--value", "x", "--from-json", "{}"], id="two"
+        ),
+        pytest.param(
+            ["set", "my/secret", "--value", "x", "--value-stdin"], id="value-and-stdin"
+        ),
+    ],
+)
+def test_set_needs_exactly_one_source(argv: list[str], client: _FakeClient) -> None:
+    result = runner.invoke(secrets_cli.app, argv)
+
+    assert result.exit_code == 1
+    assert "exactly one of" in result.stdout
+    assert client.calls == []
+
+
+def test_set_refuses_json_that_does_not_parse(client: _FakeClient) -> None:
+    result = runner.invoke(
+        secrets_cli.app, ["set", "my/secret", "--from-json", "{not json"]
+    )
+
+    assert result.exit_code == 1
+    assert "not valid JSON" in result.stdout
+    assert client.calls == []
+
+
+def test_set_refuses_a_file_it_cannot_read(client: _FakeClient) -> None:
+    result = runner.invoke(
+        secrets_cli.app, ["set", "my/secret", "--from-file", "/no/such/file.json"]
+    )
+
+    assert result.exit_code == 1
+    assert "Cannot read file" in result.stdout
+    assert client.calls == []
+
+
+def test_set_reads_a_file(client: _FakeClient, monkeypatch, tmp_path) -> None:
+    path = tmp_path / "value.json"
+    path.write_text('{"from": "file"}')
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app, ["set", "my/secret", "--from-file", str(path)]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert client.calls[0] == ("put_secret_value", {"SecretString": '{"from": "file"}'})
+
+
+def test_set_reads_stdin(client: _FakeClient, monkeypatch) -> None:
+    """So a password never has to appear in a shell history or a process list."""
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app, ["set", "my/secret", "--value-stdin", "-y"], input="s3cret\n"
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert client.calls[0][1]["SecretString"] == "s3cret"
+    assert "s3cret" not in result.stdout
+
+
+def test_set_updates_the_description_separately(
+    client: _FakeClient, monkeypatch
+) -> None:
+    """Secrets Manager takes the value and the description through two calls."""
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app,
+        ["set", "my/secret", "--value", "x", "--description", "why", "-y"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert [name for name, _ in client.calls] == ["put_secret_value", "update_secret"]
+
+
+# ---------------------------------------------------------------------------
+# edit: which keys, from where
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["edit", "my/secret"], id="neither"),
+        pytest.param(["edit", "my/secret", "-k", "a"], id="key-without-value"),
+        pytest.param(
+            ["edit", "my/secret", "-k", "a", "-v", "1", "--from-file", "p.json"],
+            id="pair-and-file",
+        ),
+    ],
+)
+def test_edit_needs_a_coherent_patch(argv: list[str], client: _FakeClient) -> None:
+    result = runner.invoke(secrets_cli.app, argv)
+
+    assert result.exit_code == 1
+    assert client.calls == []
+
+
+def test_edit_refuses_a_json_file_that_is_not_an_object(
+    client: _FakeClient, tmp_path
+) -> None:
+    """A list of keys is not a patch, and guessing what it meant writes garbage."""
+    path = tmp_path / "patch.json"
+    path.write_text('["a", "b"]')
+
+    result = runner.invoke(
+        secrets_cli.app, ["edit", "my/secret", "--from-file", str(path)]
+    )
+
+    assert result.exit_code == 1
+    assert "object at the top level" in result.stdout
+    assert client.calls == []
+
+
+def test_edit_refuses_a_json_file_that_does_not_parse(
+    client: _FakeClient, tmp_path
+) -> None:
+    path = tmp_path / "patch.json"
+    path.write_text("{oops")
+
+    result = runner.invoke(
+        secrets_cli.app, ["edit", "my/secret", "--from-file", str(path)]
+    )
+
+    assert result.exit_code == 1
+    assert "not valid JSON" in result.stdout
+    assert client.calls == []
+
+
+def test_edit_applies_a_patch_from_a_file(
+    client: _FakeClient, monkeypatch, tmp_path
+) -> None:
+    path = tmp_path / "patch.json"
+    path.write_text('{"b": "2", "c": "3"}')
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app, ["edit", "my/secret", "--from-file", str(path), "-y"]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    written = json.loads(client.calls[-1][1]["SecretString"])
+    # The existing key survives; the patch is a patch, not a replacement.
+    assert written == {"a": "1", "b": "2", "c": "3"}
+
+
+def test_edit_refuses_a_secret_that_is_not_json(monkeypatch) -> None:
+    """There is no key to edit in a blob, and overwriting it would lose it."""
+    monkeypatch.delenv("DP_AWS_PROFILE_ALIASES", raising=False)
+    monkeypatch.setattr(
+        secrets_cli, "console", Console(width=400, no_color=True, legacy_windows=False)
+    )
+    fake = _FakeClient("not json at all")
+    monkeypatch.setattr(
+        secrets_cli, "_get_client", lambda profile=None, region=None: fake
+    )
+    monkeypatch.setattr(
+        secrets_cli, "_get_sts_client", lambda profile=None, region=None: _FakeSts()
+    )
+    monkeypatch.setattr(
+        secrets_cli, "_resolve_profiles", lambda profiles: ["Admin-Prod"]
+    )
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app, ["edit", "my/secret", "-k", "a", "-v", "2", "-y"]
+    )
+
+    assert "not valid JSON" in result.stdout
+    assert [name for name, _ in fake.calls] == []
+
+
+# ---------------------------------------------------------------------------
+# rename-key
+# ---------------------------------------------------------------------------
+
+
+def test_rename_key_refuses_when_the_new_name_is_taken(
+    client: _FakeClient, monkeypatch
+) -> None:
+    """Renaming onto an existing key would overwrite a value nobody asked about."""
+    client._stored = json.dumps({"a": "1", "b": "2"})
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app,
+        ["rename-key", "my/secret", "--old-key", "a", "--new-key", "b", "-y"],
+    )
+
+    assert "already exists" in result.stdout
+    assert [name for name, _ in client.calls] == []
+
+
+def test_rename_key_reports_a_key_that_is_not_there(
+    client: _FakeClient, monkeypatch
+) -> None:
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app,
+        ["rename-key", "my/secret", "--old-key", "nope", "--new-key", "b", "-y"],
+    )
+
+    assert "not found in secret" in result.stdout
+    assert [name for name, _ in client.calls] == []
+
+
+def test_rename_key_keeps_the_keys_in_order(client: _FakeClient, monkeypatch) -> None:
+    """A secret is read by people; reordering it makes a diff nobody can review."""
+    client._stored = json.dumps({"first": "1", "second": "2", "third": "3"})
+    _answer(monkeypatch, accepted=True)
+
+    result = runner.invoke(
+        secrets_cli.app,
+        ["rename-key", "my/secret", "--old-key", "second", "--new-key", "middle", "-y"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    written = json.loads(client.calls[-1][1]["SecretString"])
+    assert list(written) == ["first", "middle", "third"]
+
+
+# ---------------------------------------------------------------------------
+# restore and versions
+# ---------------------------------------------------------------------------
+
+
+def test_restore_cancels_a_scheduled_deletion(client: _FakeClient) -> None:
+    result = runner.invoke(secrets_cli.app, ["restore", "my/secret"])
+
+    assert result.exit_code == 0, result.stdout
+    assert ("restore_secret", {"SecretId": "my/secret"}) in client.calls
+
+
+def test_restore_reports_a_secret_that_is_not_there(
+    client: _FakeClient, monkeypatch
+) -> None:
+    def missing(SecretId: str) -> None:
+        raise _FakeNotFound
+
+    monkeypatch.setattr(client, "restore_secret", missing)
+
+    result = runner.invoke(secrets_cli.app, ["restore", "gone"])
+
+    assert result.exit_code == 1
+    assert "not found" in result.stdout
+
+
+def test_versions_json_is_machine_readable(client: _FakeClient) -> None:
+    result = runner.invoke(secrets_cli.app, ["versions", "my/secret", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert {v["version_id"] for v in payload} == {"v-current", "v-previous"}
+    assert any("AWSCURRENT" in v["stages"] for v in payload)
+
+
+def test_versions_renders_a_table(client: _FakeClient) -> None:
+    result = runner.invoke(secrets_cli.app, ["versions", "my/secret"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "v-current" in result.stdout
