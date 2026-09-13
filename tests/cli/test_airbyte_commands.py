@@ -2051,3 +2051,188 @@ def test_create_sends_what_it_was_given(monkeypatch) -> None:
         "cronExpression": "0 0 3 ? * *",
         "cronTimeZone": "Europe/Berlin",
     }
+
+
+# ---------------------------------------------------------------------------
+# tags, and the shared source/destination resource app
+# ---------------------------------------------------------------------------
+
+
+def test_tags_create_passes_the_colour_and_workspace(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    import dataplat.cli.ingest.airbyte.tags as _tags
+
+    client = _StateFakeClient(state={})
+    sent: dict = {}
+
+    def spy(c, b, name, workspace_id=None, color=None):
+        sent.update(name=name, workspace_id=workspace_id, color=color)
+        return {"tagId": "t9", "name": name}
+
+    monkeypatch.setattr(
+        _tags, "build_authenticated_client", lambda: (client, "http://t")
+    )
+    monkeypatch.setattr(_tags, "create_tag", spy)
+
+    result = runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "tags",
+            "create",
+            "--name",
+            "nightly",
+            "--workspace-id",
+            "ws1",
+            "--color",
+            "75DCFF",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sent == {"name": "nightly", "workspace_id": "ws1", "color": "75DCFF"}
+    assert json.loads(result.stdout)["tagId"] == "t9"
+
+
+def test_a_resource_update_needs_something_to_change(monkeypatch) -> None:
+    """Neither --name nor --config is a request to do nothing."""
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    result = runner.invoke(
+        main_module.app,
+        ["ingest", "airbyte", "sources", "update", "--source-id", "s1"],
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "at least one of" in result.output
+
+
+def test_a_resource_config_file_that_is_missing_is_named(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+
+    result = runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "sources",
+            "update",
+            "--source-id",
+            "s1",
+            "--config",
+            "/no/such/config.json",
+        ],
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "config file not found" in result.output
+
+
+def test_a_resource_config_that_is_not_json_is_named(monkeypatch, tmp_path) -> None:
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+    path = tmp_path / "config.json"
+    path.write_text("{oops")
+
+    result = runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "sources",
+            "update",
+            "--source-id",
+            "s1",
+            "--config",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "invalid JSON" in result.output
+
+
+def test_a_resource_update_sends_name_and_config(monkeypatch, tmp_path) -> None:
+    _disable_envrc(monkeypatch)
+    _mock_authenticated_client(monkeypatch)
+    path = tmp_path / "config.json"
+    path.write_text('{"host": "db.internal"}')
+
+    result = runner.invoke(
+        main_module.app,
+        [
+            "ingest",
+            "airbyte",
+            "sources",
+            "update",
+            "--source-id",
+            "s1",
+            "--name",
+            "renamed",
+            "--config",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)
+
+
+def test_tags_list_reports_a_service_failure(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    import dataplat.cli.ingest.airbyte.tags as _tags
+
+    def boom(c, b):
+        raise ServiceError("Failed to list tags (503 Service Unavailable): down")
+
+    monkeypatch.setattr(
+        _tags,
+        "build_authenticated_client",
+        lambda: (_StateFakeClient(state={}), "http://t"),
+    )
+    monkeypatch.setattr(_tags, "list_tags", boom)
+
+    result = runner.invoke(main_module.app, ["ingest", "airbyte", "tags", "list"])
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "503" in result.output
+
+
+def test_tags_create_reports_a_rejected_tag(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    import dataplat.cli.ingest.airbyte.tags as _tags
+
+    def boom(c, b, name, workspace_id=None, color=None):
+        raise ServiceError("Failed to create tag (422 Unprocessable Entity): dupe")
+
+    monkeypatch.setattr(
+        _tags,
+        "build_authenticated_client",
+        lambda: (_StateFakeClient(state={}), "http://t"),
+    )
+    monkeypatch.setattr(_tags, "create_tag", boom)
+
+    result = runner.invoke(
+        main_module.app, ["ingest", "airbyte", "tags", "create", "--name", "prod"]
+    )
+
+    assert result.exit_code == ExitCode.SERVICE
+    assert "422" in result.output
+
+
+def test_tags_list_reports_missing_configuration(monkeypatch) -> None:
+    _disable_envrc(monkeypatch)
+    import dataplat.cli.ingest.airbyte.tags as _tags
+
+    def unconfigured():
+        raise ConfigError("Set AIRBYTE_BASE_URL")
+
+    monkeypatch.setattr(_tags, "build_authenticated_client", unconfigured)
+
+    result = runner.invoke(main_module.app, ["ingest", "airbyte", "tags", "list"])
+
+    assert result.exit_code == ExitCode.CONFIG
+    assert "AIRBYTE_BASE_URL" in result.output

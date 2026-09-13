@@ -9,6 +9,7 @@ handles ownership reassignment, and `dp bi superset users delete`.
 
 from __future__ import annotations
 
+import psycopg
 import typer
 from rich import box
 from rich.console import Console
@@ -248,7 +249,20 @@ def offboard(
                 _disable_superset_account(account)
             else:
                 _disable_db_account(configured[account.scope], account)
-        except (AuthError, ConfigError, ServiceError, ValidationError) as exc:
+        except (
+            AuthError,
+            ConfigError,
+            ServiceError,
+            ValidationError,
+            psycopg.Error,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            # The same list onboard catches, and for the same reason: one area
+            # failing must not decide the fate of the others. A driver error
+            # from the first warehouse used to abort the run before Superset
+            # was ever reached, which left access half-revoked and the summary
+            # silent about the half that was skipped.
             console.print(f"[red]✗ {cell(account.scope)}: {cell(exc)}[/red]")
             failures.append(exc)
             continue

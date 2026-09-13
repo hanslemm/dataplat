@@ -539,3 +539,67 @@ def test_offboard_needs_a_confirmation(
 
     assert result.exit_code != 0
     assert superset.updated == []
+
+
+def test_offboard_narrows_to_one_target(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard("--dry-run", "--target", "dataocean")
+
+    assert result.exit_code == 0, result.output
+    assert "bd_hlemm" in result.output
+    assert "h_lemm" not in result.output
+
+
+def test_offboard_rejects_an_unknown_target(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard("--dry-run", "--target", "nope")
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "nope" in result.output
+
+
+def test_offboard_can_skip_the_warehouses(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    result = _offboard("--dry-run", "--no-db")
+
+    assert result.exit_code == 0, result.output
+    assert "superset" in result.output
+    assert "bd_hlemm" not in result.output
+
+
+def test_offboard_says_when_there_is_nothing_to_disable(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    """Someone who was never onboarded, or already gone."""
+    for cursor in warehouses.values():
+        cursor._users = {}
+
+    result = runner.invoke(
+        people_app, ["offboard", "nobody.here@betterdoc.de", "--dry-run"], env=WIDE
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to disable" in result.output
+
+
+def test_offboard_reports_an_area_that_failed_and_keeps_going(
+    warehouses: dict[str, _Cursor], superset: FakeSuperset
+) -> None:
+    """The account that could be disabled still is; the exit code says one wasn't."""
+    failing = warehouses["dataocean"]
+    original = failing.execute
+
+    def boom(query, params=None):
+        if hasattr(query, "as_string"):
+            raise RuntimeError("cluster is read-only")
+        original(query, params)
+
+    failing.execute = boom  # type: ignore[method-assign]
+
+    result = _offboard("--yes")
+
+    assert result.exit_code != 0
+    assert superset.updated == [("7", {"active": False})]
