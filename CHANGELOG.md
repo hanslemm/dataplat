@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`dp people offboard` stopped at the first area that failed.** Its execution
+  loop caught only the four typed dataplat errors, so a driver-level failure on
+  the first warehouse aborted the run before Superset was reached — leaving
+  access half-revoked and a summary that said nothing about the half it skipped.
+  It now catches what `onboard` catches, for the reason `onboard` catches it:
+  one area failing must not decide the fate of the others.
+
+### Changed
+
+- **Coverage of the commands that change things.** 89% → 91% overall, but the
+  number is not the point — these are the paths where a mistake writes
+  something wrong rather than raising:
+
+  - `dp cloud aws secrets` 77% → 85%. The confirmation gates were already
+    tested; what happens after them mostly was not. `rename-key` refusing a
+    name that is already taken, and preserving key order so a rename does not
+    produce an unreviewable diff, are now pinned — as is refusing to edit a
+    secret that is not JSON rather than replacing it.
+  - `dp ingest airbyte connections` 69% → 76%: the bulk-update walk, its
+    confirmation gate, its per-connection failure handling, and every list
+    filter.
+  - `_resource.py` 72% → 94%, `tags.py` 76% → 94%, `dp people offboard` 83% →
+    97%.
+
+  A duplicate test name was shadowing an existing test, which had silently
+  stopped running; ruff's F811 caught it once the file grew.
+
 ## 0.9.0
 
 ### Added
