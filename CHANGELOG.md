@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`dp db schema drop` says what depends on the schema.** It could already
+  show what a schema *contains*; what breaks when it goes was a question only
+  `dp db schema impact` could answer, and only if someone thought to ask it.
+  The check now runs before the confirmation and before a `--dry-run` exits:
+  against a real warehouse, `drop raw --dry-run` reads "34 Superset dataset(s),
+  1 Airbyte destination(s), 37 connection(s) writing into it".
+
+  Advisory and never fatal. A check that can block a drop is worse than no
+  check at all — an operator who cannot drop a schema because an unrelated
+  system is down will pass whatever flag silences it and never see the check
+  again — so a Superset outage produces a note and the drop proceeds.
+  `--no-impact` skips it outright.
+
+- **`dp bi superset users update` can change roles**, with `--add-role`,
+  `--remove-role` and `--set-role` mirroring the group flags exactly, filters
+  and `--dry-run` included. Nothing here could change a Superset role before:
+  `update` moved groups and `roles list` listed, so revoking someone's `Admin`
+  meant calling the API by hand.
+
+  The "nothing changed, skip this user" test compared groups alone, so a user
+  whose groups stayed put but whose roles changed would have been skipped —
+  which is the whole of this feature. It now counts either kind of change.
+
 ## 0.9.1
 
 ### Fixed

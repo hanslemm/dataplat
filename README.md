@@ -708,6 +708,19 @@ connections that write through them (`raw`: one destination, 37 connections).
 Add `--json` to feed it to something else. Both systems are optional: with only
 one configured, you still get that half of the answer.
 
+`dp db schema drop` runs the same check itself, before the confirmation and
+before a `--dry-run` exits, so the answer arrives at the moment it is needed
+rather than only when someone thinks to ask:
+
+```text
+Depends on this:
+  raw: 34 Superset dataset(s), 1 Airbyte destination(s), 37 connection(s)
+       writing into it — `dp db schema impact raw`
+```
+
+It is advisory and never fatal — a Superset outage produces a note, not a
+blocked drop — and `--no-impact` skips it.
+
 ### Onboarding and offboarding
 
 Access spans three systems, and each names the same person differently. The

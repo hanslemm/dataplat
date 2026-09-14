@@ -588,11 +588,11 @@ def test_user_create_unknown_role_is_reported(api: FakeSuperset) -> None:
     assert api.created == []
 
 
-def test_user_update_requires_a_group_flag(api: FakeSuperset) -> None:
+def test_user_update_requires_something_to_change(api: FakeSuperset) -> None:
     result = runner.invoke(superset_cli.app, ["users", "update"])
 
     assert result.exit_code == 1
-    assert "specify at least one group update flag" in result.output
+    assert "specify at least one group or role update flag" in result.output
     assert api.updated == []
 
 
@@ -845,3 +845,109 @@ def test_user_create_can_generate_its_password(
     rows = list(csv.reader(written[0].read_text().splitlines()))
     assert rows[1][0] == "eva.germeshausen"
     assert rows[1][1] == sent
+
+
+# ---------------------------------------------------------------------------
+# users update: roles, not just groups
+# ---------------------------------------------------------------------------
+# Roles are Superset's privilege tiers, and until now nothing here could change
+# one: `update` moved groups, `roles list` listed. Revoking someone's Admin
+# meant the API by hand.
+
+
+def test_a_role_can_be_added(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "ada@example.com", "--add-role", "Admin"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    user_id, payload = api.updated[0]
+    assert user_id == "7"
+    assert sorted(payload["roles"]) == [1, 2]  # Admin added beside Gamma
+
+
+def test_a_role_can_be_removed(api: FakeSuperset) -> None:
+    """The thing that could not be done at all before."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "bob@example.com", "--remove-role", "Admin"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    user_id, payload = api.updated[0]
+    assert user_id == "8"
+    assert payload["roles"] == []
+
+
+def test_roles_can_be_replaced_wholesale(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "bob@example.com", "--set-role", "Gamma"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated[0][1]["roles"] == [2]
+
+
+def test_a_role_change_alone_is_still_a_change(api: FakeSuperset) -> None:
+    """The skip test used to compare groups only.
+
+    A user whose groups stay put but whose roles change would have been
+    skipped as "nothing to do" -- which is the whole of this feature.
+    """
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "ada@example.com", "--add-role", "Admin"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated, "a role-only change was skipped"
+    assert "Updated 1" in result.output
+
+
+def test_groups_survive_a_role_change(api: FakeSuperset) -> None:
+    """The payload carries both, so neither may be dropped by touching the other."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "bob@example.com", "--remove-role", "Admin"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated[0][1]["groups"] == [11]  # bob's existing group, untouched
+
+
+def test_set_role_cannot_be_combined_with_add_role(api: FakeSuperset) -> None:
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--set-role", "Gamma", "--add-role", "Admin"],
+        env=WIDE,
+    )
+
+    assert result.exit_code != 0
+    assert api.updated == []
+
+
+def test_update_still_needs_something_to_do(api: FakeSuperset) -> None:
+    result = runner.invoke(superset_cli.app, ["users", "update"], env=WIDE)
+
+    assert result.exit_code != 0
+    assert "role" in result.output
+    assert api.updated == []
+
+
+def test_an_unchanged_role_set_is_not_rewritten(api: FakeSuperset) -> None:
+    """Adding a role someone already holds is not a write."""
+    result = runner.invoke(
+        superset_cli.app,
+        ["users", "update", "--email", "ada@example.com", "--add-role", "Gamma"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert api.updated == []
