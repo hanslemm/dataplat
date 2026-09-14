@@ -501,6 +501,21 @@ def update_users(
         "--set-group",
         help="Replace groups with this list (repeatable)",
     ),
+    add_role: list[str] | None = typer.Option(
+        None,
+        "--add-role",
+        help="Role to add (repeatable)",
+    ),
+    remove_role: list[str] | None = typer.Option(
+        None,
+        "--remove-role",
+        help="Role to remove (repeatable)",
+    ),
+    set_role: list[str] | None = typer.Option(
+        None,
+        "--set-role",
+        help="Replace roles with this list (repeatable)",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -510,14 +525,23 @@ def update_users(
     """Update users in bulk based on role filters and group changes."""
     base_url, admin_username, admin_password = _load_auth_context()
 
-    if not any([add_group, remove_group, set_group]):
-        console.print("[red]Error: specify at least one group update flag[/red]")
+    if not any([add_group, remove_group, set_group, add_role, remove_role, set_role]):
+        console.print(
+            "[red]Error: specify at least one group or role update flag[/red]"
+        )
         raise typer.Exit(code=1)
 
     if set_group and (add_group or remove_group):
         console.print(
             "[red]Error: --set-group cannot be combined with "
             "--add-group or --remove-group[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    if set_role and (add_role or remove_role):
+        console.print(
+            "[red]Error: --set-role cannot be combined with "
+            "--add-role or --remove-role[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -546,6 +570,21 @@ def update_users(
             set_group_ids = (
                 _resolve_group_ids(client, base_url, access_token, set_group)
                 if set_group
+                else []
+            )
+            add_role_ids = (
+                _resolve_role_ids(client, base_url, access_token, add_role)
+                if add_role
+                else []
+            )
+            remove_role_ids = (
+                _resolve_role_ids(client, base_url, access_token, remove_role)
+                if remove_role
+                else []
+            )
+            set_role_ids = (
+                _resolve_role_ids(client, base_url, access_token, set_role)
+                if set_role
                 else []
             )
 
@@ -595,7 +634,22 @@ def update_users(
                             gid for gid in updated_groups if gid not in remove_group_ids
                         ]
 
-                if set(updated_groups) == set(user_groups):
+                updated_roles = user_roles
+                if set_role is not None and set_role:
+                    updated_roles = list(set_role_ids)
+                elif add_role_ids or remove_role_ids:
+                    updated_roles = list(set(user_roles).union(add_role_ids))
+                    if remove_role_ids:
+                        updated_roles = [
+                            rid for rid in updated_roles if rid not in remove_role_ids
+                        ]
+
+                # Either kind of change counts. This compared groups alone, so
+                # a user whose groups stayed put but whose roles changed was
+                # skipped as "nothing to do".
+                if set(updated_groups) == set(user_groups) and set(
+                    updated_roles
+                ) == set(user_roles):
                     continue
 
                 matched += 1
@@ -603,7 +657,7 @@ def update_users(
                     continue
 
                 payload = {
-                    "roles": user_roles,
+                    "roles": updated_roles,
                     "groups": updated_groups,
                 }
                 _update_user(client, base_url, access_token, user_id, payload)
