@@ -18,7 +18,8 @@ from typer.testing import CliRunner
 from dataplat.cli.db import app as db_app
 from dataplat.cli.db import schema_alter, schema_create, schema_drop, schema_grant
 from dataplat.cli.db._schema_opts import is_protected_schema
-from dataplat.core.errors import ExitCode
+from dataplat.core.errors import ExitCode, ServiceError
+from dataplat.services.impact import ConnectionRef, DatasetRef, DestinationRef
 
 
 class _Cursor:
@@ -149,6 +150,7 @@ def test_drop_refuses_a_protected_schema(monkeypatch, capsys) -> None:
             if_exists=False,
             dry_run=False,
             yes=True,
+            no_impact=True,
             **_CONN,
         )
 
@@ -171,6 +173,7 @@ def test_like_cannot_reach_a_protected_schema(monkeypatch, capsys) -> None:
         if_exists=False,
         dry_run=True,
         yes=True,
+        no_impact=True,
         **_CONN,
     )
 
@@ -257,6 +260,7 @@ def test_drop_shows_the_blast_radius_before_confirming(monkeypatch, capsys) -> N
         if_exists=False,
         dry_run=True,
         yes=True,
+        no_impact=True,
         **_CONN,
     )
 
@@ -277,6 +281,7 @@ def test_drop_warns_that_restrict_will_refuse(monkeypatch, capsys) -> None:
         if_exists=False,
         dry_run=True,
         yes=True,
+        no_impact=True,
         **_CONN,
     )
 
@@ -295,6 +300,7 @@ def test_drop_of_a_missing_schema_names_the_flag(monkeypatch, capsys) -> None:
             if_exists=False,
             dry_run=False,
             yes=True,
+            no_impact=True,
             **_CONN,
         )
 
@@ -313,6 +319,7 @@ def test_names_and_like_together_are_rejected(monkeypatch) -> None:
             if_exists=False,
             dry_run=True,
             yes=True,
+            no_impact=True,
             **_CONN,
         )
 
@@ -328,6 +335,7 @@ def test_neither_names_nor_like_is_rejected(monkeypatch) -> None:
             if_exists=False,
             dry_run=True,
             yes=True,
+            no_impact=True,
             **_CONN,
         )
 
@@ -715,3 +723,130 @@ def test_alter_with_nothing_to_change_is_refused(monkeypatch, capsys) -> None:
     assert exc.value.exit_code == ExitCode.INVALID_INPUT
     assert cursor.statements == []
     assert "nothing to do" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# drop: what depends on this schema
+# ---------------------------------------------------------------------------
+# `schema drop` can say what a schema contains. What breaks when it goes is the
+# half that surprises people, and the moment they most need it is the moment
+# they type this command -- so the check runs here, before the confirmation.
+
+
+def _impact(monkeypatch, datasets=(), destinations=(), connections=(), boom=False):
+    from dataplat.cli.db import schema_impact
+
+    def superset(schema: str):
+        if boom:
+            raise ServiceError("Failed to list Superset datasets (503): down")
+        return tuple(datasets), None
+
+    def airbyte(schema: str):
+        return tuple(destinations), tuple(connections), None
+
+    monkeypatch.setattr(schema_impact, "HTTP_AREAS_AVAILABLE", True)
+    monkeypatch.setattr(schema_impact, "_superset_datasets", superset)
+    monkeypatch.setattr(schema_impact, "_airbyte_writers", airbyte)
+
+
+def test_drop_names_what_depends_on_the_schema(monkeypatch, capsys) -> None:
+    cursor = _Cursor(schemas=[("analytics", "postgres", 0, 0, 0)])
+    _patch(monkeypatch, schema_drop, cursor)
+    _impact(
+        monkeypatch,
+        datasets=[DatasetRef(name="orders", database="Prod", via="schema")],
+        destinations=[
+            DestinationRef(name="raw sink", destination_id="d1", database="dataocean")
+        ],
+        connections=[ConnectionRef(name="sheets", connection_id="c1", status="active")],
+    )
+
+    schema_drop.drop_command(
+        names=["analytics"],
+        cascade=False,
+        like=None,
+        if_exists=False,
+        dry_run=True,
+        yes=True,
+        no_impact=False,
+        **_CONN,
+    )
+
+    out = capsys.readouterr().out
+    assert "1 Superset dataset" in out
+    assert "1 Airbyte destination" in out
+    assert "schema impact analytics" in out  # where to get the detail
+
+
+def test_drop_says_when_nothing_depends_on_it(monkeypatch, capsys) -> None:
+    cursor = _Cursor(schemas=[("analytics", "postgres", 0, 0, 0)])
+    _patch(monkeypatch, schema_drop, cursor)
+    _impact(monkeypatch)
+
+    schema_drop.drop_command(
+        names=["analytics"],
+        cascade=False,
+        like=None,
+        if_exists=False,
+        dry_run=True,
+        yes=True,
+        no_impact=False,
+        **_CONN,
+    )
+
+    assert "Nothing outside the database" in capsys.readouterr().out
+
+
+def test_a_failing_check_warns_and_lets_the_drop_continue(monkeypatch, capsys) -> None:
+    """Advisory, not a gate: a Superset outage must not block a schema drop.
+
+    The alternative is worse than no check at all -- an operator who cannot
+    drop a schema because an unrelated system is down will pass whatever flag
+    silences it, and then never see the check again.
+    """
+    cursor = _Cursor(schemas=[("analytics", "postgres", 0, 0, 0)])
+    _patch(monkeypatch, schema_drop, cursor)
+    _impact(monkeypatch, boom=True)
+
+    schema_drop.drop_command(
+        names=["analytics"],
+        cascade=False,
+        like=None,
+        if_exists=False,
+        dry_run=True,
+        yes=True,
+        no_impact=False,
+        **_CONN,
+    )
+
+    out = capsys.readouterr().out
+    assert "could not be checked" in out
+    assert "DROP SCHEMA" in out  # the plan was still produced
+
+
+def test_no_impact_asks_nothing(monkeypatch, capsys) -> None:
+    cursor = _Cursor(schemas=[("analytics", "postgres", 0, 0, 0)])
+    _patch(monkeypatch, schema_drop, cursor)
+    asked: list[str] = []
+
+    from dataplat.cli.db import schema_impact
+
+    monkeypatch.setattr(schema_impact, "HTTP_AREAS_AVAILABLE", True)
+    monkeypatch.setattr(
+        schema_impact,
+        "_superset_datasets",
+        lambda schema: (asked.append(schema), ((), None))[1],
+    )
+
+    schema_drop.drop_command(
+        names=["analytics"],
+        cascade=False,
+        like=None,
+        if_exists=False,
+        dry_run=True,
+        yes=True,
+        no_impact=True,
+        **_CONN,
+    )
+
+    assert asked == []
