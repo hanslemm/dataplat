@@ -54,6 +54,45 @@ except ImportError:  # pragma: no cover - dataplat[db] without [bi]/[ingest]
 console = Console()
 
 
+def summarize(schemas: list[str]) -> tuple[list[str], list[str]]:
+    """One line per schema something depends on, plus notes for what was skipped.
+
+    Never raises. This is advisory, and a check that can block a drop is worse
+    than no check at all: an operator who cannot drop a schema because an
+    unrelated system is down will pass whatever flag silences it, and then
+    never see the check again.
+    """
+    if not HTTP_AREAS_AVAILABLE:
+        return [], ["dependants not checked: dataplat[bi,ingest] is not installed"]
+
+    lines: list[str] = []
+    notes: list[str] = []
+    for schema in schemas:
+        try:
+            datasets, superset_note = _superset_datasets(schema)
+            destinations, connections, airbyte_note = _airbyte_writers(schema)
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            notes.append(f"{schema}: dependants could not be checked ({exc})")
+            continue
+
+        for note in (superset_note, airbyte_note):
+            if note and note not in notes:
+                notes.append(note)
+
+        parts = []
+        if datasets:
+            parts.append(f"{len(datasets)} Superset dataset(s)")
+        if destinations:
+            parts.append(f"{len(destinations)} Airbyte destination(s)")
+        if connections:
+            parts.append(f"{len(connections)} connection(s) writing into it")
+        if parts:
+            lines.append(
+                f"{schema}: {', '.join(parts)} — `dp db schema impact {schema}`"
+            )
+    return lines, notes
+
+
 def _superset_datasets(schema: str) -> tuple[tuple[DatasetRef, ...], str | None]:
     """Datasets referencing ``schema``, or a reason there is no answer."""
     if not os.getenv("SUPERSET_BASE_URL"):

@@ -42,6 +42,7 @@ from dataplat.cli.db._common import (
 )
 from dataplat.cli.db._plan import execute_ops, print_ops
 from dataplat.cli.db._schema_opts import SchemaLikeOption, is_protected_schema
+from dataplat.cli.db.schema_impact import summarize as impact_summary
 from dataplat.core.errors import ValidationError
 from dataplat.services.db._like import glob_to_like
 from dataplat.services.db.connection import SqlEngine
@@ -95,6 +96,12 @@ def drop_command(
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the SQL and exit without executing it."
+    ),
+    no_impact: bool = typer.Option(
+        False,
+        "--no-impact",
+        help="Skip the check for Superset datasets and Airbyte destinations "
+        "that depend on these schemas.",
     ),
     yes: bool = YesOption,
     target: str | None = TargetOption,
@@ -184,6 +191,23 @@ def drop_command(
             )
         elif contents:
             console.print(f"[red]This will destroy {contents} object(s).[/red]")
+        # Before the confirmation, and before the dry-run exit, because a
+        # preview is exactly when this answer is worth having. What a schema
+        # *contains* is above; what breaks when it goes is the half that
+        # surprises people, and neither system is ever asked otherwise.
+        if not no_impact:
+            dependants, notes = impact_summary(targets)
+            if dependants:
+                console.print("\n[bold]Depends on this:[/bold]")
+                for line in dependants:
+                    console.print(f"  [yellow]{cell(line)}[/yellow]")
+            elif not notes:
+                console.print(
+                    "\n[dim]Nothing outside the database references it.[/dim]"
+                )
+            for note in notes:
+                console.print(f"[dim]{cell(note)}[/dim]")
+
         print_ops(console, plan.ops, conn)
 
         if dry_run:
