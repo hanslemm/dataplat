@@ -161,6 +161,7 @@ def _verify_charts(
     *,
     clones: list[dict],
     originals: dict[int, dict],
+    ambiguous: set[int],
     compare: bool,
 ) -> tuple[list[dict], bool]:
     """Run each new chart's query, and optionally the original's beside it.
@@ -169,11 +170,20 @@ def _verify_charts(
     that truncates, a concat that propagates NULL, an array index that is
     0-based on one engine. Neither the live SQL check nor the construct scan
     can: there is no error to catch, only different numbers.
+
+    A chart this cannot pair to an original -- ambiguously (two originals
+    share the same name and dataset) or not at all -- is reported as missing
+    evidence and never flips ``ok``: it is not proof the two engines
+    disagree, only proof this particular check could not run. Only a query
+    that was ATTEMPTED and broke -- the chart's own, or the paired
+    original's -- counts against the result, the same as any other failed
+    Superset call.
     """
     rows: list[dict] = []
     ok = True
 
     for clone in clones:
+        clone_id = int(clone["id"])
         name = str(clone.get("slice_name") or clone.get("id"))
         raw = clone.get("query_context")
         if not raw:
@@ -200,24 +210,45 @@ def _verify_charts(
         }
 
         if compare:
-            original = originals.get(int(clone["id"]))
-            original_context = (original or {}).get("query_context")
-            if original_context:
-                try:
-                    old_rows = chart_data(
-                        client, base_url, token, json.loads(original_context)
-                    )
-                except ServiceError as exc:
-                    entry["comparison"] = f"original failed: {exc}"
-                    ok = False
+            if clone_id in ambiguous:
+                entry["paired"] = False
+                entry["status"] = "not compared: ambiguous pairing"
+            else:
+                original = originals.get(clone_id)
+                original_context = (original or {}).get("query_context")
+                if original is None:
+                    entry["paired"] = False
+                    entry["status"] = "not compared: no matching original"
+                elif not original_context:
+                    entry["paired"] = False
+                    entry["status"] = "not compared: original has no query context"
                 else:
-                    result = compare_rows(old_rows, new_rows)
-                    entry["source_rows"] = result.left_rows
-                    entry["differing_cells"] = result.differing_cells
-                    entry["missing_columns"] = list(result.missing_columns)
-                    entry["agrees"] = result.agrees
-                    if not result.agrees:
+                    entry["paired"] = True
+                    try:
+                        old_rows = chart_data(
+                            client, base_url, token, json.loads(original_context)
+                        )
+                    except ServiceError as exc:
+                        entry["status"] = f"original failed: {exc}"
                         ok = False
+                    else:
+                        result = compare_rows(old_rows, new_rows)
+                        entry["source_rows"] = result.left_rows
+                        entry["differing_cells"] = result.differing_cells
+                        entry["missing_columns"] = list(result.missing_columns)
+                        entry["agrees"] = result.agrees
+                        if result.agrees:
+                            entry["status"] = "ok"
+                        else:
+                            status = "differs"
+                            if result.missing_columns:
+                                status += (
+                                    " (missing columns: "
+                                    + ", ".join(result.missing_columns)
+                                    + ")"
+                                )
+                            entry["status"] = status
+                            ok = False
 
         rows.append(entry)
 
@@ -253,7 +284,10 @@ def duplicate_command(
     compare: bool = typer.Option(
         False,
         "--compare",
-        help="Also run the original's query and diff the two. Doubles the query load.",
+        help=(
+            "Also run the original's query and diff the two. Doubles the query "
+            "load. Has no effect without --verify."
+        ),
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Report the plan and write nothing."
@@ -262,6 +296,16 @@ def duplicate_command(
     as_json: bool = JsonOption,
 ) -> None:
     """Copy a dashboard and repoint the copy onto another database."""
+    if compare and not verify:
+        # Its only consumer is gated on --verify; running the (expensive)
+        # pairing calls anyway would spend API calls to produce nothing, and
+        # doing that silently is its own bug -- see fix round 1, finding 4.
+        console.print(
+            "[yellow]--compare has no effect without --verify; skipping the "
+            "comparison.[/yellow]"
+        )
+        compare = False
+
     base_url, username, password = load_auth_context(console)
 
     try:
@@ -415,9 +459,14 @@ def duplicate_command(
             # Pair each clone to the original chart reading the same dataset,
             # while the clone still carries the OLD datasource_id -- the
             # repoint loop below overwrites it, and after that there is no
-            # way back to which original a clone came from.
+            # way back to which original a clone came from. Keyed on
+            # (slice_name, datasource_id), not datasource_id alone: two
+            # charts on the same table is a real dashboard shape, and
+            # collapsing them to "whichever original was seen last" would
+            # silently compare a clone against a metric that is not its own.
             originals_for_clone: dict[int, dict] = {}
-            if compare:
+            ambiguous_clones: set[int] = set()
+            if compare and verify:
                 original_charts = {
                     int(c["id"]): c
                     for c in [
@@ -428,18 +477,34 @@ def duplicate_command(
                         if o.get("id") is not None
                     ]
                 }
-                by_datasource = {
-                    int(c["datasource_id"]): c
-                    for c in original_charts.values()
-                    if isinstance(c.get("datasource_id"), int)
-                }
-                originals_for_clone = {
-                    int(chart["id"]): paired
-                    for chart in full
-                    if isinstance(chart.get("datasource_id"), int)
-                    and (paired := by_datasource.get(int(chart["datasource_id"])))
-                    is not None
-                }
+                by_key: dict[tuple[str, int], list[dict]] = {}
+                for original_chart in original_charts.values():
+                    datasource_id = original_chart.get("datasource_id")
+                    if not isinstance(datasource_id, int):
+                        continue
+                    key = (
+                        str(original_chart.get("slice_name") or original_chart["id"]),
+                        datasource_id,
+                    )
+                    by_key.setdefault(key, []).append(original_chart)
+
+                for chart in full:
+                    datasource_id = chart.get("datasource_id")
+                    if not isinstance(datasource_id, int):
+                        continue
+                    key = (str(chart.get("slice_name") or chart["id"]), datasource_id)
+                    group = by_key.get(key)
+                    if not group:
+                        continue
+                    if len(group) > 1:
+                        # Nothing links a clone back to a SPECIFIC one of
+                        # several same-named originals on the same dataset;
+                        # comparing against whichever wins would be a
+                        # meaningless diff. _verify_charts reports this as
+                        # missing evidence, not as a disagreement.
+                        ambiguous_clones.add(int(chart["id"]))
+                    else:
+                        originals_for_clone[int(chart["id"])] = group[0]
 
             for chart in full:
                 payload = repoint_chart(chart, id_map)
@@ -476,6 +541,7 @@ def duplicate_command(
                     token,
                     clones=full,
                     originals=originals_for_clone,
+                    ambiguous=ambiguous_clones,
                     compare=compare,
                 )
     except (AuthError, ServiceError, ConfigError) as exc:
@@ -497,6 +563,7 @@ def duplicate_command(
         table.add_column("Rows", justify="right", no_wrap=True)
         if compare:
             table.add_column("Source rows", justify="right", no_wrap=True)
+            table.add_column("Differing cells", justify="right", no_wrap=True)
             table.add_column("Agrees", no_wrap=True)
         table.add_column("Status")
         for row in verification:
@@ -506,10 +573,33 @@ def duplicate_command(
             ]
             if compare:
                 cells.append(cell(row.get("source_rows", "")))
-                cells.append("yes" if row.get("agrees") else "no")
+                cells.append(cell(row.get("differing_cells", "")))
+                # "agrees" is absent, not False, for a chart that was never
+                # compared (an ambiguous or missing pairing, or an original
+                # that could not run) -- showing "no" for that would say the
+                # numbers disagree when nothing was ever checked.
+                agrees = row.get("agrees")
+                cells.append(
+                    "yes" if agrees is True else "no" if agrees is False else "-"
+                )
             cells.append(cell(row.get("status", "")))
             table.add_row(*cells)
         console.print(table)
+
+        if compare:
+            # Only charts whose OWN query succeeded ever reach the pairing
+            # step, so this is exactly the population --compare could have
+            # produced evidence for -- a gap here is otherwise invisible next
+            # to a table full of individually reasonable-looking rows.
+            eligible = [row for row in verification if "paired" in row]
+            if eligible:
+                compared = sum(1 for row in eligible if "agrees" in row)
+                unpaired = sum(1 for row in eligible if not row["paired"])
+                console.print(
+                    f"\n[dim]{compared} of {len(eligible)} charts compared; "
+                    f"{unpaired} could not be paired.[/dim]"
+                )
+
         if not verified_ok:
             console.print(
                 "\n[yellow]The copy exists, and the charts do not all agree.[/yellow]"
@@ -523,6 +613,7 @@ def duplicate_command(
                     "dashboard_id": new_dashboard_id,
                     "title": new_title,
                     "created_datasets": created,
+                    "verification": verification,
                 },
                 indent=2,
             )

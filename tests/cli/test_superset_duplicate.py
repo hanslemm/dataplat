@@ -30,15 +30,22 @@ class FakeSuperset:
         clone_shared: bool = False,
         virtual_sql_error: str | None = None,
         with_foreign_dataset: bool = False,
+        duplicate_original_chart: bool = False,
     ):
         self.writes: list[tuple[str, str, dict]] = []
         self.target_has_orders = target_has_orders
         self.clone_shared = clone_shared
         self.virtual_sql_error = virtual_sql_error
         self.with_foreign_dataset = with_foreign_dataset
+        self.duplicate_original_chart = duplicate_original_chart
         self.chart_rows: list[dict] = [{"a": 1}]
         self.original_rows: list[dict] | None = None
         self.chart_error: str | None = None
+        # Fails only the ORIGINAL's query (datasource id 118/121), so a test
+        # can exercise "the original could not run" without also breaking the
+        # clone's own query -- keying by datasource id is how /chart/data
+        # already tells the two apart below.
+        self.original_chart_error: str | None = None
         self.repointed: dict[int, int] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -72,7 +79,11 @@ class FakeSuperset:
                 request=request,
             )
         if path.endswith("/dashboard/42/charts"):
-            charts = CHARTS + ([FOREIGN_CHART] if self.with_foreign_dataset else [])
+            charts = (
+                CHARTS
+                + ([FOREIGN_CHART] if self.with_foreign_dataset else [])
+                + ([DUPLICATE_ORIGINAL_CHART] if self.duplicate_original_chart else [])
+            )
             return httpx.Response(200, json={"result": charts}, request=request)
         if path.endswith("/dashboard/318/charts"):
             clones = CLONES + ([FOREIGN_CLONE] if self.with_foreign_dataset else [])
@@ -105,12 +116,16 @@ class FakeSuperset:
             rows = [TARGET_USERS] + ([TARGET_ORDERS] if self.target_has_orders else [])
             return httpx.Response(200, json={"result": rows}, request=request)
         if path.endswith("/chart/data"):
+            # 118/121 are the originals' datasets; anything else is the copy's.
+            is_original = (body.get("datasource") or {}).get("id") in {118, 121}
+            if is_original and self.original_chart_error:
+                return httpx.Response(
+                    400, json={"message": self.original_chart_error}, request=request
+                )
             if self.chart_error:
                 return httpx.Response(
                     400, json={"message": self.chart_error}, request=request
                 )
-            # 118/121 are the originals' datasets; anything else is the copy's.
-            is_original = (body.get("datasource") or {}).get("id") in {118, 121}
             rows = (
                 self.original_rows
                 if is_original and self.original_rows is not None
@@ -195,8 +210,12 @@ CLONE_BY_ID = {
     # The originals (7, 8, 9), never repointed -- kept here too, since
     # pairing a clone to its original for --compare reads them the same way
     # (a GET /chart/{id}), before the repoint erases the clone's old id.
+    # slice_name is included here (not just in CHARTS/CLONES) because the
+    # --compare pairing key is (slice_name, datasource_id): a chart fetched
+    # by id alone, without its name, cannot be paired at all.
     7: {
         "id": 7,
+        "slice_name": "Revenue",
         "datasource_id": 118,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "118__table"}),
@@ -204,6 +223,7 @@ CLONE_BY_ID = {
     },
     8: {
         "id": 8,
+        "slice_name": "Signups",
         "datasource_id": 121,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "121__table"}),
@@ -211,13 +231,26 @@ CLONE_BY_ID = {
     },
     9: {
         "id": 9,
+        "slice_name": "External",
         "datasource_id": 140,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "140__table"}),
         "query_context": json.dumps({"datasource": {"id": 140, "type": "table"}}),
     },
+    # A second original sharing chart 7's (slice_name, datasource_id): the
+    # fixture for the ambiguous-pairing case (finding 3, fix round 1). Only
+    # ever added to dashboard 42's charts when duplicate_original_chart=True.
+    10: {
+        "id": 10,
+        "slice_name": "Revenue",
+        "datasource_id": 118,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "118__table"}),
+        "query_context": json.dumps({"datasource": {"id": 118, "type": "table"}}),
+    },
     70: {
         "id": 70,
+        "slice_name": "Revenue",
         "datasource_id": 118,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "118__table"}),
@@ -225,6 +258,7 @@ CLONE_BY_ID = {
     },
     80: {
         "id": 80,
+        "slice_name": "Signups",
         "datasource_id": 121,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "121__table"}),
@@ -232,6 +266,7 @@ CLONE_BY_ID = {
     },
     90: {
         "id": 90,
+        "slice_name": "External",
         "datasource_id": 140,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "140__table"}),
@@ -296,6 +331,18 @@ FOREIGN_DATASET = {
     "metrics": [],
 }
 
+# A second original chart reading the SAME dataset as chart 7, under the same
+# name -- nothing distinguishes which one clone 70 was duplicated from once
+# only (slice_name, datasource_id) survive to pair against. plan_migration
+# never sees this (it operates on datasets, not charts), only the --compare
+# pairing step does.
+DUPLICATE_ORIGINAL_CHART = {
+    "id": 10,
+    "slice_name": "Revenue",
+    "datasource_id": 118,
+    "datasource_type": "table",
+}
+
 
 @pytest.fixture
 def superset_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -329,6 +376,27 @@ def _run(*args: str):
             "BetterData",
             "--yes",
             "--no-verify",
+            *args,
+        ],
+        env=WIDE,
+    )
+
+
+def _run_compare(*args: str):
+    # Verify defaults on, so this is the one place --compare actually runs
+    # the pairing and diff -- unlike _run, which turns verify off.
+    return runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+            "--compare",
             *args,
         ],
         env=WIDE,
@@ -539,21 +607,7 @@ def test_compare_reports_agreement_per_chart(superset_env, install) -> None:
     fake = install(FakeSuperset())
     fake.chart_rows = [{"a": 1}]
 
-    result = runner.invoke(
-        superset_cli.app,
-        [
-            "dashboards",
-            "duplicate",
-            "42",
-            "--from-database",
-            "DataOcean",
-            "--to-database",
-            "BetterData",
-            "--yes",
-            "--compare",
-        ],
-        env=WIDE,
-    )
+    result = _run_compare()
 
     assert result.exit_code == ExitCode.SUCCESS, result.output
     assert "ok" in result.output.lower()
@@ -564,6 +618,84 @@ def test_compare_flags_a_row_count_difference(superset_env, install) -> None:
     fake.chart_rows = [{"a": 1}]
     fake.original_rows = [{"a": 1}, {"a": 2}]
 
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+
+
+def test_compare_reports_which_cells_differ_at_identical_row_counts(
+    superset_env, install
+) -> None:
+    # The motivating case: same row count, different values. A row-count
+    # check cannot see this, which is why the cell count has to reach the
+    # user rather than just the exit code.
+    fake = install(FakeSuperset())
+    fake.original_rows = [{"a": 1, "b": 2}]
+    fake.chart_rows = [{"a": 1, "b": 3}]
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert "1" in result.output  # the differing-cell count is visible
+    # "1" alone also matches dashboard id 318 printed elsewhere in the
+    # output, so it does not by itself prove the cell count is what is
+    # showing -- this does, and would fail if the status text reverted to
+    # the old unconditional "ok".
+    assert "differs" in result.output.lower()
+
+
+def test_compare_reports_when_the_original_cannot_run(superset_env, install) -> None:
+    # The original's query can fail even when the new one succeeds -- e.g.
+    # the source warehouse is already being decommissioned. That must read
+    # differently from "they disagree": one is missing evidence, the other
+    # is evidence, and only the latter should look like a content mismatch.
+    fake = install(FakeSuperset())
+    fake.original_chart_error = "relation orders does not exist"
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert "relation orders does not exist" in result.output
+    assert "differs" not in result.output.lower()
+
+
+def test_compare_marks_an_ambiguous_pairing_not_compared_and_still_succeeds(
+    superset_env, install
+) -> None:
+    # Two originals share (slice_name, datasource_id) -- nothing links clone
+    # 70 back to a SPECIFIC one of them, so comparing against either would be
+    # a coin flip. Refusing to compare is missing evidence, not evidence of
+    # disagreement, and must not fail a run where everything else agrees.
+    fake = install(FakeSuperset(duplicate_original_chart=True))
+    fake.chart_rows = [{"a": 1}]
+    fake.original_rows = [{"a": 1}]
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "ambiguous" in result.output.lower()
+    assert "could not be paired" in result.output.lower()
+
+
+def test_compare_without_verify_says_it_is_ignored(superset_env, install) -> None:
+    # --compare's only consumer is gated on --verify; running the pairing
+    # calls anyway would spend API calls to produce nothing. The combination
+    # must say so rather than silently doing nothing.
+    install(FakeSuperset())
+
+    result = _run("--compare")  # _run already passes --no-verify
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "compare" in result.output.lower()
+    assert "verify" in result.output.lower()
+
+
+def test_json_output_carries_verification_rows(superset_env, install) -> None:
+    # --json is the only way a non-interactive caller sees --compare's
+    # evidence; without this key, that caller has no output at all to act on.
+    fake = install(FakeSuperset())
+    fake.chart_rows = [{"a": 1}, {"a": 2}]
+
     result = runner.invoke(
         superset_cli.app,
         [
@@ -575,9 +707,14 @@ def test_compare_flags_a_row_count_difference(superset_env, install) -> None:
             "--to-database",
             "BetterData",
             "--yes",
-            "--compare",
+            "--json",
         ],
         env=WIDE,
     )
 
-    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    # duplicate's --json only replaces the final "Done" line; the phase-1
+    # plan table and the verification table print unconditionally before it,
+    # same as every other output in this command -- so only the tail is JSON.
+    payload = json.loads(result.output[result.output.index('{\n  "dashboard_id"') :])
+    assert {row["rows"] for row in payload["verification"]} == {2}
