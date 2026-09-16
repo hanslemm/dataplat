@@ -47,11 +47,18 @@ def test_chart_data_returns_the_rows_of_the_first_result() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"result": [{"data": [{"a": 1}, {"a": 2}]}]},
+            json={
+                "result": [
+                    {"data": [{"a": 1}, {"a": 2}]},
+                    {"data": [{"a": 99}]},
+                ]
+            },
             request=request,
         )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        # The second result's rows must NOT appear: a concatenating
+        # implementation passes a single-result mock identically.
         assert chart_data(client, BASE_URL, "tok", {"datasource": {"id": 904}}) == [
             {"a": 1},
             {"a": 2},

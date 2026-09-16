@@ -107,11 +107,18 @@ def copy_dashboard(
         timeout=300,
     )
     raise_for_status(response, "copy Superset dashboard")
-    result = (response.json() or {}).get("result") or {}
-    new_id = result.get("id")
-    if new_id is None:
-        raise ServiceError("copy Superset dashboard: response missing id")
-    return int(new_id)
+    payload = response.json() or {}
+    result = payload.get("result")
+    new_id = result.get("id") if isinstance(result, dict) else None
+    if not isinstance(new_id, int):
+        # A 2xx that does not name the new dashboard is not a copy we can
+        # repoint: every later phase addresses it by id, and coercing
+        # whatever came back would fail somewhere less obvious.
+        raise ServiceError(
+            "Superset copied the dashboard but returned no usable id "
+            f"({response.status_code} {response.reason_phrase})"
+        )
+    return new_id
 
 
 def update_dashboard(

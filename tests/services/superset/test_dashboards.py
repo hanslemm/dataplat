@@ -13,6 +13,7 @@ from dataplat.services.superset.dashboards import (
     dashboard_charts,
     get_dashboard,
     iter_dashboards,
+    update_dashboard,
 )
 
 BASE_URL = "https://superset.test"
@@ -89,3 +90,32 @@ def test_a_refused_copy_says_why() -> None:
         copy_dashboard(client, BASE_URL, "tok", 42, {"json_metadata": "{}"})
 
     assert "Forbidden" in str(excinfo.value)
+
+
+def test_an_update_sends_exactly_the_payload_given() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path.endswith("/dashboard/318")
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": {}}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        update_dashboard(client, BASE_URL, "tok", 318, {"json_metadata": "{}"})
+
+    assert seen == [{"json_metadata": "{}"}]
+
+
+def test_a_copy_with_non_int_id_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Superset responds 2xx but with id as string instead of int
+        return httpx.Response(201, json={"result": {"id": "abc"}}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        copy_dashboard(client, BASE_URL, "tok", 42, {"json_metadata": "{}"})
+
+    assert "no usable id" in str(excinfo.value)

@@ -63,7 +63,11 @@ def chart_data(
         timeout=300,
     )
     raise_for_status(response, "run Superset chart query")
-    results = (response.json() or {}).get("result") or []
-    if not results:
+    payload = response.json() or {}
+    results = payload.get("result")
+    if not isinstance(results, list) or not results:
         return []
-    return list((results[0] or {}).get("data") or [])
+    first_result = results[0]
+    if not isinstance(first_result, dict):
+        return []
+    return list(first_result.get("data") or [])
