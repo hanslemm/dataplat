@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.machinery
+import subprocess
 import sys
 from pathlib import Path
 
@@ -212,3 +213,79 @@ def test_doctor_offline_checks_do_not_touch_pyyaml(
     results = config_cli._offline_checks()
 
     assert any(r.label == "dbt legacy vars" for r in results)
+
+
+_BLOCK_YAML_AND_IMPORT_DB_SCRIPT = """
+import sys
+import importlib.machinery
+import importlib.util
+
+
+class _BlockYaml:
+    '''Delegates to the real PathFinder for every module except yaml, which
+    it reports as genuinely absent -- see the test docstring for why the
+    blanket "remove PathFinder" technique used elsewhere in this file
+    (_NoSpec) does not fit here.'''
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "yaml" or fullname.startswith("yaml."):
+            return None
+        return importlib.machinery.PathFinder.find_spec(fullname, path, target)
+
+
+sys.meta_path = [
+    f for f in sys.meta_path if f is not importlib.machinery.PathFinder
+] + [_BlockYaml()]
+
+# Canary: prove the block is real (yaml reported genuinely absent), not a
+# no-op that would let this script "pass" for the wrong reason.
+assert importlib.util.find_spec("yaml") is None, "canary failed: yaml still resolvable"
+
+import dataplat.cli.db as db_area
+
+assert db_area.app.info.name == "db"
+assert "yaml" not in sys.modules, "yaml ended up imported anyway"
+print("OK")
+"""
+
+
+def test_db_area_imports_without_pyyaml() -> None:
+    """``dataplat/cli/db/__init__.py`` imports ``dataplat.cli.dbt.orphans``
+    unconditionally (the ``dp db dbt-orphans`` backward-compat mount), which
+    imports ``dataplat.cli.dbt._common`` -> ``dataplat.services.dbt.projects``.
+    PyYAML ships only under the ``dbt`` extra -- ``db``'s own contract in
+    ``dataplat.core.deps.AREAS`` lists only ``psycopg`` -- so a
+    ``dataplat[db]``-only install has to be able to import the whole ``db``
+    area, and so run any ``dp db`` subcommand at all, without PyYAML
+    installed.
+
+    Before ``import yaml`` moved out of ``projects.py``'s module scope and
+    into ``_project_name()`` (the only function that touches it), this failed
+    with ``ModuleNotFoundError: No module named 'yaml'`` the instant any
+    ``dp db`` subcommand was invoked in a fresh process -- for every user,
+    whether or not they ever touch orphans or named projects.
+
+    This runs in a fresh subprocess rather than blocking yaml in-process:
+    dataplat.cli.db has to be imported genuinely fresh to prove anything
+    (an already-cached import proves nothing), and an in-process attempt at
+    that -- deleting dataplat.cli.db and its whole yaml-adjacent chain from
+    sys.modules, forcing a real reimport under a yaml-blocking meta_path
+    finder, then trying to restore every affected sys.modules entry and
+    parent-package attribute afterwards -- reliably left stale module
+    references behind for *other* tests later in the same session (observed
+    concretely: test_top_tables.py's own ``monkeypatch.setattr("dataplat.cli
+    .db.top_tables.load_duckdb", ...)`` started failing with ``AttributeError:
+    'module' object ... has no attribute 'top_tables'`` after this test ran
+    first). A subprocess's whole module cache is thrown away when it exits,
+    so there is nothing to restore, and it also happens to be exactly the
+    real-world scenario under test: a fresh ``dp db ...`` invocation in a
+    process that has never imported anything else.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _BLOCK_YAML_AND_IMPORT_DB_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout

@@ -24,8 +24,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 from dataplat.core.errors import ConfigError, ValidationError
 
 
@@ -70,8 +68,22 @@ def _project_name(prefix: str, path: Path) -> str:
     explicit = os.getenv(f"{prefix}_DBT_NAME", "").strip()
     if explicit:
         return explicit
+    # Imported here, not at module scope: this is the only place in the module
+    # that touches PyYAML, and PyYAML ships only under the `dbt` extra. Every
+    # other function in this module (load_projects, default_project_name,
+    # resolve_project/resolve_projects) has to work with only DP_TARGETS-style
+    # env vars for a caller that sets <NAME>_DBT_NAME explicitly and never
+    # needs its dbt_project.yml read -- a module-scope `import yaml` made that
+    # impossible: any importer of this module (dataplat.cli.dbt._common, and
+    # through it dataplat.cli.dbt.orphans, and through *that* the `dp db
+    # dbt-orphans` backward-compat mount in dataplat.cli.db) required PyYAML
+    # just to be imported, even for a dataplat[db]-only install that never
+    # resolves a project's name from its dbt_project.yml at all.
+    #
     # Reading it beats making the operator restate it: two sources of the same
     # fact drift, and the file is authoritative.
+    import yaml
+
     with (path / "dbt_project.yml").open(encoding="utf-8") as handle:
         parsed = yaml.safe_load(handle) or {}
     name = str(parsed.get("name", "")).strip()
