@@ -1,4 +1,4 @@
-"""`dp db dbt-orphans` — discover and rename orphan dbt tables."""
+"""`dp dbt orphans` — discover and rename orphan dbt tables."""
 
 from __future__ import annotations
 
@@ -16,6 +16,11 @@ from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import esc
+from dataplat.cli.dbt._common import (
+    ProjectOption,
+    TargetFilterOption,
+    projects_and_targets,
+)
 from dataplat.core.errors import (
     ConfigError,
     DataplatError,
@@ -35,17 +40,19 @@ from dataplat.services.db.orphans import (
     classify_object,
     diff_orphans,
     drop_object,
-    excluded_schemas,
     fetch_deprecated_objects,
     fetch_existing_relations,
     fetch_live_model_relations,
-    invocation_command,
-    node_prefix,
     open_transactional_connection,
     rename_object,
     resolve_orphans_connection_params,
 )
-from dataplat.services.db.targets import resolve_targets
+from dataplat.services.dbt.projects import DbtProject
+from dataplat.services.dbt.settings import (
+    excluded_schemas,
+    invocation_command,
+    node_prefix,
+)
 
 DEFAULT_WINDOW_DAYS = 7
 
@@ -69,7 +76,7 @@ APPLY_LOG_PREFIX = "dbt_orphans"
 PURGE_LOG_PREFIX = "dbt_orphans_purge"
 
 # Log entries keep the historical engine labels so old logs stay revertable.
-# Only the engines this command can act on appear here; _engines_for_target
+# Only the engines this command can act on appear here; _engines_for_project
 # refuses the others before it reaches this mapping.
 _ENGINE_LABELS: dict[SqlEngine, str] = {
     SqlEngine.postgresql: "postgres",
@@ -86,13 +93,6 @@ _RENAME_DETAIL = (
     "refuses the one operation this command is. In a dbt project a view on a "
     "model is the normal case, not the exception. `purge` then drops what was "
     "renamed, and a half-working destructive command is worse than none."
-)
-
-TargetOption = typer.Option(
-    "all",
-    "--target",
-    "-t",
-    help="Named DB target from DP_TARGETS, or all.",
 )
 
 
@@ -140,38 +140,47 @@ def _find_latest_log(prefix: str) -> str | None:
     return matches[-1] if matches else None
 
 
-def _engines_for_target(name: str) -> list[tuple[str, SqlEngine, str]]:
-    """Return ``(label, engine, env_prefix)`` per target; label is the log key.
+def _engines_for_project(
+    project: str | None, target: str | None
+) -> list[tuple[str, SqlEngine, str, DbtProject]]:
+    """Return ``(label, engine, env_prefix, project)`` per target of the named project.
 
-    Also the one gate every subcommand passes through, which is why the
-    capability check lives here: apply, revert and purge each start by calling
-    this, and none of them has opened a connection yet.
+    Still the one gate every subcommand passes through, which is why the
+    capability check stays here. An engine that cannot rename a relation a view
+    depends on refuses the whole invocation, including a fan-out where other
+    targets would have worked: this command renames and drops, so "did some of
+    it" is the outcome worth avoiding most.
 
-    An engine that cannot rename a relation a view depends on refuses the *whole*
-    invocation, including a ``--target all`` where other targets would have
-    worked. That is deliberate for this command and only this command: it renames
-    and drops, so "did some of it" is the outcome worth avoiding most, and naming
-    targets explicitly is a cheap way to get the rest done.
+    The ``project`` carried alongside each target (rather than resolved once
+    for the whole run) is what makes ``--project all`` correct: each project
+    fanned out by :func:`projects_and_targets` has its own node prefix and
+    exclusion settings, and a target that two projects both declare must be
+    scanned once per project, against that project's own live-model set.
     """
     try:
-        targets = resolve_targets(name)
+        pairs = projects_and_targets(project, target)
     except ValidationError as exc:
         fail(exc, console=console)
-    for tgt in targets:
-        try:
-            require_capability(
-                tgt.engine,
-                Capability.rename_with_dependents,
-                command="dp db dbt-orphans",
-                detail=_RENAME_DETAIL,
+    resolved: list[tuple[str, SqlEngine, str, DbtProject]] = []
+    for proj, targets in pairs:
+        for tgt in targets:
+            try:
+                require_capability(
+                    tgt.engine,
+                    Capability.rename_with_dependents,
+                    command="dp dbt orphans",
+                    detail=_RENAME_DETAIL,
+                )
+            except ValidationError as exc:
+                # Prefixed with the target name, like every other per-target error
+                # in this module: with a multi-target fan-out the engine's reason
+                # alone would not say which target brought the command to a stop.
+                # fail() escapes the brackets before Rich sees them.
+                fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
+            resolved.append(
+                (_ENGINE_LABELS[tgt.engine], tgt.engine, tgt.env_prefix, proj)
             )
-        except ValidationError as exc:
-            # Prefixed with the target name, like every other per-target error in
-            # this module: with `all` the engine's reason alone would not say
-            # which target brought the command to a stop. fail() escapes the
-            # brackets before Rich sees them.
-            fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
-    return [(_ENGINE_LABELS[t.engine], t.engine, t.env_prefix) for t in targets]
+    return resolved
 
 
 def _parse_exclusions(
@@ -229,7 +238,8 @@ def main(
             "dbt_orphans-<UTC timestamp>.log.json (unique per run)."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -276,7 +286,7 @@ def main(
         # fail() escaping it is what keeps a hostile token from crashing Rich.
         fail(exc, console=console)
 
-    engines = _engines_for_target(target)
+    engines = _engines_for_project(project, target)
     if not dry_run:
         confirm_or_exit(
             yes=yes,
@@ -288,12 +298,13 @@ def main(
 
     all_entries: list[RenameEntry] = []
     try:
-        for label, engine, env_prefix in engines:
+        for label, engine, env_prefix, proj in engines:
             all_entries.extend(
                 _run_for_engine(
                     label,
                     engine,
                     env_prefix=env_prefix,
+                    project=proj,
                     excluded_user_schemas=excluded_user_schemas,
                     excluded_user_relations=excluded_user_relations,
                     window_days=window_days,
@@ -344,6 +355,7 @@ def _run_for_engine(
     engine: SqlEngine,
     *,
     env_prefix: str,
+    project: DbtProject | None = None,
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
     window_days: int,
@@ -352,7 +364,7 @@ def _run_for_engine(
 ) -> list[RenameEntry]:
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
-        dbt_node_prefix = node_prefix()
+        dbt_node_prefix = node_prefix(project)
     except ConfigError as exc:
         # Re-raised as the same class, not widened to ServiceError: "set
         # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
@@ -374,7 +386,7 @@ def _run_for_engine(
     ):
         live = fetch_live_model_relations(
             cur,
-            invocation_command=invocation_command(),
+            invocation_command=invocation_command(project),
             node_prefix=dbt_node_prefix,
             statuses=LIVE_STATUSES,
             since=since,
@@ -387,7 +399,7 @@ def _run_for_engine(
             )
             return []
 
-        excluded = excluded_schemas()
+        excluded = excluded_schemas(project)
         schemas_to_scan = sorted(s for s in live if s not in excluded)
         existing = fetch_existing_relations(
             cur, schemas_to_scan, is_redshift=is_redshift
@@ -491,7 +503,8 @@ def revert_cmd(
             "dbt_orphans-*.log.json in the log directory."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -504,7 +517,7 @@ def revert_cmd(
     # order answers "no dbt_orphans log found" to a target where there could
     # never have been one, sending the reader to look for a missing file
     # instead of at the engine.
-    engines = _engines_for_target(target)
+    engines = _engines_for_project(project, target)
     if log is None:
         log = _find_latest_log(APPLY_LOG_PREFIX)
         if log is None:
@@ -512,13 +525,13 @@ def revert_cmd(
                 f"[red]Error: no {APPLY_LOG_PREFIX} log found in {esc(LOG_DIR)}/[/red]"
             )
             console.print(
-                "[dim]Run `dp db dbt-orphans` first or pass --log explicitly.[/dim]"
+                "[dim]Run `dp dbt orphans` first or pass --log explicitly.[/dim]"
             )
             raise typer.Exit(code=1)
         console.print(f"[dim]Using latest log: {esc(log)}[/dim]")
     if not os.path.exists(log):
         console.print(f"[red]Error: log file not found: {esc(log)}[/red]")
-        console.print("[dim]Run `dp db dbt-orphans` first to generate it.[/dim]")
+        console.print("[dim]Run `dp dbt orphans` first to generate it.[/dim]")
         raise typer.Exit(code=1)
 
     try:
@@ -544,7 +557,7 @@ def revert_cmd(
 
     total = 0
     try:
-        for label, engine, env_prefix in engines:
+        for label, engine, env_prefix, _project in engines:
             entries = [
                 r for r in renames if isinstance(r, dict) and r.get("database") == label
             ]
@@ -696,7 +709,8 @@ def purge_cmd(
             "dbt_orphans_purge-<UTC timestamp>.log.json (unique per run)."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -752,7 +766,7 @@ def purge_cmd(
     except ValidationError as exc:
         fail(exc, console=console)
 
-    engines = _engines_for_target(target)
+    engines = _engines_for_project(project, target)
     if not dry_run:
         confirm_or_exit(
             yes=yes,
@@ -772,13 +786,14 @@ def purge_cmd(
     all_drops: list[DropEntry] = []
     blocked: list[BlockedEntry] = []
     try:
-        for label, engine, env_prefix in engines:
+        for label, engine, env_prefix, proj in engines:
             try:
                 all_drops.extend(
                     _purge_for_engine(
                         label,
                         engine,
                         env_prefix=env_prefix,
+                        project=proj,
                         excluded_user_schemas=excluded_user_schemas,
                         excluded_user_relations=excluded_user_relations,
                         dry_run=dry_run,
@@ -839,6 +854,7 @@ def _purge_for_engine(
     engine: SqlEngine,
     *,
     env_prefix: str,
+    project: DbtProject | None = None,
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
     dry_run: bool,
@@ -861,7 +877,7 @@ def _purge_for_engine(
         return []
 
     is_redshift = engine is SqlEngine.redshift
-    effective_excluded_schemas = excluded_schemas() | excluded_user_schemas
+    effective_excluded_schemas = excluded_schemas(project) | excluded_user_schemas
     drops: list[DropEntry] = []
 
     with (

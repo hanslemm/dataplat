@@ -12,10 +12,12 @@ from dataplat.services.db.orphans import (
     LIVE_STATUSES,
     build_rename_statement,
     classify_object,
+    resolve_orphans_connection_params,
+)
+from dataplat.services.dbt.settings import (
     excluded_schemas,
     invocation_command,
     node_prefix,
-    resolve_orphans_connection_params,
 )
 
 
@@ -78,31 +80,39 @@ def test_constants() -> None:
 
 
 def test_excluded_schemas_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``excluded_schemas``/``node_prefix``/``invocation_command`` used to be
+    defined in ``dataplat.services.db.orphans`` itself; they now live in
+    ``dataplat.services.dbt.settings`` (see that module's own test suite for
+    full coverage, including the per-project behaviour). These four tests stay
+    here, imported from their new home, to keep proving the orphans CLI's own
+    legacy-mode call convention (``project=None``, for an installation that has
+    not adopted named dbt projects) still behaves like the reader it replaced.
+    """
     monkeypatch.delenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", raising=False)
-    assert excluded_schemas() == frozenset({"raw", "_raw", "dbt_artifacts"})
+    assert excluded_schemas(None) == frozenset({"raw", "_raw", "dbt_artifacts"})
 
 
 def test_excluded_schemas_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "a, b ,")
-    assert excluded_schemas() == frozenset({"a", "b"})
+    assert excluded_schemas(None) == frozenset({"a", "b"})
 
 
 def test_node_prefix_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DP_DBT_PROJECT", "acme")
-    assert node_prefix() == "model.acme."
+    assert node_prefix(None) == "model.acme."
 
 
 def test_node_prefix_requires_project(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DP_DBT_PROJECT", raising=False)
     with pytest.raises(ConfigError, match="DP_DBT_PROJECT"):
-        node_prefix()
+        node_prefix(None)
 
 
 def test_invocation_command_optional(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DP_DBT_INVOCATION_COMMAND", raising=False)
-    assert invocation_command() is None
+    assert invocation_command(None) is None
     monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "dbt build")
-    assert invocation_command() == "dbt build"
+    assert invocation_command(None) == "dbt build"
 
 
 def test_classify_object_returns_view_for_view() -> None:

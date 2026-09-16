@@ -19,3 +19,8 @@ def dbt() -> None:
     that command, which would make `dp dbt orphans` unreachable once a second
     command lands.
     """
+
+
+from dataplat.cli.dbt.orphans import app as orphans_app  # noqa: E402
+
+app.add_typer(orphans_app, name="orphans")

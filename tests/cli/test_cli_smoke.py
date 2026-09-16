@@ -719,7 +719,7 @@ def test_db_dbt_orphans_purge_rejects_multi_dot_exclusion() -> None:
 
 
 def _isolate_log_dir(monkeypatch, tmp_path) -> None:
-    from dataplat.cli.db import dbt_orphans as orphans_module
+    from dataplat.cli.dbt import orphans as orphans_module
 
     monkeypatch.setattr(orphans_module, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(orphans_module, "LEGACY_LOG_DIR", tmp_path / "local")

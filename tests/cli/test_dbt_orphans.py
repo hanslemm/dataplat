@@ -12,8 +12,8 @@ import pytest
 from typer.testing import CliRunner
 
 from dataplat.cli import _prompt
-from dataplat.cli.db import dbt_orphans as do
-from dataplat.cli.db.dbt_orphans import _parse_exclusions
+from dataplat.cli.dbt import orphans as do
+from dataplat.cli.dbt.orphans import _parse_exclusions
 from dataplat.core.errors import ConfigError, ExitCode, ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import DEPRECATED_SUFFIX
@@ -173,8 +173,8 @@ def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
     monkeypatch.setattr(do, "LOG_DIR", state.log_dir)
     monkeypatch.setattr(
         do,
-        "_engines_for_target",
-        lambda name: [(LABEL, SqlEngine.postgresql, "DEMO_PG")],
+        "_engines_for_project",
+        lambda project, target: [(LABEL, SqlEngine.postgresql, "DEMO_PG", None)],
     )
     monkeypatch.setattr(
         do,
@@ -187,8 +187,8 @@ def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         yield _Conn()
 
     monkeypatch.setattr(do, "open_transactional_connection", _open)
-    monkeypatch.setattr(do, "node_prefix", lambda: "model.demo.")
-    monkeypatch.setattr(do, "invocation_command", lambda: None)
+    monkeypatch.setattr(do, "node_prefix", lambda project=None: "model.demo.")
+    monkeypatch.setattr(do, "invocation_command", lambda project=None: None)
     monkeypatch.setattr(
         do,
         "fetch_live_model_relations",
@@ -340,10 +340,13 @@ def test_scan_rejects_zero_window(warehouse: SimpleNamespace) -> None:
 
 
 def test_scan_unknown_target_exits_invalid_input(tmp_path: Path) -> None:
-    """No `warehouse` fixture: that one stubs out target resolution entirely."""
+    """No `warehouse` fixture: that one stubs out project/target resolution
+    entirely. ``nope`` isn't declared by the default project (``demo_project``),
+    so it is rejected the same way a target outside the project always is.
+    """
     result = _scan(["--target", "nope", "--log", str(tmp_path / "s.json")])
     assert result.exit_code == ExitCode.INVALID_INPUT
-    assert "Unknown target" in result.output
+    assert "does not build into" in result.output
 
 
 def test_scan_unset_dbt_project_exits_config(
@@ -357,7 +360,9 @@ def test_scan_unset_dbt_project_exits_config(
     when nothing about retrying can set an environment variable.
     """
     monkeypatch.setattr(
-        do, "node_prefix", lambda: (_ for _ in ()).throw(ConfigError("DP_DBT_PROJECT"))
+        do,
+        "node_prefix",
+        lambda project=None: (_ for _ in ()).throw(ConfigError("DP_DBT_PROJECT")),
     )
     log = tmp_path / "s.json"
 
@@ -804,7 +809,7 @@ def test_log_discovery_still_globs_the_timestamp(
 # compared byte for byte afterwards.
 #
 # Note these tests do *not* use the `warehouse` fixture, which stubs out
-# `_engines_for_target` — the very function that refuses.
+# `_engines_for_project` — the very function that refuses.
 
 
 def _flat(text: str) -> str:
@@ -833,6 +838,11 @@ def _duckdb_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("DDB_ENGINE", "duckdb")
     monkeypatch.setenv("DDB_PATH", str(path))
     monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    # The default project (demo_project) must declare ddb as one of its own
+    # targets, or `projects_and_targets` rejects `--target ddb` with "does not
+    # build into" before the capability gate this test is actually exercising
+    # is ever reached.
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "ddb")
     return path
 
 
@@ -850,7 +860,7 @@ def _forbid_connections(monkeypatch: pytest.MonkeyPatch) -> None:
 def _assert_rename_refusal(result: Any) -> None:
     out = _flat(result.output)
     assert result.exit_code == ExitCode.INVALID_INPUT, result.output
-    assert "[ddb] dp db dbt-orphans cannot run against DuckDB" in out
+    assert "[ddb] dp dbt orphans cannot run against DuckDB" in out
     # The engine fact...
     assert "ALTER TABLE ... RENAME TO fails with a DependencyException" in out
     assert "no CASCADE" in out
@@ -933,7 +943,8 @@ def test_revert_refuses_a_duckdb_target_before_looking_for_a_log(
 def test_all_refuses_when_one_target_cannot_rename(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`-t all` is the default, and this command renames and drops.
+    """Every declared target is the default (no ``--target``), and this command
+    renames and drops.
 
     Deliberately not per-target degradation: a partly-applied destructive run is
     the outcome worth avoiding most, and the refusal names the target so the
@@ -941,8 +952,9 @@ def test_all_refuses_when_one_target_cannot_rename(
     """
     _duckdb_target(monkeypatch, tmp_path)
     monkeypatch.setenv("DP_TARGETS", "demo_pg,ddb")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,ddb")
     _forbid_connections(monkeypatch)
 
-    result = _scan(["--target", "all", "--log", str(tmp_path / "s.json")])
+    result = _scan(["--log", str(tmp_path / "s.json")])
 
     _assert_rename_refusal(result)

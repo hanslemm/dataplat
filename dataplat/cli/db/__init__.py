@@ -34,12 +34,12 @@ from dataplat.cli.db._common import (
     db_session,
     resolve_any_params_or_exit,
 )
-from dataplat.cli.db.dbt_orphans import app as dbt_orphans_app
 from dataplat.cli.db.describe import app as describe_app
 from dataplat.cli.db.long_queries import kill_command, long_queries_command
 from dataplat.cli.db.role import app as role_app
 from dataplat.cli.db.schema import app as schema_app
 from dataplat.cli.db.top_tables import top_tables_command
+from dataplat.cli.dbt.orphans import app as dbt_orphans_app
 from dataplat.services.db.connection import SqlEngine
 
 app = typer.Typer(
