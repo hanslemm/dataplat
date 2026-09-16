@@ -135,6 +135,22 @@ def test_malformed_json_propagates(
         relation_names(project)
 
 
+def test_non_object_manifest_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Valid JSON, but not an object at the top level -- a hostile or
+    # corrupted file, distinct from unparsable JSON (above). Without this
+    # check, manifest.get("nodes") raises AttributeError, which is not a
+    # ValueError and so is not translatable by a caller that only catches
+    # that family (see dataplat.cli.dbt.orphans._produced_relations).
+    project = _project(tmp_path, monkeypatch)
+    target = project.path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="does not contain a JSON object"):
+        relation_names(project)
+
+
 def test_sources_are_never_included(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

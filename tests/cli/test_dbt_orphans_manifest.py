@@ -56,17 +56,32 @@ def _node(name: str) -> dict[str, Any]:
     return {"name": name, "resource_type": "model"}
 
 
-def _project(tmp_path: Path, *, nodes: dict[str, dict[str, Any]] | None) -> DbtProject:
+def _project(
+    tmp_path: Path,
+    *,
+    nodes: dict[str, dict[str, Any]] | None,
+    raw_manifest_text: str | None = None,
+) -> DbtProject:
     """A throwaway ``DbtProject`` whose manifest is exactly what the test wants.
 
     ``nodes=None`` means no target/manifest.json at all -- never compiled --
     which is a different fact than a manifest that exists and produces
     nothing (``nodes={}``); tests distinguish the two on purpose.
+
+    ``raw_manifest_text``, when given, is written verbatim as
+    ``target/manifest.json`` instead of ``{"nodes": nodes}`` -- for a test
+    that needs manifest content ``relation_names`` cannot even parse into
+    the normal shape (e.g. valid JSON that is not an object at all).
+    ``nodes`` is ignored in that case.
     """
     project_dir = tmp_path / "manifest_project"
     project_dir.mkdir()
     (project_dir / "dbt_project.yml").write_text("name: manifest_demo\n")
-    if nodes is not None:
+    if raw_manifest_text is not None:
+        target_dir = project_dir / "target"
+        target_dir.mkdir()
+        (target_dir / "manifest.json").write_text(raw_manifest_text)
+    elif nodes is not None:
         target_dir = project_dir / "target"
         target_dir.mkdir()
         (target_dir / "manifest.json").write_text(json.dumps({"nodes": nodes}))
@@ -282,3 +297,107 @@ def test_legacy_project_none_never_reads_a_manifest(
 
     assert result.exit_code == 0, result.output
     assert "Processed 1 object(s)" in result.output
+
+
+def test_scan_refuses_cleanly_on_a_manifest_that_is_not_a_json_object(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A manifest.json that parses as valid JSON but isn't an object at the
+    top level (a hostile or corrupted file, not merely a missing one) must
+    refuse cleanly -- exit CONFIG with a message, not an uncaught
+    AttributeError past the command's own DataplatError handler.
+
+    The audit log surviving is the part that actually matters: under
+    --project all --no-dry-run, an earlier target may already have renamed
+    objects before this one refuses, and `main`'s `except DataplatError`
+    handler is what writes the (partial) log recording those renames. A raw
+    traceback here would skip that handler entirely and lose the log,
+    making already-applied renames unrecoverable.
+    """
+    project = _project(tmp_path, nodes=None, raw_manifest_text=json.dumps([1, 2, 3]))
+    _wire_engine(monkeypatch, project)
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(tmp_path)
+
+    assert result.exit_code == ExitCode.CONFIG, result.output
+    assert "does not contain a JSON object" in result.output
+
+    log_path = tmp_path / "s.json"
+    assert log_path.exists(), "the audit log must survive a manifest-shape refusal"
+    payload = json.loads(log_path.read_text())
+    assert payload["renames"] == []
+
+
+def test_scan_selectively_spares_produced_and_partition_but_flags_the_orphan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """All three outcomes in one existing set, proving they don't interfere
+    with each other: a name the manifest produces directly is spared, a
+    partition child of a produced parent is spared, and a name unrelated to
+    either is still renamed. The three earlier tests each prove one outcome
+    in isolation; this is the one that pins the selectivity itself.
+    """
+    project = _project(tmp_path, nodes={"model.demo.a": _node("fct_events")})
+    _wire_engine(monkeypatch, project)
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: set()}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {
+            SCHEMA: {"fct_events", "fct_events_p_trello", "truly_orphaned"}
+        },
+    )
+    monkeypatch.setattr(
+        do,
+        "classify_object",
+        lambda cur, schema, name, **kw: "table" if name == "truly_orphaned" else None,
+    )
+
+    result = _scan(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert "Processed 1 object(s)" in result.output
+    assert result.output.count("Would rename") == 1
+    assert "Would rename table analytics.truly_orphaned" in result.output
+
+
+def test_scan_still_renames_a_partition_shaped_name_with_no_produced_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name that merely looks like a partition child (contains the ``_p_``
+    marker) but whose supposed parent the manifest does not produce is not
+    spared -- it is an orphan like any other. Pins this end-to-end, through
+    _run_for_engine and diff_orphans, rather than only at
+    is_partition_of's own unit level
+    (test_partition_without_a_live_parent_is_not_spared in
+    tests/services/dbt/test_manifest.py) -- the guard against ever
+    shortcutting this to "contains the marker means spare".
+    """
+    project = _project(tmp_path, nodes={"model.demo.a": _node("fct_events")})
+    _wire_engine(monkeypatch, project)
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: set()}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {SCHEMA: {"fct_gone_p_trello"}},
+    )
+    monkeypatch.setattr(
+        do,
+        "classify_object",
+        lambda cur, schema, name, **kw: (
+            "table" if name == "fct_gone_p_trello" else None
+        ),
+    )
+
+    result = _scan(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert "Processed 1 object(s)" in result.output
+    assert "Would rename table analytics.fct_gone_p_trello" in result.output

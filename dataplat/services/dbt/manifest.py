@@ -38,6 +38,19 @@ def relation_names(project: DbtProject) -> set[str]:
     yet. That case must fail loudly rather than return an empty set: an empty
     produced-set would make every table in the scanned schemas look orphaned,
     which is worse than refusing to run.
+
+    Raises ``ValueError`` (``json.JSONDecodeError``, a ``ValueError``
+    subclass, included) for a ``manifest.json`` that cannot be trusted:
+    unparsable JSON, or JSON that parses but is not an object at the top
+    level (a list, string, number, ``null`` ...). The latter is not
+    hypothetical -- a caller that only guards `.is_file()` and JSON
+    parsing, not the parsed shape, hits ``AttributeError`` on
+    ``manifest.get("nodes")`` for exactly this input, which is not a
+    ``ValueError`` and so is not translatable by a caller that only catches
+    that family. Validating the shape here, in the one module that knows
+    what a manifest is supposed to look like, means every caller can treat
+    "this manifest is untrustworthy" as one exception family instead of
+    enumerating every way a hostile or corrupted file can fail to be a dict.
     """
     path = _manifest_path(project)
     if not path.is_file():
@@ -46,7 +59,13 @@ def relation_names(project: DbtProject) -> set[str]:
             "`dbt docs generate` in the project first."
         )
     with path.open(encoding="utf-8") as handle:
-        manifest: dict[str, Any] = json.load(handle)
+        manifest: Any = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"{path} does not contain a JSON object at its top level "
+            f"(got {type(manifest).__name__}). A dbt manifest is always a "
+            "JSON object; this file is not one dbt produced."
+        )
 
     names: set[str] = set()
     nodes: dict[str, Any] = manifest.get("nodes") or {}

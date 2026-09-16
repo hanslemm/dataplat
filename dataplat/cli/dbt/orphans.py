@@ -570,7 +570,18 @@ def _produced_relations(project: DbtProject | None) -> set[str] | None:
         return None
     try:
         produced = relation_names(project)
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
+    except (FileNotFoundError, ValueError) as exc:
+        # ValueError, not json.JSONDecodeError specifically: relation_names
+        # raises plain ValueError for a manifest that parses but is not a
+        # JSON object at the top level (a hostile or corrupted file), and
+        # json.JSONDecodeError for unparsable JSON is itself a ValueError
+        # subclass -- one except clause covers both, and covers whatever
+        # else relation_names decides is untrustworthy manifest shape in the
+        # future. This has to stay a ConfigError and not propagate raw: an
+        # uncaught exception here would skip the audit-log write in `main`'s
+        # `except DataplatError` handler, and under a multi-target fan-out
+        # that log is what makes an earlier target's already-applied renames
+        # recoverable.
         raise ConfigError(str(exc)) from exc
     if not produced:
         raise ConfigError(
