@@ -48,6 +48,27 @@ def test_default_project_name_is_first_when_unset() -> None:
     assert default_project_name() == "demo_project"
 
 
+def test_default_project_name_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DP_DBT_DEFAULT_PROJECT", "demo_other")
+    assert default_project_name() == "demo_other"
+
+
+def test_default_project_name_unknown_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DP_DBT_DEFAULT_PROJECT", "nope")
+    with pytest.raises(ConfigError, match="DP_DBT_DEFAULT_PROJECT"):
+        default_project_name()
+
+
+def test_no_projects_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DP_DBT_PROJECTS", "")
+    assert load_projects() == {}
+    assert default_project_name() is None
+    with pytest.raises(ValidationError, match="No dbt projects configured"):
+        resolve_project("anything")
+    with pytest.raises(ValidationError, match="No dbt projects configured"):
+        resolve_projects("all")
+
+
 def test_missing_path_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DP_DBT_PROJECTS", "broken")
     monkeypatch.delenv("BROKEN_DBT_PATH", raising=False)
