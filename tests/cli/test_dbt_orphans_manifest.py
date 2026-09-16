@@ -122,6 +122,18 @@ def _scan(tmp_path: Path, args: list[str] | None = None) -> Any:
     return runner.invoke(do.app, [*(args or []), "--log", str(tmp_path / "s.json")])
 
 
+def _flat(text: str) -> str:
+    """One long line: Rich wraps at the terminal width, assertions aren't.
+
+    Load-bearing for the manifest-refusal messages below: they interpolate
+    ``tmp_path``, whose length varies with how many tests a given pytest
+    session has already run, so the exact wrap point (and thus whether a
+    phrase like "zero produced relations" straddles a newline) is not
+    stable across runs. See tests/cli/test_dbt_orphans.py's own ``_flat``.
+    """
+    return " ".join(text.split())
+
+
 def test_scan_spares_a_name_the_manifest_still_produces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -246,8 +258,9 @@ def test_scan_refuses_when_manifest_produces_zero_relations(
     result = _scan(tmp_path)
 
     assert result.exit_code == ExitCode.CONFIG, result.output
-    assert "manifest_demo" in result.output
-    assert "zero produced relations" in result.output
+    out = _flat(result.output)
+    assert "manifest_demo" in out
+    assert "zero produced relations" in out
 
 
 def test_scan_refuses_when_manifest_is_missing(
@@ -260,7 +273,97 @@ def test_scan_refuses_when_manifest_is_missing(
     result = _scan(tmp_path)
 
     assert result.exit_code == ExitCode.CONFIG, result.output
-    assert "No manifest.json" in result.output
+    assert "No manifest.json" in _flat(result.output)
+
+
+def _named_project(
+    base: Path,
+    name: str,
+    env_prefix: str,
+    *,
+    nodes: dict[str, dict[str, Any]] | None,
+) -> DbtProject:
+    """Like ``_project``, but with a distinct name/env_prefix per call.
+
+    ``_project`` hardcodes ``name="manifest_demo"``, which is fine for every
+    other test in this file (one project at a time) but wrong for a fan-out
+    test: the preflight below dedupes manifest reads by project *name*, so
+    two same-named ``DbtProject`` objects would collapse into one read and
+    the test could not tell whether the second project's manifest was ever
+    consulted at all.
+    """
+    project_dir = base / name
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").write_text(f"name: {name}\n")
+    if nodes is not None:
+        target_dir = project_dir / "target"
+        target_dir.mkdir()
+        (target_dir / "manifest.json").write_text(json.dumps({"nodes": nodes}))
+    return DbtProject(
+        name=name,
+        env_prefix=env_prefix,
+        path=project_dir,
+        profiles_dir=project_dir,
+        project_name=name,
+        target_names=(env_prefix.lower(),),
+    )
+
+
+def test_apply_preflights_every_project_manifest_before_confirm_or_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ordering hazard a whole-branch review caught: under
+    ``--project all --no-dry-run``, the manifest refusal used to run
+    per-target inside ``_run_for_engine``, so a bad manifest on a *later*
+    project was only discovered after an *earlier* project's renames had
+    already been applied -- and the confirmation had already been answered
+    for nothing.
+
+    Two projects here, good manifest first and bad (missing) manifest
+    second -- the worst ordering, since a per-target check would have let
+    the first project's renames through before ever reaching the second.
+    Both ``open_transactional_connection`` and ``confirm_or_exit`` are made
+    to raise if reached at all, so this proves the refusal happens before
+    *either* project is touched and before the operator is even asked to
+    confirm -- not merely that it happens "early enough".
+    """
+    good = _named_project(
+        tmp_path, "good_project", "DEMO_PG", nodes={"model.demo.a": _node("kept")}
+    )
+    bad = _named_project(tmp_path, "bad_project", "DEMO_PG2", nodes=None)
+
+    monkeypatch.setattr(
+        do,
+        "_engines_for_project",
+        lambda _project, _target: [
+            ("demo_pg", SqlEngine.postgresql, "DEMO_PG", good),
+            ("demo_pg2", SqlEngine.postgresql, "DEMO_PG2", bad),
+        ],
+    )
+    monkeypatch.setattr(
+        do, "resolve_orphans_connection_params", lambda engine, *, env_prefix: object()
+    )
+    monkeypatch.setattr(do, "node_prefix", lambda project=None: "model.demo.")
+    monkeypatch.setattr(do, "invocation_command", lambda project=None: None)
+    monkeypatch.setattr(do, "excluded_schemas", lambda project=None: frozenset())
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    def _forbid_confirm(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "the manifest refusal must fire before the operator is asked to confirm"
+        )
+
+    monkeypatch.setattr(do, "confirm_or_exit", _forbid_confirm)
+
+    result = _scan(tmp_path, ["-p", "all", "--no-dry-run"])
+
+    assert result.exit_code == ExitCode.CONFIG, result.output
+    assert "No manifest.json" in _flat(result.output)
+
+    log_path = tmp_path / "s.json"
+    assert log_path.exists(), "a preflight refusal must still write the audit log"
+    payload = json.loads(log_path.read_text())
+    assert payload["renames"] == []
 
 
 def test_legacy_project_none_never_reads_a_manifest(
@@ -321,7 +424,7 @@ def test_scan_refuses_cleanly_on_a_manifest_that_is_not_a_json_object(
     result = _scan(tmp_path)
 
     assert result.exit_code == ExitCode.CONFIG, result.output
-    assert "does not contain a JSON object" in result.output
+    assert "does not contain a JSON object" in _flat(result.output)
 
     log_path = tmp_path / "s.json"
     assert log_path.exists(), "the audit log must survive a manifest-shape refusal"

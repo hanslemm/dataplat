@@ -994,6 +994,75 @@ def test_purge_refuses_ambiguous_legacy_rename_age_across_same_engine_targets(
     assert "demo_pg2" in result.output
 
 
+def test_purge_ambiguity_check_runs_before_the_confirmation_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``purge`` used to run ``confirm_or_exit`` before the legacy-ambiguity
+    check, so an operator confirmed an irreversible drop and was *then*
+    refused -- training people to confirm blind. Proven by making
+    ``confirm_or_exit`` itself raise if it is ever reached: with the ordering
+    fixed, the ambiguity refusal fires first and ``confirm_or_exit`` is never
+    called at all (not even reached to check ``--yes``, which is why this
+    test does not pass it).
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    when = datetime.now(UTC) - timedelta(days=30)
+    apply_log = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    apply_log.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    def _forbid_confirm(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "the ambiguity refusal must fire before the operator is asked to confirm"
+        )
+
+    monkeypatch.setattr(do, "confirm_or_exit", _forbid_confirm)
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(
+        [
+            "purge",
+            "-p",
+            "demo_project",
+            "--no-dry-run",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
+
+
 # --- revert -------------------------------------------------------------
 
 
@@ -1259,6 +1328,106 @@ def test_revert_refuses_ambiguous_legacy_entries_across_same_engine_targets(
     assert "demo_pg2" in result.output
 
 
+def test_revert_refuses_when_the_auto_selected_log_matches_no_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The false-success shape a whole-branch review caught: two apply logs
+    sit on disk, the newest belongs to a target this invocation was never
+    scoped to, ``--log`` is not passed, and revert auto-selects that newest
+    log. Before this fix that printed "No entries in log" and "Reverted 0
+    object(s)" and exited 0 -- the operator believes the renames were
+    undone, and ``purge`` (which scans the catalog, not the log) would later
+    drop them for good. Same shape as the pre-upgrade-log Critical this
+    branch already fixed for a *mismatched engine label*; this is the
+    mismatched-log-entirely variant. Only the auto-selected case refuses --
+    see the sibling test below for an explicitly passed log, which must not.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    def _write_log(path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "dry_run": False,
+                    "source": "dbt-orphans",
+                    # demo_project's target (see conftest.py), not one
+                    # demo_other declares -- DEMO_OTHER_DBT_TARGETS=demo_rs.
+                    "renames": [
+                        {
+                            "database": "demo_pg",
+                            "schema": SCHEMA,
+                            "old_name": ORPHAN,
+                            "new_name": DEPRECATED,
+                            "kind": "table",
+                        }
+                    ],
+                }
+            )
+        )
+
+    older = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    newer = log_dir / f"{do.APPLY_LOG_PREFIX}-20240202T000000Z.log.json"
+    _write_log(older)
+    _write_log(newer)
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert str(newer) in out
+    assert "auto-selected" in out
+    assert "--log" in out
+
+
+def test_revert_explicit_log_matching_no_target_still_reports_zero_reverted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sibling of the test above: an *explicitly* passed ``--log``
+    matching no target in the invocation is the operator's own choice, and
+    keeps the pre-existing behaviour -- "No entries in log", "Reverted 0
+    object(s)", exit 0. Only the auto-selected case (above) refuses.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    mismatched = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    mismatched.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "demo_pg",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other", "--log", str(mismatched)])
+
+    out = _flat(result.output)
+    assert result.exit_code == 0, result.output
+    assert "No entries in log" in out
+    assert "Reverted 0 object(s)" in out
+
+
 # --- the [engine] line prefix -------------------------------------------
 
 
@@ -1407,6 +1576,39 @@ def test_scan_refuses_a_duckdb_target(
     # Nothing was renamed, and no audit log claims anything was.
     assert not log.exists()
     assert path.read_bytes() == before
+
+
+def test_scan_refuses_a_duckdb_target_carrying_libpq_variables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A DuckDB target can carry stale libpq-shaped env vars -- HOST/USER/
+    PASSWORD/DATABASE left over from before it was reconfigured to
+    ``duckdb``, say. ``_connection_identity`` is called for *every* resolved
+    target by the overlap check, which runs before the capability gate (see
+    ``_engines_for_project``'s docstring), and used to catch only
+    ``ConfigError`` -- but ``resolve_connection_params`` raises
+    ``ValidationError`` for a non-libpq engine (the return type is
+    libpq-shaped and has nowhere to put a DuckDB target's settings). That
+    escaped as a generic "connects over the PostgreSQL wire protocol"
+    message naming `dp db query`/`describe`/`top-tables` -- not this command
+    -- and with no target-name prefix, instead of the specific capability
+    refusal below. Catching ``DataplatError`` fixes it: the target is
+    excluded from the overlap check ("cannot tell" is not "distinct" -- see
+    ``_connection_identity``'s docstring) and the invocation reaches the
+    real refusal, proven here with the exact same assertion every other
+    DuckDB-refusal test in this file uses.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DDB_HOST", "localhost")
+    monkeypatch.setenv("DDB_PORT", "5432")
+    monkeypatch.setenv("DDB_USER", "svc")
+    monkeypatch.setenv("DDB_PASSWORD", "x")
+    monkeypatch.setenv("DDB_DATABASE", "analytics")
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["--target", "ddb"])
+
+    _assert_rename_refusal(result)
 
 
 def test_scan_refuses_a_duckdb_target_before_the_gate(

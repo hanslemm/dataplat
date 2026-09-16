@@ -226,17 +226,24 @@ def _connection_identity(tgt: DbTarget) -> tuple[str, int, str] | None:
     no connection is opened — so this is safe to call for every resolved
     target before any capability check or connection attempt. ``None`` covers
     every case this cannot compare: missing connection settings, a
-    non-libpq shape (DuckDB resolves to a different params type entirely),
-    or a config problem in the settings themselves (e.g. a non-integer
-    port). A target that cannot be read this way is excluded from the
-    overlap check rather than treated as either a collision or a clearance —
-    "cannot tell" is not the same claim as "distinct".
+    non-libpq engine (``resolve_connection_params`` raises ``ValidationError``
+    for one, since the libpq-shaped return type has no host/user/port to put
+    a DuckDB target's settings in), or a config problem in the settings
+    themselves (e.g. a non-integer port). Caught as ``DataplatError``, not
+    just ``ConfigError``, to cover both: this runs before the capability gate
+    (see ``_refuse_overlapping_targets``'s call site), so a DuckDB target
+    carrying libpq-shaped variables reaches this overlap check first, and a
+    bare ``ConfigError`` catch would let its ``ValidationError`` escape as a
+    generic, unprefixed crash instead of the capability refusal further
+    down. A target that cannot be read this way is excluded from the overlap
+    check rather than treated as either a collision or a clearance — "cannot
+    tell" is not the same claim as "distinct".
     """
     try:
         params = resolve_orphans_connection_params(
             tgt.engine, env_prefix=tgt.env_prefix
         )
-    except ConfigError:
+    except DataplatError:
         return None
     if not isinstance(params, DbConnectionParams):
         return None
@@ -457,9 +464,14 @@ def main(
         DEFAULT_WINDOW_DAYS,
         "--window-days",
         help=(
-            "Consider a model 'live' if any matching dbt build in the last "
-            "N days produced it. Larger windows are more conservative "
-            "(fewer false-positive renames)."
+            "How many days back to look for a matching dbt build. For a "
+            "project with a manifest, this only decides which schemas get "
+            "scanned (any schema with a build in the window) -- whether a "
+            "relation is spared is decided by manifest membership, with no "
+            "time dimension, not by this window. On the legacy path (no "
+            "--project configured), this is still the sole criterion: a "
+            "model survives only if it built within the last N days. Larger "
+            "windows are more conservative (fewer false-positive renames)."
         ),
     ),
 ) -> None:
@@ -484,17 +496,25 @@ def main(
         fail(exc, console=console)
 
     engines = _engines_for_project(project, target)
-    if not dry_run:
-        confirm_or_exit(
-            yes=yes,
-            prompt="Rename every orphaned dbt object with a _deprecated suffix?",
-            console=console,
-        )
 
     since = datetime.now(UTC) - timedelta(days=window_days)
 
     all_entries: list[RenameEntry] = []
     try:
+        # Pre-flight every resolved project's manifest once, before the
+        # confirmation prompt and before any target is touched. This used to
+        # happen per-target inside _run_for_engine, which (a) re-read the same
+        # project's manifest once per target it declares, and (b) under
+        # --project all --no-dry-run only discovered a later project's bad
+        # manifest after an earlier project's renames had already been
+        # applied -- the confirmation had already been answered for nothing.
+        produced_by_project = _preflight_produced(engines)
+        if not dry_run:
+            confirm_or_exit(
+                yes=yes,
+                prompt="Rename every orphaned dbt object with a _deprecated suffix?",
+                console=console,
+            )
         for label, engine, env_prefix, proj in engines:
             all_entries.extend(
                 _run_for_engine(
@@ -502,6 +522,7 @@ def main(
                     engine,
                     env_prefix=env_prefix,
                     project=proj,
+                    produced=produced_by_project[proj.name if proj else None],
                     excluded_user_schemas=excluded_user_schemas,
                     excluded_user_relations=excluded_user_relations,
                     window_days=window_days,
@@ -620,12 +641,41 @@ def _produced_predicate(produced: set[str] | None) -> Callable[[str], bool] | No
     return _is_produced
 
 
+def _preflight_produced(
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+) -> dict[str | None, set[str] | None]:
+    """Read every distinct resolved project's manifest exactly once.
+
+    Keyed by project name (``None`` for the legacy no-project path, which
+    ``_produced_relations`` never reads anything for). Two targets that
+    declare the same project -- an ordinary shape, see
+    ``_engines_for_project`` -- used to trigger two separate manifest reads,
+    once per target, because this used to happen inside ``_run_for_engine``.
+    Deduplicating here means one read per project regardless of how many of
+    its targets are in this invocation.
+
+    Called before the destructive confirmation prompt (see ``main``'s own
+    comment at the call site): a bad manifest anywhere in a
+    ``--project all --no-dry-run`` fan-out now refuses before any project's
+    renames are applied, and before the operator is even asked to confirm,
+    rather than surfacing only after an earlier project already went
+    through.
+    """
+    produced_by_project: dict[str | None, set[str] | None] = {}
+    for _label, _engine, _env_prefix, proj in engines:
+        key = proj.name if proj is not None else None
+        if key not in produced_by_project:
+            produced_by_project[key] = _produced_relations(proj)
+    return produced_by_project
+
+
 def _run_for_engine(
     label: str,
     engine: SqlEngine,
     *,
     env_prefix: str,
     project: DbtProject | None = None,
+    produced: set[str] | None,
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
     window_days: int,
@@ -635,7 +685,6 @@ def _run_for_engine(
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
         dbt_node_prefix = node_prefix(project)
-        produced = _produced_relations(project)
     except ConfigError as exc:
         # Re-raised as the same class, not widened to ServiceError: "set
         # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
@@ -790,6 +839,7 @@ def revert_cmd(
     # never have been one, sending the reader to look for a missing file
     # instead of at the engine.
     engines = _engines_for_project(project, target)
+    log_was_auto_selected = log is None
     if log is None:
         log = _find_latest_log(APPLY_LOG_PREFIX)
         if log is None:
@@ -841,6 +891,7 @@ def revert_cmd(
         fail(exc, console=console)
 
     total = 0
+    matched_any_target = False
     try:
         for label, engine, env_prefix, _project in engines:
             # A legacy log's entries carry the old engine-family value (see
@@ -856,6 +907,7 @@ def revert_cmd(
             if not entries:
                 console.print(f"[dim]{_tag(label)} No entries in log.[/dim]")
                 continue
+            matched_any_target = True
             total += _revert_for_engine(
                 label, engine, entries, env_prefix=env_prefix, dry_run=dry_run
             )
@@ -867,6 +919,26 @@ def revert_cmd(
         # See the note in `main`: the count printed after the error is why this
         # takes the code from the exception instead of calling fail().
         raise typer.Exit(code=exit_code_for(exc))
+
+    # An explicitly passed --log matching nothing is the operator's own
+    # choice -- keep reporting "Reverted 0 object(s)" as before. An
+    # auto-selected log matching nothing is different: the newest log on
+    # disk can belong to a different project or target than this invocation,
+    # and reporting success here is the same false-comfort shape as the
+    # pre-upgrade-log Critical this branch already fixed (see
+    # _LEGACY_ENGINE_LABELS above) -- purge would later drop what the
+    # operator believes was already reverted.
+    if log_was_auto_selected and not matched_any_target:
+        fail(
+            ValidationError(
+                f"the auto-selected log {log} matches no entries for any "
+                "target in this invocation. Nothing was reverted, but this "
+                "is likely the wrong log rather than genuinely nothing to "
+                "revert -- pass --log explicitly to confirm which one you "
+                "mean."
+            ),
+            console=console,
+        )
 
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(f"[green]{prefix}Reverted {total} object(s).[/green]")
@@ -1059,15 +1131,12 @@ def purge_cmd(
         fail(exc, console=console)
 
     engines = _engines_for_project(project, target)
-    if not dry_run:
-        confirm_or_exit(
-            yes=yes,
-            prompt=(
-                "Permanently DROP every *_deprecated object? This cannot be undone."
-            ),
-            console=console,
-        )
 
+    # Pre-flight, before the destructive confirmation: this used to run after
+    # confirm_or_exit, so an operator confirmed an irreversible drop and was
+    # then refused -- training people to confirm blind. Reading the
+    # rename-age index and checking it for ambiguity needs nothing the
+    # confirmation would have produced, so there is no reason it has to wait.
     renamed_at = _renamed_at_index() if older_than is not None else None
     if renamed_at is not None:
         try:
@@ -1083,6 +1152,15 @@ def purge_cmd(
         if older_than is not None
         else None
     )
+
+    if not dry_run:
+        confirm_or_exit(
+            yes=yes,
+            prompt=(
+                "Permanently DROP every *_deprecated object? This cannot be undone."
+            ),
+            console=console,
+        )
 
     all_drops: list[DropEntry] = []
     blocked: list[BlockedEntry] = []
