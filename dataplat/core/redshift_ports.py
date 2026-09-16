@@ -328,18 +328,35 @@ def _rownumber_without_order(sql: str) -> bool:
     return False
 
 
-def _strip(sql: str) -> str:
-    """Remove what must not be scanned, in the one order that works.
+def _strip_comments(sql: str) -> str:
+    """Remove comments only, in the one order that works.
 
     Jinja comments FIRST: a ``{# ... #}`` block may legitimately contain ``--``,
     and stripping line comments first eats the block's closing tag, leaving the
-    whole comment in the scanned text. Then string literals, before looking for
-    calls: German label text like ``'Verdauungssystem (Magen)'`` is otherwise
-    read as a call to ``verdauungssystem()``.
+    whole comment in the scanned text.
+
+    String literals are deliberately left alone here. This is the text the
+    SYNTAX_CHECKS pass runs against, and three of those checks -- the Perl
+    regex class, the interval-with-month/year literal, the regex
+    lookahead/non-capturing group -- look for content that only ever appears
+    INSIDE a string literal (a ``regexp_replace`` pattern argument, an
+    ``interval '1 month'`` literal). Blanking literals before this pass would
+    make those three permanently unable to match anything.
     """
     sql = re.sub(r"\{#.*?#\}", "", sql, flags=re.S)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
-    sql = re.sub(r"--[^\n]*", "", sql)
+    return re.sub(r"--[^\n]*", "", sql)
+
+
+def _strip_literals(sql: str) -> str:
+    """Blank string literals, on top of comment stripping.
+
+    Only for the CALL-NAME scan (KNOWN_SAFE/KNOWN_RISKY/UNKNOWN) and the
+    row_number check: German label text like ``'Verdauungssystem (Magen)'``
+    is otherwise read as a call to ``verdauungssystem()``. The upstream
+    scanner this was vendored from strips literals before looking for calls,
+    not before its syntax pass -- see :func:`_strip_comments`.
+    """
     return re.sub(r"'(?:[^']|'')*'", "''", sql)
 
 
@@ -348,15 +365,16 @@ def scan(sql: str) -> tuple[Finding, ...]:
     if not sql or not sql.strip():
         return ()
 
-    stripped = _strip(sql)
+    comments_stripped = _strip_comments(sql)
+    calls_text = _strip_literals(comments_stripped)
 
     # A token preceded by '::' is a CAST, not a call -- ``::numeric(38, 6)`` is
     # the standard fix for the bare-::numeric trap, and reading it as a call to
     # numeric() reported a phantom UNKNOWN on every model that uses one.
     calls = {
         m.group(1).lower()
-        for m in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", stripped)
-        if not stripped[: m.start()].rstrip().endswith("::")
+        for m in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", calls_text)
+        if not calls_text[: m.start()].rstrip().endswith("::")
     }
     # FILTER (WHERE ...) and RANGE BETWEEN are syntax, not calls -- the '(' that
     # follows makes them look like functions. Both are in SYNTAX_CHECKS, so drop
@@ -365,7 +383,7 @@ def scan(sql: str) -> tuple[Finding, ...]:
 
     findings: list[Finding] = []
     for call in sorted(calls):
-        if _only_called_through_jinja(call, stripped):
+        if _only_called_through_jinja(call, calls_text):
             continue
         if call in KNOWN_RISKY:
             findings.append(Finding("RISKY", call, KNOWN_RISKY[call]))
@@ -380,10 +398,10 @@ def scan(sql: str) -> tuple[Finding, ...]:
             )
 
     for pattern, label, message in SYNTAX_CHECKS:
-        if re.search(pattern, stripped, re.I):
+        if re.search(pattern, comments_stripped, re.I):
             findings.append(Finding("SYNTAX", label, message))
 
-    if _rownumber_without_order(stripped):
+    if _rownumber_without_order(calls_text):
         findings.append(
             Finding("SYNTAX", "row_number() with no ORDER BY", ROWNUM_MESSAGE)
         )

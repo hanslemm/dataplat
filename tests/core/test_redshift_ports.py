@@ -96,6 +96,24 @@ def test_supersets_own_jinja_is_not_a_finding() -> None:
     assert _kinds(sql)["UNKNOWN"] == set()
 
 
+def test_a_perl_regex_class_inside_a_literal_argument_is_flagged() -> None:
+    # Dead until fix round 12: the syntax pass ran against the fully-stripped
+    # text (literals blanked to ''), and this check can only ever match
+    # content that lives INSIDE the string literal it is looking at.
+    sql = r"select regexp_replace(x, '\s+', ' ') from t"
+    assert "Perl regex class" in _kinds(sql)["SYNTAX"]
+
+
+def test_an_interval_literal_with_month_or_year_against_a_column_is_flagged() -> None:
+    sql = "select d + interval '1 month' from t"
+    assert "interval with month/year" in _kinds(sql)["SYNTAX"]
+
+
+def test_a_non_capturing_group_inside_a_regex_literal_is_flagged() -> None:
+    sql = "select regexp_replace(x, '(?:ab)', 'y') from t"
+    assert "regex lookahead/lookbehind or non-capturing group" in _kinds(sql)["SYNTAX"]
+
+
 def test_provenance_is_recorded() -> None:
     # "Where did this come from, and what have I not picked up" must be
     # answerable without asking anyone.
