@@ -35,6 +35,29 @@ def test_target_narrows_the_fan_out() -> None:
     assert [t.name for t in pairs[0][1]] == ["demo_rs"]
 
 
+def test_target_all_is_treated_like_omitting_target() -> None:
+    """``-t all`` must resolve identically to omitting ``--target``.
+
+    The pre-project-era option defaulted to ``"all"`` and its own help text
+    documented that meaning (see ``resolve_targets``'s ``ALL_TARGETS``
+    handling on the legacy no-project path). Without this, a documented
+    invocation that worked before a project was configured breaks the
+    moment one is -- during the exact migration this area exists to sell.
+    Also checks whitespace/case, matching how every other ``--target`` value
+    is normalized here (``target.strip().lower()``).
+    """
+    from dataplat.cli.dbt._common import projects_and_targets
+
+    omitted = projects_and_targets("demo_project", None)
+    explicit_all = projects_and_targets("demo_project", "all")
+    padded_all = projects_and_targets("demo_project", " ALL ")
+
+    want = [t.name for t in omitted[0][1]]
+    assert want == ["demo_pg", "demo_rs"]
+    assert [t.name for t in explicit_all[0][1]] == want
+    assert [t.name for t in padded_all[0][1]] == want
+
+
 def test_target_outside_the_project_is_rejected() -> None:
     from dataplat.cli.dbt._common import projects_and_targets
 

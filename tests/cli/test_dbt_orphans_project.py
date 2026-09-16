@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
+from dataplat.core.errors import ExitCode
 from dataplat.main import app
 
 runner = CliRunner()
@@ -18,6 +21,33 @@ def test_orphans_rejects_a_target_outside_the_project() -> None:
     result = runner.invoke(app, ["dbt", "orphans", "-p", "demo_other", "-t", "demo_pg"])
     assert result.exit_code != 0
     assert "does not build into" in result.output
+
+
+def test_orphans_accepts_target_all_under_a_configured_project(tmp_path: Path) -> None:
+    """``-t all`` predates named projects (the option used to default to it,
+    with its own help text documenting that meaning) and must keep working
+    once a project is configured, not just on the legacy no-project path --
+    otherwise a documented invocation breaks during the exact migration
+    ``dp dbt`` exists to sell.
+
+    Both invocations here fail downstream (the tracked demo_project fixture
+    has no compiled manifest -- see tests/cli/test_dbt_orphans_manifest.py),
+    which is the point: comparing ``-t all`` against omitting ``-t``
+    entirely proves ``all`` reached the exact same per-target work as the
+    default, not merely that project/target *resolution* let it through.
+    ``--log`` is pointed at tmp_path so a downstream failure's audit log
+    does not land in the developer's real ``~/.config/dataplat``.
+    """
+    log_a = str(tmp_path / "a.json")
+    log_b = str(tmp_path / "b.json")
+    with_all = runner.invoke(
+        app, ["dbt", "orphans", "-p", "demo_project", "-t", "all", "--log", log_a]
+    )
+    without_t = runner.invoke(
+        app, ["dbt", "orphans", "-p", "demo_project", "--log", log_b]
+    )
+    assert "does not build into" not in with_all.output
+    assert with_all.exit_code == without_t.exit_code == ExitCode.CONFIG
 
 
 def test_orphans_defaults_to_dry_run() -> None:
