@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from dataplat.core.errors import ValidationError
+from dataplat.core.errors import ServiceError, ValidationError
 from dataplat.services.superset.repoint import (
     DatasetKey,
     canonical_rows,
@@ -128,6 +128,34 @@ def test_a_virtual_dataset_is_marked_as_one() -> None:
     assert cohort.is_virtual
 
 
+def test_a_source_dataset_with_no_usable_id_is_a_service_error() -> None:
+    # A bare KeyError/TypeError here would escape the CLI's exit-code
+    # machinery as a raw traceback rather than the documented exit code.
+    broken = {"table_name": "x", "schema": "s", "sql": None, "database": {"id": 1}}
+    with pytest.raises(ServiceError):
+        plan_migration(
+            source_datasets=[broken],
+            target_datasets=TARGET,
+            from_database_id=1,
+            overrides={},
+        )
+
+
+def test_a_matched_target_dataset_with_no_usable_id_is_a_service_error() -> None:
+    # public.orders in SOURCE matches this target by schema+table, so the
+    # matched branch -- not just the source-side one -- must guard the id too.
+    broken_target = [
+        {"table_name": "orders", "schema": "public", "database": {"id": 2}}
+    ]
+    with pytest.raises(ServiceError):
+        plan_migration(
+            source_datasets=SOURCE,
+            target_datasets=broken_target,
+            from_database_id=1,
+            overrides={},
+        )
+
+
 def test_parse_overrides_reads_schema_dot_table_pairs() -> None:
     parsed = parse_overrides(["public.orders=analytics.orders"])
     assert parsed == {DatasetKey("public", "orders"): DatasetKey("analytics", "orders")}
@@ -179,6 +207,20 @@ def test_a_chart_with_no_query_context_still_repoints() -> None:
     assert "query_context" not in payload
 
 
+def test_a_chart_with_unparseable_params_is_a_service_error() -> None:
+    # Omitting "params" and still rewriting datasource_id would leave the
+    # chart pointing at two different datasets at once -- silently.
+    chart = {**CHART, "params": "{not json"}
+    with pytest.raises(ServiceError):
+        repoint_chart(chart, {118: 904})
+
+
+def test_a_chart_with_unparseable_query_context_is_a_service_error() -> None:
+    chart = {**CHART, "query_context": "{not json"}
+    with pytest.raises(ServiceError):
+        repoint_chart(chart, {118: 904})
+
+
 def test_native_filters_are_remapped() -> None:
     metadata = json.dumps(
         {
@@ -218,6 +260,11 @@ def test_copy_metadata_survives_a_dashboard_with_neither_field() -> None:
     assert json.loads(copy_metadata({})) == {}
 
 
+def test_copy_metadata_survives_malformed_json() -> None:
+    dashboard = {"json_metadata": "{not json", "position_json": "{not json"}
+    assert json.loads(copy_metadata(dashboard)) == {}
+
+
 def test_dashboard_metadata_remaps_but_drops_the_original_layout() -> None:
     # The copy has its OWN layout, which Superset built by remapping chartId
     # onto the clones. Writing the original's positions back would undo that.
@@ -232,6 +279,12 @@ def test_dashboard_metadata_remaps_but_drops_the_original_layout() -> None:
     out = json.loads(dashboard_metadata(metadata, {118: 904}))
     assert "positions" not in out
     assert out["native_filter_configuration"][0]["targets"][0]["datasetId"] == 904
+
+
+def test_dashboard_metadata_survives_malformed_json() -> None:
+    # repoint_metadata already absorbed this and handed the raw string back;
+    # re-parsing it here must not raise the very error it just swallowed.
+    assert dashboard_metadata("{not json", {118: 904}) == "{not json"
 
 
 SOURCE_DATASET = {

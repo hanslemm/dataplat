@@ -13,7 +13,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from dataplat.core.errors import ValidationError
+from dataplat.core.errors import ServiceError, ValidationError
 
 __all__ = [
     "Comparison",
@@ -89,6 +89,23 @@ class MigrationPlan:
         }
 
 
+def _require_dataset_id(dataset: dict) -> int:
+    """The int id of a Superset dataset payload, or a loud, typed failure.
+
+    A payload with no usable id is not the user's mistake to fix -- it means
+    Superset returned something unusable, which is what :class:`ServiceError`
+    is for. Falling back to a bare ``dataset["id"]`` would raise ``KeyError``
+    instead, which is not a :class:`DataplatError` and so escapes ``fail()``
+    as a raw traceback rather than the documented exit code.
+    """
+    dataset_id = dataset.get("id")
+    if not isinstance(dataset_id, int):
+        raise ServiceError(
+            f"Superset returned a dataset with no usable id: {DatasetKey.of(dataset)}"
+        )
+    return dataset_id
+
+
 def parse_overrides(pairs: Iterable[str]) -> dict[DatasetKey, DatasetKey]:
     """Read repeated ``schema.table=schema.table`` flags."""
     overrides: dict[DatasetKey, DatasetKey] = {}
@@ -127,7 +144,7 @@ def plan_migration(
     foreign: list[DatasetMatch] = []
 
     for dataset in source_datasets:
-        source_id = int(dataset["id"])
+        source_id = _require_dataset_id(dataset)
         source_key = DatasetKey.of(dataset)
         is_virtual = bool(dataset.get("sql"))
         name = str(dataset.get("table_name") or source_id)
@@ -157,7 +174,7 @@ def plan_migration(
                     "map",
                     is_virtual,
                     name,
-                    int(target["id"]),
+                    _require_dataset_id(target),
                 )
             )
             continue
@@ -172,7 +189,7 @@ def plan_migration(
                     "schema+table",
                     is_virtual,
                     name,
-                    int(target["id"]),
+                    _require_dataset_id(target),
                 )
             )
             continue
@@ -230,8 +247,15 @@ def repoint_chart(chart: dict, id_map: dict[int, int]) -> dict | None:
     if raw_params:
         try:
             params = json.loads(raw_params)
-        except ValueError:
-            params = None
+        except ValueError as exc:
+            # Omitting "params" here would still rewrite datasource_id below,
+            # leaving the chart pointing at two different datasets at once --
+            # exactly what the docstring says never happens.
+            raise ServiceError(
+                f"Chart {chart.get('id')} has unparseable params; refusing to "
+                "rewrite its datasource, which would leave it pointing at two "
+                "different datasets at once"
+            ) from exc
         if isinstance(params, dict):
             if params.get("datasource"):
                 params["datasource"] = f"{new_id}__{datasource_type}"
@@ -241,8 +265,12 @@ def repoint_chart(chart: dict, id_map: dict[int, int]) -> dict | None:
     if raw_context:
         try:
             context = json.loads(raw_context)
-        except ValueError:
-            context = None
+        except ValueError as exc:
+            raise ServiceError(
+                f"Chart {chart.get('id')} has unparseable query_context; "
+                "refusing to rewrite its datasource, which would leave it "
+                "pointing at two different datasets at once"
+            ) from exc
         if isinstance(context, dict):
             datasource = context.get("datasource")
             if isinstance(datasource, dict):
@@ -287,7 +315,13 @@ def dashboard_metadata(json_metadata: str, id_map: dict[int, int]) -> str:
     ``positions`` back over it would undo exactly that, and the dashboard
     would render the original's charts inside the copy.
     """
-    remapped = json.loads(repoint_metadata(json_metadata, id_map))
+    try:
+        remapped = json.loads(repoint_metadata(json_metadata, id_map))
+    except ValueError:
+        # repoint_metadata hands back the raw string when it could not parse
+        # it, so a second parse here would raise the very error it just
+        # absorbed.
+        return json_metadata or "{}"
     remapped.pop("positions", None)
     return json.dumps(remapped)
 
@@ -356,10 +390,10 @@ def semantic_payload(source: dict, synced: dict) -> dict:
 
     columns: list[dict] = []
     for name, synced_column in synced_by_name.items():
-        column: dict[str, object] = {
-            "id": synced_column.get("id"),
-            "column_name": name,
-        }
+        column: dict[str, object] = {"column_name": name}
+        synced_id = synced_column.get("id")
+        if isinstance(synced_id, int):
+            column["id"] = synced_id
         origin = source_by_name.get(name)
         if origin:
             for field in _COLUMN_FIELDS:
@@ -447,11 +481,18 @@ def compare_rows(left: list[dict], right: list[dict]) -> Comparison:
     right_columns = {key for row in right for key in row}
     missing = tuple(sorted(left_columns ^ right_columns))
 
-    canonical_left = canonical_rows(left)
-    canonical_right = canonical_rows(right)
-
     differing = 0
-    for row_left, row_right in zip(canonical_left, canonical_right, strict=False):
-        differing += sum(1 for a, b in zip(row_left, row_right, strict=False) if a != b)
+    if not missing:
+        # Canonical tuples are positional. With columns missing on one side,
+        # zipping them would pair up unrelated cells and count a mismatch
+        # that is really the shape difference `missing_columns` already
+        # reports -- so only count cells when both sides have the same
+        # columns to compare.
+        canonical_left = canonical_rows(left)
+        canonical_right = canonical_rows(right)
+        for row_left, row_right in zip(canonical_left, canonical_right, strict=False):
+            differing += sum(
+                1 for a, b in zip(row_left, row_right, strict=False) if a != b
+            )
 
     return Comparison(len(left), len(right), differing, missing)
