@@ -781,10 +781,10 @@ dp bi superset dashboards datasets 42 --from-database DataOcean
 **Virtual datasets carry SQL, and Redshift is not Postgres.** Before creating
 one, `dp` runs its SQL against the target and reports the engine's own error if
 it will not run. It also scans for constructs known to behave *differently
-without erroring* — a bare `::numeric` that truncates on Redshift, a `concat()`
-that propagates NULL where Postgres ignores it, an array subscript that is
-0-based on one engine and 1-based on the other. That list is vendored from the
-dbt migration's own evidence and is advisory: it reports, it never blocks.
+without erroring* — a bare `::numeric` that truncates on Redshift, and a
+`concat()` that propagates NULL where Postgres ignores it. That list is
+vendored from the dbt migration's own evidence and is advisory: it reports,
+it never blocks.
 
 `--compare` is the check that settles it. Because `duplicate` copies rather
 than moves, both dashboards are live at once, so each chart's query can be run
