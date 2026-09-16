@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `dp bi superset dashboards list | datasets | duplicate`. `duplicate` copies a
+  dashboard and repoints the copy's charts onto another database's datasets,
+  creating missing datasets with their metrics and calculated columns. Virtual
+  SQL is validated against the target before anything is created, and scanned
+  for Postgres/Redshift constructs that differ without erroring. `--compare`
+  runs each chart on both databases and diffs the results. Nothing is deleted
+  on any path.
+
 ## 0.10.0
 
 ### Added

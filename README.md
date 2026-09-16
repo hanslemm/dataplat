@@ -37,7 +37,8 @@ dp
 │   └── superset
 │       ├── users          # list | create | update | delete | set-password
 │       ├── roles          # list
-│       └── groups         # list
+│       ├── groups         # list
+│       └── dashboards     # list | datasets | duplicate               [3]
 ├── people                 # access across every area at once
 │   ├── onboard            # create accounts everywhere, copying a colleague
 │   └── offboard           # disable everywhere; drops nothing
@@ -59,6 +60,9 @@ roles, no other sessions, and no rename that survives a dependent view. See
 [2] `list`, `create` and `drop` work on every engine; `grant`, `revoke` and
 `alter` need a server — DuckDB has no `GRANT` statement and does not implement
 `ALTER SCHEMA`.
+
+[3] `duplicate` copies a dashboard and repoints the copy's charts onto another
+database's datasets, creating what is missing. It never deletes anything.
 
 ## Installation
 
@@ -720,6 +724,65 @@ Depends on this:
 
 It is advisory and never fatal — a Superset outage produces a note, not a
 blocked drop — and `--no-impact` skips it.
+
+### Moving a dashboard to another warehouse
+
+Retiring a warehouse means moving what reads from it. `dp` can find that:
+
+```bash
+dp bi superset dashboards list --database DataOcean
+```
+
+and, per dashboard, say how much of it can move at all:
+
+```bash
+dp bi superset dashboards datasets 42 --to-database BetterData
+```
+
+`duplicate` then copies the dashboard and points the copy's charts at the other
+database's datasets:
+
+```bash
+dp bi superset dashboards duplicate 42 \
+    --from-database DataOcean --to-database BetterData
+```
+
+Nothing is written until every dataset resolves — one run reports every
+problem rather than one problem per run — and `--dry-run` writes nothing at
+all. A dataset with no counterpart is created, with its metrics and calculated
+columns copied across: a chart names its metrics as strings, so a dataset
+without them is one the chart cannot render even though its id is correct.
+
+A dataset on neither the source nor the target connection is reported and left
+alone. A dashboard can read from several databases, and repointing the ones
+nobody was migrating would be a change nobody asked for.
+
+**Virtual datasets carry SQL, and Redshift is not Postgres.** Before creating
+one, `dp` runs its SQL against the target and reports the engine's own error if
+it will not run. It also scans for constructs known to behave *differently
+without erroring* — a bare `::numeric` that truncates on Redshift, a `concat()`
+that propagates NULL where Postgres ignores it, an array subscript that is
+0-based on one engine and 1-based on the other. That list is vendored from the
+dbt migration's own evidence and is advisory: it reports, it never blocks.
+
+`--compare` is the check that settles it. Because `duplicate` copies rather
+than moves, both dashboards are live at once, so each chart's query can be run
+on both and the results diffed:
+
+```bash
+dp bi superset dashboards duplicate 42 \
+    --from-database DataOcean --to-database BetterData --compare
+```
+
+Rows are ordered in Python, never with an `ORDER BY`: the two engines disagree
+on text collation, and Redshift ignores trailing blanks where Postgres does
+not, so sorting on the engines would invent differences. A disagreement exits
+`1`, not `5` — `5` is the retryable code, and a dashboard whose numbers differ
+will not agree because something tried again.
+
+The original dashboard, its charts and its datasets are never modified, and
+nothing is ever deleted. If a later step fails, the copy and any created
+datasets stay, and their ids are printed.
 
 ### Onboarding and offboarding
 
