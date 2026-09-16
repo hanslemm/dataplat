@@ -10,6 +10,7 @@ from collections.abc import Iterator
 
 import httpx
 
+from dataplat.core.errors import ServiceError
 from dataplat.services._http import raise_for_status
 from dataplat.services.superset.client import auth_headers
 
@@ -96,8 +97,16 @@ def create_dataset(
         timeout=120,
     )
     raise_for_status(response, "create Superset dataset")
-    resp = response.json() or {}
-    return int(resp.get("id", 0))
+    dataset_id = (response.json() or {}).get("id")
+    if not isinstance(dataset_id, int):
+        # A 2xx with no id is not a dataset we can use, and returning a
+        # plausible-looking 0 would surface three calls later as a confusing
+        # "not found" against an id nobody chose.
+        raise ServiceError(
+            "Superset accepted the dataset but returned no id "
+            f"({response.status_code} {response.reason_phrase})"
+        )
+    return dataset_id
 
 
 def update_dataset(

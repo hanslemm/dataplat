@@ -89,6 +89,21 @@ def test_creation_returns_the_new_id() -> None:
         assert create_dataset(client, BASE_URL, "tok", {"table_name": "orders"}) == 904
 
 
+def test_a_creation_that_returns_no_id_fails_here_rather_than_later() -> None:
+    # A bogus id does not fail at the point of creation -- it fails three
+    # calls later, against an id nobody chose.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        create_dataset(client, BASE_URL, "tok", {"table_name": "orders"})
+
+    assert "no id" in str(excinfo.value)
+
+
 def test_a_refused_creation_says_what_superset_said() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
