@@ -120,6 +120,7 @@ def installed(*sites: Path) -> Iterator[None]:
 def test_all_builtin_areas_present_in_order() -> None:
     assert [m.name for m in all_areas()] == [
         "db",
+        "dbt",
         "ingest",
         "bi",
         "people",
@@ -254,6 +255,7 @@ def test_all_areas_appends_plugins_after_the_builtins(tmp_path: Path) -> None:
     with installed(_widget(tmp_path)):
         assert [m.name for m in all_areas()] == [
             "db",
+            "dbt",
             "ingest",
             "bi",
             "people",

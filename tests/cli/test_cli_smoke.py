@@ -187,6 +187,7 @@ def test_areas_mount_as_placeholders_in_registry_order() -> None:
         assert group.list_commands(ctx) == [
             "config",
             "db",
+            "dbt",
             "ingest",
             "bi",
             "people",
@@ -223,7 +224,8 @@ def test_unknown_command_still_suggests_a_lazy_area() -> None:
     result = runner.invoke(main_module.app, ["dbb"])
 
     assert result.exit_code == 2
-    assert "Did you mean 'db'?" in result.output
+    # 'dbt' is now also one edit away from 'dbb' and is offered alongside 'db'.
+    assert "Did you mean 'db', 'dbt'?" in result.output
 
 
 def test_a_third_party_area_mounts_under_its_registry_name(
