@@ -7,7 +7,6 @@ import pytest
 from dataplat.core.errors import ConfigError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
-    DBT_ARTIFACTS_SCHEMA,
     DEPRECATED_SUFFIX,
     LIVE_STATUSES,
     build_rename_statement,
@@ -76,7 +75,8 @@ def _clear_orphan_env(monkeypatch) -> None:
 def test_constants() -> None:
     assert DEPRECATED_SUFFIX == "_deprecated"
     assert frozenset({"success", "error"}) == LIVE_STATUSES
-    assert DBT_ARTIFACTS_SCHEMA == "dbt_artifacts"
+    # DBT_ARTIFACTS_SCHEMA lives in dataplat.services.dbt.settings, not here --
+    # see tests/services/dbt/test_settings.py::test_dbt_artifacts_schema.
 
 
 def test_excluded_schemas_default(monkeypatch: pytest.MonkeyPatch) -> None:

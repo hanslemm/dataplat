@@ -26,7 +26,6 @@ from dataplat.services.db.connection import (
 )
 
 DEPRECATED_SUFFIX = "_deprecated"
-DBT_ARTIFACTS_SCHEMA = "dbt_artifacts"
 
 # excluded_schemas / node_prefix / invocation_command used to live here as this
 # module's own env-var readers (DP_DBT_PROJECT, DP_DBT_ORPHANS_EXCLUDE_SCHEMAS,
@@ -40,8 +39,11 @@ DBT_ARTIFACTS_SCHEMA = "dbt_artifacts"
 # fetch_live_model_relations's invocation_command/node_prefix -- take the
 # already-resolved value as an argument instead), and this module stays a
 # generic multi-engine SQL service with no dependency on the dbt project
-# registry. The CLI (dataplat.cli.dbt.orphans), the one real caller, imports
-# them straight from dataplat.services.dbt.settings.
+# registry. DBT_ARTIFACTS_SCHEMA moved with them -- it is what
+# dataplat.services.dbt.settings's DEFAULT_EXCLUDED_SCHEMAS is built from, and
+# is not redefined here a second time. The CLI (dataplat.cli.dbt.orphans),
+# the one real caller, imports them straight from
+# dataplat.services.dbt.settings.
 LIVE_STATUSES: frozenset[str] = frozenset({"success", "error"})
 
 ObjectKind = Literal["table", "view", "matview"]

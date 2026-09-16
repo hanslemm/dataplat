@@ -5,11 +5,20 @@ import pytest
 from dataplat.core.errors import ConfigError
 from dataplat.services.dbt.projects import resolve_project
 from dataplat.services.dbt.settings import (
+    DBT_ARTIFACTS_SCHEMA,
     DEFAULT_EXCLUDED_SCHEMAS,
     excluded_schemas,
     invocation_command,
     node_prefix,
 )
+
+
+def test_dbt_artifacts_schema() -> None:
+    """The one definition -- dataplat.services.db.orphans used to define this
+    a second time with no consumer of its own but a test asserting its
+    value; this is that assertion, repointed here.
+    """
+    assert DBT_ARTIFACTS_SCHEMA == "dbt_artifacts"
 
 
 def test_node_prefix_from_project() -> None:
