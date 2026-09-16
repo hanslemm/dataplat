@@ -181,10 +181,10 @@ def _give_project_a_manifest(
     no target/manifest.json -- writing one into them directly would leave
     residue behind after the run (the same reason
     tests/services/dbt/test_manifest.py builds its own throwaway projects
-    under tmp_path). ``_run_for_engine`` now reads the manifest for every
-    named project it is given, so any test that reaches it through a real
-    project needs one to exist; this builds a disposable stand-in instead of
-    touching the tracked fixture.
+    under tmp_path). ``_preflight_produced`` now reads the manifest for
+    every named project resolved for the run, so any test that reaches it
+    through a real project needs one to exist; this builds a disposable
+    stand-in instead of touching the tracked fixture.
 
     ``produced`` defaults to ``{"kept"}`` -- the name every test in this file
     already treats as the live, non-orphan relation -- so a test that does
@@ -1426,6 +1426,86 @@ def test_revert_explicit_log_matching_no_target_still_reports_zero_reverted(
     assert result.exit_code == 0, result.output
     assert "No entries in log" in out
     assert "Reverted 0 object(s)" in out
+
+
+def test_revert_refuses_when_the_auto_selected_log_has_no_renames_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same false-success door, reached differently: the log this time
+    has *zero* renames recorded at all (not merely zero matching this
+    invocation's targets) -- the early "nothing to revert" return, which
+    sits before the per-target matching this file's other new tests cover.
+    An empty log is exactly as likely to be the wrong log (a later scan
+    that happened to find nothing, written under the same prefix) as it is
+    proof there was nothing to revert, so the auto-selected case refuses
+    here too. Only reachable now that the apply path's own preflight
+    refusal (see test_dbt_orphans_manifest.py) writes exactly this shape of
+    log -- a bad manifest refuses before any renames, leaving an empty log
+    behind -- which made this door easier to walk through than it used to
+    be.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    older = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    newer = log_dir / f"{do.APPLY_LOG_PREFIX}-20240202T000000Z.log.json"
+    for path in (older, newer):
+        path.write_text(
+            json.dumps(
+                {
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "dry_run": False,
+                    "source": "dbt-orphans",
+                    "renames": [],
+                }
+            )
+        )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert str(newer) in out
+    assert "auto-selected" in out
+    assert "--log" in out
+
+
+def test_revert_explicit_log_with_no_renames_still_reports_nothing_to_revert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sibling of the test above: an *explicitly* passed ``--log`` with
+    no renames recorded is the operator's own choice, and keeps the
+    pre-existing behaviour -- "No renames recorded in the log; nothing to
+    revert.", exit 0. Only the auto-selected case (above) refuses.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    empty = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    empty.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [],
+            }
+        )
+    )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other", "--log", str(empty)])
+
+    out = _flat(result.output)
+    assert result.exit_code == 0, result.output
+    assert "No renames recorded in the log; nothing to revert." in out
 
 
 # --- the [engine] line prefix -------------------------------------------

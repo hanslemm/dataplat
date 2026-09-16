@@ -27,8 +27,8 @@ TargetFilterOption = typer.Option(
     "--target",
     "-t",
     help=(
-        "Narrow to one of the project's own targets. "
-        "Defaults to every target the project declares."
+        "Narrow to one of the project's own targets. `all`, or omitting "
+        "this, means every target the project declares."
     ),
 )
 

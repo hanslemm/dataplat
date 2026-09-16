@@ -464,13 +464,15 @@ def main(
         DEFAULT_WINDOW_DAYS,
         "--window-days",
         help=(
-            "How many days back to look for a matching dbt build. For a "
-            "project with a manifest, this only decides which schemas get "
-            "scanned (any schema with a build in the window) -- whether a "
-            "relation is spared is decided by manifest membership, with no "
-            "time dimension, not by this window. On the legacy path (no "
-            "--project configured), this is still the sole criterion: a "
-            "model survives only if it built within the last N days. Larger "
+            "How many days back to look for a matching dbt build. A "
+            "relation built within this window is always spared. For a "
+            "project with a manifest, the window is no longer the *only* "
+            "way to be spared -- a relation the manifest still claims to "
+            "produce survives even if it has not rebuilt inside the window "
+            "-- but the window still decides which schemas get scanned and "
+            "which builds count as live, so a smaller window still means "
+            "more rename candidates. On the legacy path (no --project "
+            "configured), the window remains the sole criterion. Larger "
             "windows are more conservative (fewer false-positive renames)."
         ),
     ),
@@ -874,6 +876,23 @@ def revert_cmd(
 
     renames = payload.get("renames") or []
     if not renames:
+        # Same false-success door as the auto-selected-but-non-matching
+        # refusal further down (see the comment there): an empty log is
+        # exactly as likely to be the wrong log -- e.g. a later scan that
+        # happened to find nothing, written under the same prefix -- as it
+        # is to be genuine proof there was nothing to revert. Only the
+        # auto-selected case refuses; an explicitly passed empty log is the
+        # operator's own choice and keeps reporting "nothing to revert".
+        if log_was_auto_selected:
+            fail(
+                ValidationError(
+                    f"the auto-selected log {log} has no renames recorded "
+                    "at all. Nothing was reverted, but this is likely the "
+                    "wrong log rather than genuinely nothing to revert -- "
+                    "pass --log explicitly to confirm which one you mean."
+                ),
+                console=console,
+            )
         console.print("[dim]No renames recorded in the log; nothing to revert.[/dim]")
         return
 

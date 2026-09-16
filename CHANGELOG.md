@@ -36,10 +36,12 @@
   a relation the manifest still claims to produce is spared even if it has
   not rebuilt recently, and so is a partition child of a produced parent — a
   manifest that cannot be read, or reports zero produced relations, refuses
-  outright rather than diff against nothing. This changes `--window-days`:
-  with a manifest it only decides which schemas get scanned, not whether a
-  relation is spared; the legacy no-project path is unaffected. The scan
-  still assumes it is the only dbt project writing into the schemas it scans
+  outright rather than diff against nothing. `--window-days` still decides
+  which schemas get scanned and which builds count as live either way, but
+  with a manifest it is no longer the *only* way to be spared: a relation
+  the manifest still claims to produce survives a window it did not rebuild
+  in. The legacy no-project path is unaffected. The scan still assumes it
+  is the only dbt project writing into the schemas it scans
   — sharing a schema with an unrelated dbt project outside a declared
   `DP_DBT_PROJECTS` overlap remains an undetected hazard.
 

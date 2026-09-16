@@ -458,11 +458,14 @@ claims to produce is spared even if it has not rebuilt inside `--window-days`,
 and so is a partition child of a produced parent. A manifest that cannot be
 read at all, or that reports zero produced relations, refuses outright —
 diffing against nothing would flag everything already in scope as an orphan.
-This changes what `--window-days` means: for a project with a manifest, it
-only decides *which schemas get scanned* (any schema with a build in the
-window); whether a relation is spared is manifest membership, with no time
-dimension. On the legacy no-project path there is no manifest, so the window
-stays the sole criterion, exactly as before.
+This changes what `--window-days` means, but does not remove it from the
+picture: a relation built inside the window is still always spared, and the
+window still decides which schemas get scanned and which builds count as
+live — so a smaller window still means more rename candidates. What changes
+is that the window stops being the *only* way to be spared: a relation the
+manifest still claims to produce survives even if it has not rebuilt inside
+the window. On the legacy no-project path there is no manifest, so the
+window stays the sole criterion, exactly as before.
 
 The scan assumes it is the only dbt project writing into the schemas it
 scans — it has no way to attribute an existing table to a *different* dbt

@@ -2,15 +2,18 @@
 
 Focused sibling to tests/cli/test_dbt_orphans.py (same split rationale as
 test_dbt_orphans_alias.py / test_dbt_orphans_project.py): this file is only
-about the new behaviour ``_run_for_engine`` gained by consulting
+about the new behaviour the command gained by consulting
 ``dataplat.services.dbt.manifest`` -- sparing a name the manifest still
 produces, sparing a partition child of a produced parent, and refusing
 outright when the manifest cannot be trusted (missing, or reporting zero
-produced relations).
+produced relations). The manifest is read once per project by
+``_preflight_produced`` before any target is touched; ``_run_for_engine``
+(and, through it, ``diff_orphans``) only *consults* the resulting produced
+set, via the ``produced`` parameter -- it does not read the manifest itself.
 
 Each test builds its own throwaway ``DbtProject`` under ``tmp_path`` and
-hands it to ``_run_for_engine`` directly by monkeypatching
-``_engines_for_project`` -- the same technique
+runs it through the full CLI entry point (``main``, via ``_scan``) by
+monkeypatching ``_engines_for_project`` -- the same technique
 tests/services/dbt/test_manifest.py uses to avoid writing into the tracked
 demo_project/demo_other fixtures, applied here without needing the full
 DP_DBT_PROJECTS env-var registry at all, since ``_produced_relations`` only

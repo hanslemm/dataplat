@@ -737,7 +737,15 @@ def test_db_dbt_orphans_revert_no_log_found(tmp_path, monkeypatch) -> None:
 
 
 def test_db_dbt_orphans_revert_auto_picks_latest_log(tmp_path, monkeypatch) -> None:
-    """Revert without --log finds the newest timestamped log (legacy dir included)."""
+    """Revert without --log finds the newest timestamped log (legacy dir
+    included) -- and, because both logs here have no renames recorded at
+    all, this also pins the auto-selected-empty-log refusal: an
+    auto-picked log with nothing in it is exactly as likely to be the
+    wrong log as it is proof there was nothing to revert, so it refuses
+    rather than silently reporting "nothing to revert". The refused
+    message still names the newest log, which is what proves the right one
+    was selected.
+    """
     _isolate_log_dir(monkeypatch, tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -752,9 +760,9 @@ def test_db_dbt_orphans_revert_auto_picks_latest_log(tmp_path, monkeypatch) -> N
 
     result = runner.invoke(main_module.app, ["db", "dbt-orphans", "revert"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert "dbt_orphans-20260422T120000Z.log.json" in result.stdout
-    assert "nothing to revert" in result.stdout
+    assert "auto-selected" in result.stdout
 
 
 def test_db_dbt_orphans_revert_corrupt_log(tmp_path) -> None:
