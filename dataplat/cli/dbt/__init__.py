@@ -1,7 +1,1 @@
-"""dbt command area."""
-
-from __future__ import annotations
-
-from dataplat.cli.dbt.app import app
-
-__all__ = ["app"]
+"""dbt area — commands that operate on a named dbt project."""

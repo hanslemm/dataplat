@@ -75,7 +75,7 @@ BUILTIN_AREAS: tuple[AreaMount, ...] = (
     AreaMount(
         name="dbt",
         help_text="dbt project commands",
-        target="dataplat.cli.dbt:app",
+        target="dataplat.cli.dbt.app:app",
         deps=AREAS["dbt"],
     ),
     AreaMount(

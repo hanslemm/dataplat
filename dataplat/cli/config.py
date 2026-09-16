@@ -175,12 +175,20 @@ def component_vars() -> dict[str, list[EnvVarSpec]]:
     )
 
     # dbt/projects.py imports PyYAML at module scope, and that ships only
-    # under the dbt extra -- an eager top-level import here would break
-    # `dp config show` for anyone who has, say, only dataplat[db] installed.
-    from dataplat.services.dbt.projects import load_projects
+    # under the dbt extra. Laziness alone only defers the failure from import
+    # time to call time: component_vars() runs on every `dp config show`
+    # regardless of whether any dbt project is configured, so an unguarded
+    # call still raises ModuleNotFoundError for anyone without PyYAML. The
+    # area_ready() guard -- the same style of guard `_connect_checks()` uses
+    # for psycopg via its own `db_deps_ready` flag -- is what actually makes
+    # this safe.
+    from dataplat.core.deps import area_ready
 
-    for name, project in load_projects().items():
-        components[f"dbt project: {name}"] = _project_specs(project.env_prefix)
+    if area_ready("dbt"):
+        from dataplat.services.dbt.projects import load_projects
+
+        for name, project in load_projects().items():
+            components[f"dbt project: {name}"] = _project_specs(project.env_prefix)
     return components
 
 
