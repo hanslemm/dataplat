@@ -19,6 +19,7 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from dataplat.cli._exit import fail
 from dataplat.cli._options import JsonOption, YesOption
@@ -33,7 +34,7 @@ from dataplat.core.errors import (
     ValidationError,
 )
 from dataplat.core.redshift_ports import SOURCE_SYNCED, scan
-from dataplat.services.superset.charts import get_chart, update_chart
+from dataplat.services.superset.charts import chart_data, get_chart, update_chart
 from dataplat.services.superset.client import build_client
 from dataplat.services.superset.client import login as _login
 from dataplat.services.superset.dashboards import (
@@ -56,6 +57,7 @@ from dataplat.services.superset.datasets import (
 from dataplat.services.superset.repoint import (
     DatasetMatch,
     MigrationPlan,
+    compare_rows,
     copy_metadata,
     create_payload,
     dashboard_metadata,
@@ -150,6 +152,76 @@ def _report_blockers(
                     f"    {esc(finding.kind)} {esc(finding.construct)} — "
                     f"{esc(shorten(finding.message, 200))}"
                 )
+
+
+def _verify_charts(
+    client,
+    base_url: str,
+    token: str,
+    *,
+    clones: list[dict],
+    originals: dict[int, dict],
+    compare: bool,
+) -> tuple[list[dict], bool]:
+    """Run each new chart's query, and optionally the original's beside it.
+
+    Comparison is the only check that sees the silent divergences -- a cast
+    that truncates, a concat that propagates NULL, an array index that is
+    0-based on one engine. Neither the live SQL check nor the construct scan
+    can: there is no error to catch, only different numbers.
+    """
+    rows: list[dict] = []
+    ok = True
+
+    for clone in clones:
+        name = str(clone.get("slice_name") or clone.get("id"))
+        raw = clone.get("query_context")
+        if not raw:
+            rows.append({"chart": name, "status": "no query context"})
+            continue
+        try:
+            context = json.loads(raw)
+        except ValueError:
+            rows.append({"chart": name, "status": "unreadable query context"})
+            ok = False
+            continue
+
+        try:
+            new_rows = chart_data(client, base_url, token, context)
+        except ServiceError as exc:
+            rows.append({"chart": name, "status": f"error: {exc}"})
+            ok = False
+            continue
+
+        entry: dict[str, object] = {
+            "chart": name,
+            "status": "ok",
+            "rows": len(new_rows),
+        }
+
+        if compare:
+            original = originals.get(int(clone["id"]))
+            original_context = (original or {}).get("query_context")
+            if original_context:
+                try:
+                    old_rows = chart_data(
+                        client, base_url, token, json.loads(original_context)
+                    )
+                except ServiceError as exc:
+                    entry["comparison"] = f"original failed: {exc}"
+                    ok = False
+                else:
+                    result = compare_rows(old_rows, new_rows)
+                    entry["source_rows"] = result.left_rows
+                    entry["differing_cells"] = result.differing_cells
+                    entry["missing_columns"] = list(result.missing_columns)
+                    entry["agrees"] = result.agrees
+                    if not result.agrees:
+                        ok = False
+
+        rows.append(entry)
+
+    return rows, ok
 
 
 def duplicate_command(
@@ -259,6 +331,8 @@ def duplicate_command(
 
     created: list[int] = []
     new_dashboard_id: int | None = None
+    verification: list[dict] = []
+    verified_ok = True
 
     try:
         with build_client() as client:
@@ -338,6 +412,35 @@ def duplicate_command(
                 )
                 raise typer.Exit(code=ExitCode.FAILURE)
 
+            # Pair each clone to the original chart reading the same dataset,
+            # while the clone still carries the OLD datasource_id -- the
+            # repoint loop below overwrites it, and after that there is no
+            # way back to which original a clone came from.
+            originals_for_clone: dict[int, dict] = {}
+            if compare:
+                original_charts = {
+                    int(c["id"]): c
+                    for c in [
+                        get_chart(client, base_url, token, int(o["id"]))
+                        for o in dashboard_charts(
+                            client, base_url, token, int(original["id"])
+                        )
+                        if o.get("id") is not None
+                    ]
+                }
+                by_datasource = {
+                    int(c["datasource_id"]): c
+                    for c in original_charts.values()
+                    if isinstance(c.get("datasource_id"), int)
+                }
+                originals_for_clone = {
+                    int(chart["id"]): paired
+                    for chart in full
+                    if isinstance(chart.get("datasource_id"), int)
+                    and (paired := by_datasource.get(int(chart["datasource_id"])))
+                    is not None
+                }
+
             for chart in full:
                 payload = repoint_chart(chart, id_map)
                 if payload is None:
@@ -356,6 +459,25 @@ def duplicate_command(
                     )
                 },
             )
+
+            if verify:
+                # The chart payloads in `full` were read BEFORE the repoint,
+                # so their query_context still names the OLD dataset. Re-read
+                # them now, or verification would run the original's query
+                # and report its numbers as the new dashboard's.
+                full = [
+                    get_chart(client, base_url, token, int(c["id"]))
+                    for c in full
+                    if c.get("id") is not None
+                ]
+                verification, verified_ok = _verify_charts(
+                    client,
+                    base_url,
+                    token,
+                    clones=full,
+                    originals=originals_for_clone,
+                    compare=compare,
+                )
     except (AuthError, ServiceError, ConfigError) as exc:
         if new_dashboard_id or created:
             console.print(
@@ -363,6 +485,36 @@ def duplicate_command(
                 f"dataset(s) {', '.join(str(c) for c in created) or '—'}[/dim]"
             )
         fail(exc, console=console)
+
+    if verify and new_dashboard_id:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+        )
+        table.add_column("Chart", style="cyan")
+        table.add_column("Rows", justify="right", no_wrap=True)
+        if compare:
+            table.add_column("Source rows", justify="right", no_wrap=True)
+            table.add_column("Agrees", no_wrap=True)
+        table.add_column("Status")
+        for row in verification:
+            cells: list[str | Text] = [
+                cell(row.get("chart")),
+                cell(row.get("rows", "")),
+            ]
+            if compare:
+                cells.append(cell(row.get("source_rows", "")))
+                cells.append("yes" if row.get("agrees") else "no")
+            cells.append(cell(row.get("status", "")))
+            table.add_row(*cells)
+        console.print(table)
+        if not verified_ok:
+            console.print(
+                "\n[yellow]The copy exists, and the charts do not all agree.[/yellow]"
+            )
+            raise typer.Exit(code=ExitCode.FAILURE)
 
     if as_json:
         typer.echo(

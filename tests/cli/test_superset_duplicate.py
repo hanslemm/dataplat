@@ -36,6 +36,10 @@ class FakeSuperset:
         self.clone_shared = clone_shared
         self.virtual_sql_error = virtual_sql_error
         self.with_foreign_dataset = with_foreign_dataset
+        self.chart_rows: list[dict] = [{"a": 1}]
+        self.original_rows: list[dict] | None = None
+        self.chart_error: str | None = None
+        self.repointed: dict[int, int] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -50,6 +54,9 @@ class FakeSuperset:
             and "/sqllab/execute/" not in path
         ):
             self.writes.append((request.method, path, body))
+
+        if request.method == "PUT" and "/chart/" in path and "datasource_id" in body:
+            self.repointed[int(path.rsplit("/", 1)[-1])] = int(body["datasource_id"])
 
         if path.endswith("/security/login"):
             return httpx.Response(200, json={"access_token": "tok"}, request=request)
@@ -97,14 +104,36 @@ class FakeSuperset:
         if path.endswith("/dataset/"):
             rows = [TARGET_USERS] + ([TARGET_ORDERS] if self.target_has_orders else [])
             return httpx.Response(200, json={"result": rows}, request=request)
+        if path.endswith("/chart/data"):
+            if self.chart_error:
+                return httpx.Response(
+                    400, json={"message": self.chart_error}, request=request
+                )
+            # 118/121 are the originals' datasets; anything else is the copy's.
+            is_original = (body.get("datasource") or {}).get("id") in {118, 121}
+            rows = (
+                self.original_rows
+                if is_original and self.original_rows is not None
+                else self.chart_rows
+            )
+            return httpx.Response(
+                200, json={"result": [{"data": rows}]}, request=request
+            )
         if "/chart/" in path:
             chart_id = int(path.rsplit("/", 1)[-1])
             dashboards = [{"id": 318}]
             if self.clone_shared:
                 dashboards.append({"id": 99})
+            chart = dict(CLONE_BY_ID[chart_id])
+            if chart_id in self.repointed:
+                new = self.repointed[chart_id]
+                chart["datasource_id"] = new
+                chart["query_context"] = json.dumps(
+                    {"datasource": {"id": new, "type": "table"}}
+                )
             return httpx.Response(
                 200,
-                json={"result": {**CLONE_BY_ID[chart_id], "dashboards": dashboards}},
+                json={"result": {**chart, "dashboards": dashboards}},
                 request=request,
             )
         if path.endswith("/sqllab/execute/"):
@@ -163,6 +192,30 @@ CLONES = [
     },
 ]
 CLONE_BY_ID = {
+    # The originals (7, 8, 9), never repointed -- kept here too, since
+    # pairing a clone to its original for --compare reads them the same way
+    # (a GET /chart/{id}), before the repoint erases the clone's old id.
+    7: {
+        "id": 7,
+        "datasource_id": 118,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "118__table"}),
+        "query_context": json.dumps({"datasource": {"id": 118, "type": "table"}}),
+    },
+    8: {
+        "id": 8,
+        "datasource_id": 121,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "121__table"}),
+        "query_context": json.dumps({"datasource": {"id": 121, "type": "table"}}),
+    },
+    9: {
+        "id": 9,
+        "datasource_id": 140,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "140__table"}),
+        "query_context": json.dumps({"datasource": {"id": 140, "type": "table"}}),
+    },
     70: {
         "id": 70,
         "datasource_id": 118,
@@ -432,3 +485,99 @@ def test_a_dataset_on_another_database_is_reported_and_left_alone(
     assert "Left alone" in result.output
     # The foreign dataset's cloned chart (90) is never the subject of a PUT.
     assert not [p for m, p, _ in fake.writes if m == "PUT" and p.endswith("/chart/90")]
+
+
+def test_verify_reports_a_chart_that_returns_rows(superset_env, install) -> None:
+    fake = install(FakeSuperset())
+    fake.chart_rows = [{"a": 1}, {"a": 2}]
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "2" in result.output
+
+
+def test_a_chart_that_fails_to_run_exits_one_not_five(superset_env, install) -> None:
+    # 5 is documented as the one retryable code. A chart that cannot run will
+    # not start running because a wrapper tried again.
+    fake = install(FakeSuperset())
+    fake.chart_error = "metric 'revenue' does not exist"
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert "revenue" in result.output
+
+
+def test_compare_reports_agreement_per_chart(superset_env, install) -> None:
+    fake = install(FakeSuperset())
+    fake.chart_rows = [{"a": 1}]
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+            "--compare",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "ok" in result.output.lower()
+
+
+def test_compare_flags_a_row_count_difference(superset_env, install) -> None:
+    fake = install(FakeSuperset())
+    fake.chart_rows = [{"a": 1}]
+    fake.original_rows = [{"a": 1}, {"a": 2}]
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+            "--compare",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
