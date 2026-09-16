@@ -9,7 +9,7 @@ schema itself are always excluded.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Literal, TypedDict
@@ -481,12 +481,24 @@ def diff_orphans(
     excluded_schemas: frozenset[str],
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
+    is_produced: Callable[[str], bool] | None = None,
 ) -> dict[str, list[str]]:
     """Return ``{schema: [names]}`` of orphans after applying all exclusions.
 
     An object is an orphan when it exists in the warehouse but is not in the
     live dbt model set. Names already ending in ``DEPRECATED_SUFFIX`` are
     skipped, as are the excluded schemas and user-excluded relations.
+
+    ``is_produced``, when given, is one more way for a name to survive the
+    live-model check: a name it accepts is not an orphan even though it was
+    absent from ``live`` (e.g. a dbt project's own manifest still claims it,
+    or it is a partition child of something the manifest claims). It is
+    folded into the same candidate-building comprehension as the other
+    checks rather than applied as a separate pass afterward, so there is one
+    place where orphan status is decided, not two that could disagree.
+    Optional and defaulting to ``None`` so a caller with no manifest to
+    consult (the legacy, pre-named-project path this module has always
+    supported) gets the exact behaviour it always had.
     """
     orphans: dict[str, list[str]] = {}
     for schema, names in existing.items():
@@ -499,6 +511,7 @@ def diff_orphans(
             if name not in live_names
             and not name.endswith(DEPRECATED_SUFFIX)
             and (schema, name) not in excluded_user_relations
+            and (is_produced is None or not is_produced(name))
         }
         if candidates:
             orphans[schema] = sorted(candidates)

@@ -59,3 +59,47 @@ def relation_names(project: DbtProject) -> set[str]:
         if final:
             names.add(str(final).lower())
     return names
+
+
+# The macro this whole feature replaces (macros/global/deprecated_models.sql
+# in betterdoc-org/mage) calls this "excluded" partitioning: a table like
+# ``fct_events_p_trello`` has no manifest node of its own -- dbt only ever
+# produces ``fct_events`` -- so without this, spotting it as an orphan is a
+# false positive real enough that someone acts on it.
+_PARTITION_MARKER = "_p_"
+
+
+def is_partition_of(relation: str, produced: set[str]) -> bool:
+    """Whether ``relation`` is a partition child of something ``produced`` builds.
+
+    A naive version splits ``relation`` on the *first* (or last) occurrence of
+    ``_p_`` and checks whether the piece before it is in ``produced``. That
+    breaks the moment a produced model's own name legitimately contains the
+    marker: given ``produced = {"shipments_p_class"}``, a genuine partition
+    child ``shipments_p_class_p_west`` splits, on either end, into a head that
+    is not ``"shipments_p_class"`` -- so a single split can never be right for
+    every produced name at once. The macro this replaces does not have this
+    problem because its SQL anchors the *produced* name as the prefix
+    (``'^' || model_name || '_p_.*$'``), checked against every model, not the
+    candidate's own text split at one position. This does the same: for each
+    name the project produces, ask whether ``relation`` extends it with the
+    marker and something after. ``produced`` is typically small enough
+    (hundreds of models) that the linear scan costs nothing that matters.
+
+    Case-insensitive on both sides -- ``relation`` is lowercased here the same
+    way ``relation_names`` lowercases everything it returns, so a caller
+    comparing a warehouse-cased candidate against ``produced`` does not have
+    to get that normalization right twice. Requires a non-empty partition-key
+    suffix: ``relation`` merely ending in the bare marker with nothing after
+    it is not a real partition name under this or the macro's convention.
+
+    Only spares a child whose parent is still live. A partition of a model
+    that has genuinely gone is an orphan like any other, and sparing it would
+    make this exception a way to accumulate dead tables forever.
+    """
+    relation = relation.lower()
+    for parent in produced:
+        prefix = f"{parent.lower()}{_PARTITION_MARKER}"
+        if relation.startswith(prefix) and len(relation) > len(prefix):
+            return True
+    return False

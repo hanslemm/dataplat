@@ -167,6 +167,43 @@ def no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_prompt, "sys", SimpleNamespace(stdin=_Stdin(False)))
 
 
+def _give_project_a_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    prefix: str,
+    *,
+    project_name: str,
+    produced: set[str] = frozenset({"kept"}),
+) -> None:
+    """Point ``<prefix>_DBT_PATH`` at a throwaway project with a manifest.
+
+    conftest's demo_project/demo_other fixtures are tracked in git and have
+    no target/manifest.json -- writing one into them directly would leave
+    residue behind after the run (the same reason
+    tests/services/dbt/test_manifest.py builds its own throwaway projects
+    under tmp_path). ``_run_for_engine`` now reads the manifest for every
+    named project it is given, so any test that reaches it through a real
+    project needs one to exist; this builds a disposable stand-in instead of
+    touching the tracked fixture.
+
+    ``produced`` defaults to ``{"kept"}`` -- the name every test in this file
+    already treats as the live, non-orphan relation -- so a test that does
+    not care about manifest-awareness itself still gets a non-empty produced
+    set (an empty one is refused) that does not happen to spare ``ORPHAN``.
+    """
+    project_dir = tmp_path / f"{prefix.lower()}_manifest_project"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").write_text(f"name: {project_name}\n")
+    target_dir = project_dir / "target"
+    target_dir.mkdir()
+    nodes = {
+        f"model.demo.{name}": {"name": name, "resource_type": "model"}
+        for name in produced
+    }
+    (target_dir / "manifest.json").write_text(json.dumps({"nodes": nodes}))
+    monkeypatch.setenv(f"{prefix}_DBT_PATH", str(project_dir))
+
+
 @pytest.fixture
 def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     """A one-orphan warehouse with every write recorded instead of executed."""
@@ -437,6 +474,9 @@ def test_scan_resolves_a_real_named_project(
     fixture -- and only stubs the warehouse layer below it (connection,
     cursor, catalog queries).
     """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
     state = SimpleNamespace(present={SCHEMA: {ORPHAN, "kept"}})
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -492,6 +532,9 @@ def test_summary_distinguishes_two_same_engine_targets(
     family, not the target -- so this exact scenario would have printed the
     same tag twice with no way to tell which block belonged to which cluster.
     """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
     monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
     monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
     log_dir = tmp_path / "logs"
@@ -1481,6 +1524,12 @@ def test_all_fan_out_reaches_each_project_with_its_own_settings(
     (test_dbt_orphans_project.py) nor the capability refusal above -- this
     test is only about whether the right settings reach the right target.
     """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_OTHER", project_name="ignored_because_env_wins"
+    )
     monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg")
     monkeypatch.setenv("DEMO_OTHER_DBT_TARGETS", "demo_pg2")
     log_dir = tmp_path / "logs"

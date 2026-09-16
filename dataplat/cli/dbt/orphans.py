@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ from dataplat.services.db.orphans import (
     resolve_orphans_connection_params,
 )
 from dataplat.services.db.targets import ALL_TARGETS, DbTarget, resolve_targets
+from dataplat.services.dbt.manifest import is_partition_of, relation_names
 from dataplat.services.dbt.projects import DbtProject, default_project_name
 from dataplat.services.dbt.settings import (
     excluded_schemas,
@@ -545,6 +547,68 @@ def _write_audit_log(
         json.dump(payload, f, indent=4)
 
 
+def _produced_relations(project: DbtProject | None) -> set[str] | None:
+    """Relation names ``project``'s manifest says it produces, or ``None``.
+
+    ``None`` is the legacy, pre-named-project path (see
+    ``dataplat.services.dbt.settings``'s own module docstring): there is no
+    manifest to read there, so this reads nothing and the manifest-based
+    checks in ``_run_for_engine`` (produced-set exclusion, partition sparing)
+    simply do not run for it -- the exact behaviour that path has always had,
+    not a new refusal.
+
+    For a configured project, a manifest that cannot be read at all (never
+    compiled, or corrupt) and a manifest that reports zero produced relations
+    both refuse rather than let the scan continue. The second case matters as
+    much as the first: an empty produced set is never a reason to think a
+    project produces nothing (a genuinely empty project has no warehouse
+    tables to scan in the first place), only a reason to think the manifest
+    is wrong -- and diffing against an empty produced set would make every
+    object already in scope look orphaned.
+    """
+    if project is None:
+        return None
+    try:
+        produced = relation_names(project)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ConfigError(str(exc)) from exc
+    if not produced:
+        raise ConfigError(
+            f"{project.name}'s manifest ({project.path / 'target' / 'manifest.json'}) "
+            "reports zero produced relations. Refusing: diffing against an "
+            "empty produced set would treat every object already in scope as "
+            "an orphan. Run `dbt compile` (or `dbt docs generate`) for a "
+            "build that actually produces something, then re-run."
+        )
+    return produced
+
+
+def _produced_predicate(produced: set[str] | None) -> Callable[[str], bool] | None:
+    """The ``is_produced`` callable ``diff_orphans`` consults, or ``None``.
+
+    ``None`` when there is no manifest to consult (see ``_produced_relations``)
+    -- ``diff_orphans`` treats that the same as never having been passed the
+    argument at all, which is what keeps the legacy path's behaviour
+    unchanged.
+
+    Lowercases the candidate before comparing. ``relation_names`` already
+    lowercases everything it returns, and ``is_partition_of`` lowercases its
+    own ``relation`` argument too, but the plain membership check right here
+    does not get that for free -- a warehouse catalog can report a
+    quoted, mixed-case relation name, and comparing it against the
+    always-lowercase produced set without lowercasing it first would quietly
+    stop matching for exactly that project.
+    """
+    if produced is None:
+        return None
+
+    def _is_produced(name: str) -> bool:
+        lowered = name.lower()
+        return lowered in produced or is_partition_of(lowered, produced)
+
+    return _is_produced
+
+
 def _run_for_engine(
     label: str,
     engine: SqlEngine,
@@ -560,6 +624,7 @@ def _run_for_engine(
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
         dbt_node_prefix = node_prefix(project)
+        produced = _produced_relations(project)
     except ConfigError as exc:
         # Re-raised as the same class, not widened to ServiceError: "set
         # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
@@ -605,6 +670,7 @@ def _run_for_engine(
             excluded_schemas=excluded,
             excluded_user_schemas=excluded_user_schemas,
             excluded_user_relations=excluded_user_relations,
+            is_produced=_produced_predicate(produced),
         )
 
         _print_summary(label, live, existing, orphans)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from dataplat.services.dbt.manifest import relation_names
+from dataplat.services.dbt.manifest import is_partition_of, relation_names
 from dataplat.services.dbt.projects import DbtProject, resolve_project
 
 # Every test builds its own project under tmp_path rather than pointing at
@@ -221,3 +221,46 @@ def test_two_nodes_producing_the_same_relation_name_collapse_to_one(
         },
     )
     assert relation_names(project) == {"shared"}
+
+
+# =========================================================================
+# is_partition_of
+# =========================================================================
+
+
+def test_partition_child_is_recognised() -> None:
+    assert is_partition_of("fct_events_p_trello", {"fct_events"}) is True
+
+
+def test_unrelated_table_is_not_a_partition() -> None:
+    assert is_partition_of("fct_unrelated", {"fct_events"}) is False
+
+
+def test_partition_without_a_live_parent_is_not_spared() -> None:
+    assert is_partition_of("fct_gone_p_trello", {"fct_events"}) is False
+
+
+def test_bare_marker_with_no_partition_key_is_not_a_partition() -> None:
+    # A relation that is only the parent name plus the marker, with nothing
+    # after it, has no partition key -- it is not a real partition name
+    # under this (or the macro's) convention, so it is not spared.
+    assert is_partition_of("fct_events_p_", {"fct_events"}) is False
+
+
+def test_produced_name_that_itself_contains_the_marker_still_matches() -> None:
+    # The defect a naive "split on the first/last _p_" implementation has:
+    # splitting fct_events_p_class_p_west at either end never yields a head
+    # equal to the produced name "fct_events_p_class", because that name
+    # legitimately contains the marker itself. Checking every produced name
+    # as a candidate prefix (what the SQL macro this replaces actually does)
+    # gets this right regardless of where else "_p_" appears.
+    assert is_partition_of("fct_events_p_class_p_west", {"fct_events_p_class"}) is True
+
+
+def test_partition_match_is_case_insensitive_on_both_sides() -> None:
+    assert is_partition_of("FCT_EVENTS_P_TRELLO", {"fct_events"}) is True
+    assert is_partition_of("fct_events_p_trello", {"FCT_EVENTS"}) is True
+
+
+def test_empty_produced_set_is_never_a_partition() -> None:
+    assert is_partition_of("fct_events_p_trello", set()) is False

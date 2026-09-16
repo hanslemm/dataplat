@@ -565,6 +565,65 @@ def test_diff_orphans_drops_schemas_with_no_orphans() -> None:
     ) == {"analytics": ["b"]}
 
 
+def test_diff_orphans_is_produced_spares_a_name_not_in_live() -> None:
+    # A candidate absent from `live` (the dbt-run-results table) but accepted
+    # by `is_produced` (e.g. the project's manifest still claims it) is not
+    # reported -- the whole point of threading a second source through.
+    from dataplat.services.db.orphans import diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {"manifest_only", "genuine_orphan"}}
+    assert diff_orphans(
+        live=live,
+        existing=existing,
+        excluded_schemas=frozenset(),
+        excluded_user_schemas=frozenset(),
+        excluded_user_relations=frozenset(),
+        is_produced=lambda name: name == "manifest_only",
+    ) == {"public": ["genuine_orphan"]}
+
+
+def test_diff_orphans_is_produced_none_matches_old_behaviour() -> None:
+    # Not passing is_produced at all and passing an always-false one must
+    # agree: the parameter is additive, never a reason for a name to survive
+    # on its own account.
+    from dataplat.services.db.orphans import diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {"a", "b"}}
+    kwargs = dict(
+        live=live,
+        existing=existing,
+        excluded_schemas=frozenset(),
+        excluded_user_schemas=frozenset(),
+        excluded_user_relations=frozenset(),
+    )
+    assert diff_orphans(**kwargs) == diff_orphans(
+        is_produced=lambda name: False, **kwargs
+    )
+
+
+def test_diff_orphans_is_produced_cannot_resurrect_a_deprecated_name() -> None:
+    # is_produced is consulted alongside the other checks in the same
+    # comprehension, not instead of them -- a name already ending in
+    # DEPRECATED_SUFFIX stays excluded even if is_produced would accept it.
+    from dataplat.services.db.orphans import DEPRECATED_SUFFIX, diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {f"x{DEPRECATED_SUFFIX}"}}
+    assert (
+        diff_orphans(
+            live=live,
+            existing=existing,
+            excluded_schemas=frozenset(),
+            excluded_user_schemas=frozenset(),
+            excluded_user_relations=frozenset(),
+            is_produced=lambda name: True,
+        )
+        == {}
+    )
+
+
 def test_build_drop_statement_table() -> None:
     from dataplat.services.db.orphans import build_drop_statement
 
