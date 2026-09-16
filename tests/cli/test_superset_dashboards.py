@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 from dataplat.cli.bi import superset as superset_cli
 from dataplat.core.errors import ExitCode
+from dataplat.core.redshift_ports import SOURCE_SYNCED
 
 runner = CliRunner()
 WIDE = {"COLUMNS": "200"}
@@ -209,6 +210,12 @@ CHARTS = [
         "datasource_id": 121,
         "datasource_type": "table",
     },
+    {
+        "id": 9,
+        "slice_name": "Cohort",
+        "datasource_id": 140,
+        "datasource_type": "table",
+    },
 ]
 
 DATASET_118 = {
@@ -225,6 +232,18 @@ DATASET_121 = {
     "table_name": "users",
     "schema": "public",
     "sql": None,
+    "database": {"id": 1},
+    "columns": [],
+    "metrics": [],
+}
+# Virtual, and its SQL trips a real SYNTAX finding (DISTINCT ON is
+# Postgres-only) -- the fixture that exercises the construct scan, which
+# DATASET_118/121 (both physical, both `"sql": None`) cannot.
+DATASET_140 = {
+    "id": 140,
+    "table_name": "cohort",
+    "schema": "analytics",
+    "sql": "select distinct on (case_id) case_id, x from t order by case_id",
     "database": {"id": 1},
     "columns": [],
     "metrics": [],
@@ -246,6 +265,8 @@ def _dataset_routes(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"result": DATASET_118}, request=request)
     if path.endswith("/dataset/121"):
         return httpx.Response(200, json={"result": DATASET_121}, request=request)
+    if path.endswith("/dataset/140"):
+        return httpx.Response(200, json={"result": DATASET_140}, request=request)
     if path.endswith("/dataset/"):
         q = request.url.params.get("q", "")
         rows = TARGET_DATASETS if "2" in q else []
@@ -307,3 +328,38 @@ def test_datasets_rejects_an_unknown_database_with_the_config_code(
 
     assert result.exit_code == ExitCode.CONFIG, result.output
     assert "BetterData" in result.output  # names what does exist
+
+
+def test_a_virtual_dataset_is_scanned_for_redshift_constructs(
+    superset_env, patch_client
+) -> None:
+    # The construct advisory is why this command is more than a coverage
+    # count. With every other fixture physical, none of this path runs.
+    patch_client(_coverage_handler)
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["dashboards", "datasets", "42", "--to-database", "BetterData"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "DISTINCT ON" in result.output
+    # A stale vendored table must announce its own age at the moment someone
+    # leans on it.
+    assert SOURCE_SYNCED in result.output
+
+
+def test_scan_findings_reach_the_json_output(superset_env, patch_client) -> None:
+    patch_client(_coverage_handler)
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["dashboards", "datasets", "42", "--to-database", "BetterData", "--json"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    rows = json.loads(result.output)
+    virtual = next(r for r in rows if r["source_id"] == 140)
+    assert any(f["construct"] == "DISTINCT ON" for f in virtual["port_findings"])
