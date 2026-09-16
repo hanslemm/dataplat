@@ -94,21 +94,29 @@ def test_excluded_schemas_project_empty_wins_over_legacy(
     assert excluded_schemas(project) == frozenset()
 
 
-def test_excluded_schemas_project_unset_falls_back_to_legacy(
+def test_excluded_schemas_project_absent_falls_back_to_legacy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Project variable is unset, legacy is set — should use legacy
+    project = resolve_project("demo_project")
     monkeypatch.delenv("DEMO_PROJECT_DBT_ORPHANS_EXCLUDE_SCHEMAS", raising=False)
-    monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "foo, bar")
-    project = resolve_project("demo_project")
-    assert excluded_schemas(project) == frozenset({"foo", "bar"})
+    monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "from_legacy")
+    assert excluded_schemas(project) == frozenset({"from_legacy"})
 
 
-def test_invocation_command_project_unset_falls_back_to_legacy(
+def test_invocation_command_project_absent_falls_back_to_legacy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Project variable is unset, legacy is set — should use legacy
-    monkeypatch.delenv("DEMO_PROJECT_DBT_INVOCATION_COMMAND", raising=False)
-    monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "test")
     project = resolve_project("demo_project")
-    assert invocation_command(project) == "test"
+    monkeypatch.delenv("DEMO_PROJECT_DBT_INVOCATION_COMMAND", raising=False)
+    monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "build")
+    assert invocation_command(project) == "build"
+
+
+def test_invocation_command_project_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Project variable explicitly empty should return None, not fall through to legacy
+    monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "legacy_value")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_INVOCATION_COMMAND", "")
+    project = resolve_project("demo_project")
+    assert invocation_command(project) is None
