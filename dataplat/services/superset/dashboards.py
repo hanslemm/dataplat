@@ -107,8 +107,8 @@ def copy_dashboard(
         timeout=300,
     )
     raise_for_status(response, "copy Superset dashboard")
-    payload = response.json() or {}
-    result = payload.get("result")
+    body = response.json() or {}
+    result = body.get("result")
     new_id = result.get("id") if isinstance(result, dict) else None
     if not isinstance(new_id, int):
         # A 2xx that does not name the new dashboard is not a copy we can
