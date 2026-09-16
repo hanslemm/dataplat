@@ -118,7 +118,15 @@ runner = CliRunner()
 SCHEMA = "ana[/x]lytics"
 ORPHAN = "orders[bold]"
 DEPRECATED = f"{ORPHAN}{DEPRECATED_SUFFIX}"
-LABEL = "postgres"
+# A target name, not an engine family: this is what production actually
+# produces as the identity threaded through the summary, the audit log's
+# `database` field, and revert's log filter (see _engines_for_project's
+# docstring). It used to be "postgres" here, which no real invocation can
+# write anymore -- a label the fixture alone could still produce hid the
+# Critical where revert's post-fix filter could no longer match any log
+# written before that fix (see _LEGACY_ENGINE_LABELS for the backward
+# compatibility that now covers that case for real logs).
+LABEL = "demo_pg"
 
 
 class _Cursor:
@@ -828,6 +836,57 @@ def test_purge_older_than_drops_once_past_the_grace_period(
     assert warehouse.dropped == [(SCHEMA, DEPRECATED)]
 
 
+def test_purge_older_than_recognizes_pre_upgrade_apply_logs(
+    warehouse: SimpleNamespace, no_tty: None, tmp_path: Path
+) -> None:
+    """The rename-age index has the same legacy-value problem revert's log
+    filter does: an apply log written before target-name identity existed
+    keys its entries on the engine family ("postgres"), not a target name.
+    ``--older-than`` has to keep recognizing it as a recorded rename, or
+    every pre-upgrade rename looks unrecorded and is skipped (silently,
+    without --include-unknown) instead of purged once its grace period has
+    actually passed. See _LEGACY_ENGINE_LABELS.
+    """
+    when = datetime.now(UTC) - timedelta(days=30)
+    path = warehouse.log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        # The legacy value: what an apply log written before
+                        # this migration actually contains.
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = _scan(
+        [
+            "purge",
+            "--no-dry-run",
+            "--yes",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert warehouse.dropped == [(SCHEMA, DEPRECATED)]
+    assert "no recorded rename" not in result.output
+
+
 # --- revert -------------------------------------------------------------
 
 
@@ -992,6 +1051,46 @@ def test_revert_warns_when_the_log_was_a_dry_run(
     result = _scan(["revert", "--log", str(path)])
     assert result.exit_code == 0, result.output
     assert "generated in dry-run mode" in result.output
+
+
+def test_revert_still_works_against_a_log_written_before_this_migration(
+    warehouse: SimpleNamespace, tmp_path: Path
+) -> None:
+    """A log written before target-name identity existed carries the legacy
+    engine-family value ("postgres"/"redshift") as `database`, not a target
+    name. Revert has to keep matching it: refusing to recognize the legacy
+    value at all would make revert silently no-op every pre-upgrade rename
+    while still reporting success -- and purge, which scans the catalog
+    rather than the log, would then permanently drop objects revert claimed
+    to have already restored. See _LEGACY_ENGINE_LABELS.
+    """
+    warehouse.present[SCHEMA] = {DEPRECATED}
+    path = tmp_path / "legacy.log.json"
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        # The legacy value: what a log written before this
+                        # migration actually contains, not a target name.
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = _scan(["revert", "--no-dry-run", "--log", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert warehouse.renamed == [(SCHEMA, DEPRECATED, ORPHAN)]
 
 
 # --- the [engine] line prefix -------------------------------------------
@@ -1242,3 +1341,62 @@ def test_all_refuses_across_a_genuinely_multi_project_fan_out(
     result = _scan(["-p", "all", "--log", str(tmp_path / "s.json")])
 
     _assert_rename_refusal(result)
+
+
+def test_all_fan_out_reaches_each_project_with_its_own_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The green case the two refusal tests above never exercise: a
+    genuinely multi-project ``-p all`` fan-out that *succeeds*, and reaches
+    each project's own targets with that project's own node prefix and
+    exclusions -- the entire reason ``_engines_for_project`` carries the
+    resolved project alongside each target rather than resolving one
+    globally for the whole run (see its docstring).
+
+    demo_project (demo_pg) and demo_other (demo_pg2) declare disjoint
+    targets here, deliberately, so this hits neither overlap refusal
+    (test_dbt_orphans_project.py) nor the capability refusal above -- this
+    test is only about whether the right settings reach the right target.
+    """
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg")
+    monkeypatch.setenv("DEMO_OTHER_DBT_TARGETS", "demo_pg2")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+
+    seen_node_prefixes: list[str] = []
+
+    def _fetch_live(
+        cur: object, *, invocation_command: object, node_prefix: str, **kw: object
+    ) -> dict[str, set[str]]:
+        seen_node_prefixes.append(node_prefix)
+        return {SCHEMA: {"kept"}}
+
+    monkeypatch.setattr(do, "fetch_live_model_relations", _fetch_live)
+    monkeypatch.setattr(
+        do, "fetch_existing_relations", lambda cur, schemas, **kw: {SCHEMA: {"kept"}}
+    )
+
+    result = _scan(["-p", "all", "--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == 0, result.output
+    assert "[demo_pg]" in result.output
+    assert "[demo_pg2]" in result.output
+    # demo_project's own dbt_project.yml names it demo_project_from_yml;
+    # demo_other is named via DEMO_OTHER_DBT_NAME=explicit_name (conftest).
+    # Each target got its own project's node prefix, not one shared value.
+    assert sorted(seen_node_prefixes) == [
+        "model.demo_project_from_yml.",
+        "model.explicit_name.",
+    ]

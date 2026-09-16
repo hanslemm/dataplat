@@ -28,7 +28,7 @@ from dataplat.core.errors import (
     ValidationError,
 )
 from dataplat.services.db.capabilities import Capability, require_capability
-from dataplat.services.db.connection import SqlEngine
+from dataplat.services.db.connection import DbConnectionParams, SqlEngine
 from dataplat.services.db.orphans import (
     DEPRECATED_SUFFIX,
     LIVE_STATUSES,
@@ -88,6 +88,26 @@ _RENAME_DETAIL = (
     "renamed, and a half-working destructive command is worse than none."
 )
 
+# ``database`` values a pre-named-project audit log used: the engine family
+# (postgres/redshift), not a target name — see _engines_for_project's
+# docstring for why the identity moved to the target's own name. Revert's
+# log filter and purge's rename-age index both still have to recognize the
+# legacy value: a log written before that migration cannot carry an identity
+# that did not exist yet, and refusing to match it at all silently no-ops
+# every revert of a pre-upgrade rename while reporting success — the exact
+# hazard this migration must not introduce. The write side never produces
+# these anymore; this is read-only backward compatibility.
+#
+# Ambiguous for two targets that share an engine — a legacy log cannot tell
+# them apart, because the distinction it would need did not exist when it
+# was written. That is a real but pre-existing limit of the old format
+# itself, not something this introduces: the original code had the same
+# engine-only identity for every target, always.
+_LEGACY_ENGINE_LABELS: dict[SqlEngine, str] = {
+    SqlEngine.postgresql: "postgres",
+    SqlEngine.redshift: "redshift",
+}
+
 
 def _tag(label: str) -> str:
     """The ``[<target>]`` prefix every progress line carries.
@@ -136,43 +156,97 @@ def _find_latest_log(prefix: str) -> str | None:
     return matches[-1] if matches else None
 
 
+def _connection_identity(tgt: DbTarget) -> tuple[str, int, str] | None:
+    """Best-effort ``(host, port, dbname)`` for ``tgt``, or ``None``.
+
+    ``resolve_orphans_connection_params`` only reads environment variables —
+    no connection is opened — so this is safe to call for every resolved
+    target before any capability check or connection attempt. ``None`` covers
+    every case this cannot compare: missing connection settings, a
+    non-libpq shape (DuckDB resolves to a different params type entirely),
+    or a config problem in the settings themselves (e.g. a non-integer
+    port). A target that cannot be read this way is excluded from the
+    overlap check rather than treated as either a collision or a clearance —
+    "cannot tell" is not the same claim as "distinct".
+    """
+    try:
+        params = resolve_orphans_connection_params(
+            tgt.engine, env_prefix=tgt.env_prefix
+        )
+    except ConfigError:
+        return None
+    if not isinstance(params, DbConnectionParams):
+        return None
+    return (params.host, params.port, params.dbname)
+
+
 def _refuse_overlapping_targets(
     pairs: list[tuple[DbtProject | None, list[DbTarget]]],
 ) -> None:
-    """Refuse a fan-out where two or more resolved projects share a target.
+    """Refuse a fan-out where two or more resolved projects share a warehouse.
 
     Each project's live dbt model set is scoped to that project alone (see
-    ``_engines_for_project``), so scanning the same physical target once per
-    project that declares it does not fail safe: each pass would see every
-    *other* project's live tables as its own orphans, because the live sets
-    are never unioned across the fan-out. With ``--no-dry-run`` that is two
-    projects' production tables quarantined in one invocation.
+    ``_engines_for_project``), so scanning the same physical warehouse once
+    per project that declares it does not fail safe: each pass would see
+    every *other* project's live tables as its own orphans, because the live
+    sets are never unioned across the fan-out. With ``--no-dry-run`` that is
+    two projects' production tables quarantined in one invocation.
 
-    Unioning the live sets instead was considered and rejected: a fan-out
-    whose safety depends on a set union being exactly right, with no test
-    surface today, is not something a command that renames and drops things
-    should carry. Refusing outright is boring and obviously correct — the
-    operator reruns the overlapping projects one at a time.
+    Two checks, because "the same warehouse" shows up here two ways. Two
+    projects can declare the identical target *name* — caught by comparing
+    names. Two projects can also each declare their *own*, differently-named
+    target that happens to resolve to the same host, port and database:
+    separate credentials per project pointed at one shared cluster is an
+    ordinary setup, not a misconfiguration, and the name-based check alone
+    lets it straight through. The second check (see
+    ``_connection_identity``) is best-effort by nature: it can only compare
+    targets whose connection settings actually resolve, and even then a DNS
+    alias, or the same host written two different ways, still slips past it.
+    It narrows this hole; it does not close it.
+
+    Unioning the live sets instead of refusing was considered and rejected:
+    a fan-out whose safety depends on a set union being exactly right, with
+    no test surface today, is not something a command that renames and drops
+    things should carry. Refusing outright is boring and obviously correct —
+    the operator reruns the overlapping projects one at a time.
     """
-    owners: dict[str, list[str]] = {}
+    by_name: dict[str, list[str]] = {}
+    by_connection: dict[tuple[str, int, str], list[tuple[str, str]]] = {}
     for proj, targets in pairs:
         if proj is None:
             continue
         for tgt in targets:
-            owners.setdefault(tgt.name, []).append(proj.name)
-    conflicts = {name: projs for name, projs in owners.items() if len(projs) > 1}
-    if not conflicts:
-        return
-    detail = "; ".join(
+            by_name.setdefault(tgt.name, []).append(proj.name)
+            identity = _connection_identity(tgt)
+            if identity is not None:
+                by_connection.setdefault(identity, []).append((proj.name, tgt.name))
+
+    details: list[str] = [
         f"{name} (built into by {', '.join(projs)})"
-        for name, projs in sorted(conflicts.items())
-    )
+        for name, projs in sorted(by_name.items())
+        if len(projs) > 1
+    ]
+    for (host, port, dbname), entries in sorted(by_connection.items()):
+        distinct_projects = {proj for proj, _ in entries}
+        if len(distinct_projects) <= 1:
+            continue
+        who = ", ".join(f"{proj} ({tgt})" for proj, tgt in sorted(set(entries)))
+        details.append(
+            f"{host}:{port}/{dbname} (built into by {who}, under different "
+            "target names)"
+        )
+
+    if not details:
+        return
     raise ValidationError(
-        "Refusing: more than one project builds into the same target in this "
-        f"invocation: {detail}. Each project's live dbt model set is its own, "
-        "so scanning a shared target once per project would rename one "
-        "project's live tables as another's orphans. Run the overlapping "
-        "projects one at a time (--project <name>) instead."
+        "Refusing: more than one project builds into the same warehouse in "
+        f"this invocation: {'; '.join(details)}. Each project's live dbt "
+        "model set is its own, so scanning a shared warehouse once per "
+        "project would rename one project's live tables as another's "
+        "orphans. (The differently-named-target check is best-effort, "
+        "matched on host, port and database name — a DNS alias or an "
+        "address written differently can still slip through.) Run the "
+        "overlapping projects one at a time (--project <name>) instead."
     )
 
 
@@ -618,8 +692,15 @@ def revert_cmd(
     total = 0
     try:
         for label, engine, env_prefix, _project in engines:
+            # A legacy log's entries carry the old engine-family value (see
+            # _LEGACY_ENGINE_LABELS), not this target's name; matching only
+            # `label` would silently revert nothing from any log written
+            # before this migration.
+            wanted = {label, _LEGACY_ENGINE_LABELS.get(engine)}
             entries = [
-                r for r in renames if isinstance(r, dict) and r.get("database") == label
+                r
+                for r in renames
+                if isinstance(r, dict) and r.get("database") in wanted
             ]
             if not entries:
                 console.print(f"[dim]{_tag(label)} No entries in log.[/dim]")
@@ -957,6 +1038,7 @@ def _purge_for_engine(
             deprecated = _apply_age_filter(
                 deprecated,
                 label=label,
+                legacy_label=_LEGACY_ENGINE_LABELS.get(engine),
                 renamed_at=renamed_at,
                 cutoff=cutoff,
                 include_unknown=include_unknown,
@@ -979,14 +1061,25 @@ def _apply_age_filter(
     deprecated: list[tuple[str, str, Any]],
     *,
     label: str,
+    legacy_label: str | None,
     renamed_at: dict[tuple[str, str, str], datetime],
     cutoff: datetime,
     include_unknown: bool,
 ) -> list[tuple[str, str, Any]]:
-    """Keep only objects renamed before ``cutoff`` per the audit logs."""
+    """Keep only objects renamed before ``cutoff`` per the audit logs.
+
+    ``renamed_at`` is built from every apply log on disk (see
+    ``_renamed_at_index``), old and new alike, so a rename an old log
+    recorded under the legacy engine-family value has to be found under
+    ``legacy_label`` too — otherwise every pre-upgrade rename looks like it
+    has no recorded rename at all, which ``--older-than`` (without
+    ``--include-unknown``) then skips outright.
+    """
     kept: list[tuple[str, str, Any]] = []
     for schema, name, kind in deprecated:
         when = renamed_at.get((label, schema, name))
+        if when is None and legacy_label is not None:
+            when = renamed_at.get((legacy_label, schema, name))
         if when is None:
             if include_unknown:
                 kept.append((schema, name, kind))
