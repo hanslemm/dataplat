@@ -32,15 +32,29 @@
   explicitly passed `--log` matching nothing is left alone; that one is the
   operator's own call.
 
+  **Behaviour change worth calling out on its own:** the auto-selected-log
+  refusal above now also covers a log with *zero renames recorded at all* —
+  e.g. the newest log on disk happens to be a scan that found nothing. An
+  empty auto-selected log is genuinely ambiguous (it can mean "wrong log" or
+  "nothing was ever renamed", and there is no way to tell which), so it now
+  refuses the same way, where it used to print "nothing to revert" and exit
+  0. `revert` run unconditionally straight after a scan — a runbook, a CI
+  step — now exits non-zero on a clean run where it used to exit 0. Pass
+  `--log` explicitly to keep that path non-interactive; an explicitly passed
+  empty log still exits 0, unchanged.
+
   A project with a compiled manifest also gets orphan detection to consult it:
   a relation the manifest still claims to produce is spared even if it has
   not rebuilt recently, and so is a partition child of a produced parent — a
   manifest that cannot be read, or reports zero produced relations, refuses
-  outright rather than diff against nothing. `--window-days` still decides
-  which schemas get scanned and which builds count as live either way, but
-  with a manifest it is no longer the *only* way to be spared: a relation
-  the manifest still claims to produce survives a window it did not rebuild
-  in. The legacy no-project path is unaffected. The scan still assumes it
+  outright rather than diff against nothing. `--window-days` keeps its
+  existing job either way — a relation that built inside the window is
+  always spared, and the window is still what decides both which schemas get
+  scanned and which builds count as live — but with a manifest it stops
+  being the *only* way to survive: a relation the manifest still claims to
+  produce is spared too, even if it did not rebuild inside the window. The
+  legacy no-project path is unaffected: there is no manifest there, so the
+  window stays the sole criterion. The scan still assumes it
   is the only dbt project writing into the schemas it scans
   — sharing a schema with an unrelated dbt project outside a declared
   `DP_DBT_PROJECTS` overlap remains an undetected hazard.
