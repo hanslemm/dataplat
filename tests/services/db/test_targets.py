@@ -19,6 +19,15 @@ def test_demo_pg_target() -> None:
     assert target.reassign_owner == "demo_pg_root"
 
 
+def test_demo_pg2_target() -> None:
+    """A second Postgres target sharing demo_pg's engine, deliberately — see
+    tests/conftest.py for why."""
+    target = resolve_target("demo_pg2")
+    assert target.env_prefix == "DEMO_PG2"
+    assert target.engine == SqlEngine.postgresql
+    assert target.reassign_owner == "demo_pg2_root"
+
+
 def test_demo_rs_target() -> None:
     target = resolve_target("demo_rs")
     assert target.env_prefix == "DEMO_RS"
@@ -37,7 +46,7 @@ def test_resolve_target_unknown_raises() -> None:
 
 def test_resolve_targets_all() -> None:
     targets = resolve_targets("all")
-    assert [t.name for t in targets] == ["demo_pg", "demo_rs"]
+    assert [t.name for t in targets] == ["demo_pg", "demo_pg2", "demo_rs"]
 
 
 def test_resolve_targets_single() -> None:

@@ -77,12 +77,12 @@ def test_long_queries_history_renders_markup_like_sql() -> None:
     assert "[bold]" in result.output
 
 
-def test_long_queries_renders_both_targets() -> None:
+def test_long_queries_renders_every_target() -> None:
     with patch(_FETCH, return_value=[_row("42", "running", 120)]) as fetch:
         result = runner.invoke(db_app, ["long-queries"])
 
     assert result.exit_code == 0, result.output
-    assert fetch.call_count == 2  # demo_pg + demo_rs
+    assert fetch.call_count == 3  # demo_pg + demo_pg2 + demo_rs
     assert "Postgres" in result.output
     assert "Redshift" in result.output
     assert "777" in result.output  # PID column drives `dp db kill`

@@ -373,6 +373,7 @@ def test_engines_for_project_falls_back_to_legacy_targets_when_unconfigured(
 
     assert {(label, proj) for label, _engine, _env_prefix, proj in engines} == {
         ("demo_pg", None),
+        ("demo_pg2", None),
         ("demo_rs", None),
     }
 
@@ -470,6 +471,138 @@ def test_scan_resolves_a_real_named_project(
     logged = json.loads((tmp_path / "s.json").read_text())
     assert logged["dry_run"] is True
     assert logged["renames"][0]["database"] == "demo_pg"
+
+
+def test_summary_distinguishes_two_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Important Finding 4's motivating case: two targets that share an
+    engine (demo_pg, demo_pg2 -- both postgresql, see tests/conftest.py) must
+    produce two distinguishable summary blocks, not two identical-looking
+    ``[postgres]`` ones. Before the fix, the label threaded through
+    ``_print_summary`` was ``_ENGINE_LABELS[tgt.engine]`` -- the engine
+    family, not the target -- so this exact scenario would have printed the
+    same tag twice with no way to tell which block belonged to which cluster.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: {"kept"}}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {SCHEMA: {ORPHAN, "kept"}},
+    )
+    monkeypatch.setattr(do, "classify_object", lambda cur, schema, name, **kw: "table")
+
+    result = _scan(["-p", "demo_project", "--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == 0, result.output
+    assert "[demo_pg]" in result.output
+    assert "[demo_pg2]" in result.output
+    # Two distinct summary blocks, not the same tag printed twice.
+    assert result.output.count("live dbt models") == 2
+
+
+def test_revert_filters_log_entries_by_target_not_by_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The data-correctness case Important Finding 4 exists to prevent: two
+    targets sharing an engine (demo_pg, demo_pg2) must never have their audit
+    log entries cross-applied during revert. Before the fix, the audit log's
+    ``database`` field held the *engine* label, so demo_pg's and demo_pg2's
+    entries would have been indistinguishable from each other's -- revert
+    could restore one cluster's objects using the other cluster's history.
+
+    Each ``rename_object`` call here records which target's connection was
+    open when it happened (via the stubbed ``resolve_orphans_connection_params``
+    / ``open_transactional_connection``, which thread the env_prefix through
+    as a stand-in for "params"), so cross-contamination would show up as a
+    rename recorded under the wrong target's connection, not merely as an
+    entry being skipped.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log = tmp_path / "revert.log.json"
+    log.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "demo_pg",
+                        "schema": SCHEMA,
+                        "old_name": "pg_orphan",
+                        "new_name": f"pg_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                    {
+                        "database": "demo_pg2",
+                        "schema": SCHEMA,
+                        "old_name": "pg2_orphan",
+                        "new_name": f"pg2_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                ],
+            }
+        )
+    )
+
+    present = {f"pg_orphan{DEPRECATED_SUFFIX}", f"pg2_orphan{DEPRECATED_SUFFIX}"}
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: env_prefix,
+    )
+
+    open_connections: list[str] = []
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        open_connections.append(str(params))
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do,
+        "classify_object",
+        lambda cur, schema, name, **kw: "table" if name in present else None,
+    )
+
+    reverted: list[tuple[str, str, str]] = []
+
+    def _rename(
+        cur: object, schema: str, old: str, new: str, kind: str, **kw: object
+    ) -> None:
+        reverted.append((open_connections[-1], old, new))
+
+    monkeypatch.setattr(do, "rename_object", _rename)
+
+    result = _scan(["revert", "-p", "demo_project", "--no-dry-run", "--log", str(log)])
+
+    assert result.exit_code == 0, result.output
+    assert reverted == [
+        ("DEMO_PG", f"pg_orphan{DEPRECATED_SUFFIX}", "pg_orphan"),
+        ("DEMO_PG2", f"pg2_orphan{DEPRECATED_SUFFIX}", "pg2_orphan"),
+    ]
 
 
 def test_scan_unset_dbt_project_exits_config(
