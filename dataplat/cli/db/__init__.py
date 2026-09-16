@@ -47,7 +47,12 @@ app = typer.Typer(
     help="Database query commands",
     no_args_is_help=True,
 )
-app.add_typer(dbt_orphans_app, name="dbt-orphans")
+app.add_typer(
+    dbt_orphans_app,
+    name="dbt-orphans",
+    help="Deprecated: moved to `dp dbt orphans`.",
+    deprecated=True,
+)
 app.add_typer(describe_app, name="describe")
 app.add_typer(role_app, name="role")
 app.add_typer(schema_app, name="schema")
