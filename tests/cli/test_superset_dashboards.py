@@ -350,6 +350,89 @@ def test_a_virtual_dataset_is_scanned_for_redshift_constructs(
     assert SOURCE_SYNCED in result.output
 
 
+def test_from_database_alone_says_which_datasets_are_on_it(
+    superset_env, patch_client
+) -> None:
+    # The flag resolves and validates its argument; if it then had no effect,
+    # every row would read "unchecked" and this test would fail. Every
+    # dashboard-42 fixture dataset lives on database id 1 (DataOcean), so
+    # naming that connection as --from-database must mark all of them.
+    patch_client(_coverage_handler)
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["dashboards", "datasets", "42", "--from-database", "DataOcean"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "on source" in result.output
+    assert "unchecked" not in result.output
+
+
+DATASET_205 = {
+    "id": 205,
+    "table_name": "external_metrics",
+    "schema": "vendor",
+    "sql": None,
+    # A third database -- neither the --from-database nor the --to-database
+    # named below -- so plan_migration's foreign branch is the only one that
+    # can classify it.
+    "database": {"id": 9},
+    "columns": [],
+    "metrics": [],
+}
+
+
+def _foreign_dataset_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path.endswith("/security/login"):
+        return httpx.Response(200, json={"access_token": "tok"}, request=request)
+    if path.endswith("/dashboard/42/charts"):
+        return httpx.Response(
+            200,
+            json={
+                "result": [
+                    {"id": 7, "datasource_id": 118, "datasource_type": "table"},
+                    {"id": 20, "datasource_id": 205, "datasource_type": "table"},
+                ]
+            },
+            request=request,
+        )
+    if path.endswith("/database/"):
+        return httpx.Response(200, json=DATABASES, request=request)
+    if path.endswith("/dataset/205"):
+        return httpx.Response(200, json={"result": DATASET_205}, request=request)
+    return _dataset_routes(request)
+
+
+def test_a_dataset_on_another_database_is_classified_as_foreign(
+    superset_env, patch_client
+) -> None:
+    # plan_migration's foreign branch is otherwise never entered by any test
+    # in this file: every shipped fixture dataset sits on the same database
+    # id as --from-database, so this status string, or the branch itself,
+    # could be deleted and every other test would still pass.
+    patch_client(_foreign_dataset_handler)
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "datasets",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "other database" in result.output
+
+
 def test_scan_findings_reach_the_json_output(superset_env, patch_client) -> None:
     patch_client(_coverage_handler)
 

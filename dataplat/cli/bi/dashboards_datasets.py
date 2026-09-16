@@ -82,13 +82,8 @@ def datasets_command(
         # client, but it raises ServiceError when Superset hands back a
         # dataset with no usable id -- and outside this block that would
         # escape fail() and print a traceback instead of exit 5.
-        #
-        # Without a target there is nothing to check against, so every
-        # dataset is simply listed. With one, the plan answers it -- and
-        # `from_id` may be None, which means "every dataset is a candidate",
-        # the right default for a report that is asked before anyone has
-        # named a source connection.
-        if to_database is None:
+        if to_database is None and from_id is None:
+            # Neither side named: just list what the dashboard reads.
             rows = [
                 {
                     "dataset": str(DatasetKey.of(d)),
@@ -96,6 +91,24 @@ def datasets_command(
                     "virtual": bool(d.get("sql")),
                     "target_id": None,
                     "status": "unchecked",
+                }
+                for d in sources
+            ]
+        elif to_database is None:
+            # A source named but no target: answer the question the flag's
+            # own help text promises -- which of these live on that
+            # connection -- rather than resolving it and ignoring it.
+            rows = [
+                {
+                    "dataset": str(DatasetKey.of(d)),
+                    "source_id": d.get("id"),
+                    "virtual": bool(d.get("sql")),
+                    "target_id": None,
+                    "status": (
+                        "on source"
+                        if (d.get("database") or {}).get("id") == from_id
+                        else "other database"
+                    ),
                 }
                 for d in sources
             ]
