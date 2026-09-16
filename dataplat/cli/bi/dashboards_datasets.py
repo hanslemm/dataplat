@@ -16,7 +16,7 @@ from rich.table import Table
 
 from dataplat.cli._exit import fail
 from dataplat.cli._options import JsonOption
-from dataplat.cli._render import cell
+from dataplat.cli._render import cell, esc, shorten
 from dataplat.cli.bi._superset_auth import load_auth_context
 from dataplat.core.errors import AuthError, ConfigError, ServiceError, ValidationError
 from dataplat.core.redshift_ports import SOURCE_SYNCED, scan
@@ -77,47 +77,53 @@ def datasets_command(
                 targets = list(
                     iter_datasets(client, base_url, token, database_id=to_id)
                 )
+
+        # Inside the try, deliberately. plan_migration is pure and needs no
+        # client, but it raises ServiceError when Superset hands back a
+        # dataset with no usable id -- and outside this block that would
+        # escape fail() and print a traceback instead of exit 5.
+        #
+        # Without a target there is nothing to check against, so every
+        # dataset is simply listed. With one, the plan answers it -- and
+        # `from_id` may be None, which means "every dataset is a candidate",
+        # the right default for a report that is asked before anyone has
+        # named a source connection.
+        if to_database is None:
+            rows = [
+                {
+                    "dataset": str(DatasetKey.of(d)),
+                    "source_id": d.get("id"),
+                    "virtual": bool(d.get("sql")),
+                    "target_id": None,
+                    "status": "unchecked",
+                }
+                for d in sources
+            ]
+        else:
+            plan = plan_migration(
+                source_datasets=sources,
+                target_datasets=targets,
+                from_database_id=from_id,
+                overrides={},
+            )
+            groups = (
+                (plan.matched, "exists"),
+                (plan.to_create, "missing"),
+                (plan.foreign, "other database"),
+            )
+            rows = [
+                {
+                    "dataset": str(match.source_key),
+                    "source_id": match.source_id,
+                    "virtual": match.is_virtual,
+                    "target_id": match.target_id if status == "exists" else None,
+                    "status": status,
+                }
+                for matches, status in groups
+                for match in matches
+            ]
     except (AuthError, ServiceError, ConfigError, ValidationError) as exc:
         fail(exc, console=console)
-
-    # Without a target there is nothing to check against, so every dataset is
-    # simply listed. With one, the plan answers it -- and `from_id` may be
-    # None, which means "every dataset is a candidate", the right default for
-    # a report that is asked before anyone has named a source connection.
-    if to_database is None:
-        rows = [
-            {
-                "dataset": str(DatasetKey.of(d)),
-                "source_id": d.get("id"),
-                "virtual": bool(d.get("sql")),
-                "target_id": None,
-                "status": "unchecked",
-            }
-            for d in sources
-        ]
-    else:
-        plan = plan_migration(
-            source_datasets=sources,
-            target_datasets=targets,
-            from_database_id=from_id,
-            overrides={},
-        )
-        groups = (
-            (plan.matched, "exists"),
-            (plan.to_create, "missing"),
-            (plan.foreign, "other database"),
-        )
-        rows = [
-            {
-                "dataset": str(match.source_key),
-                "source_id": match.source_id,
-                "virtual": match.is_virtual,
-                "target_id": match.target_id if status == "exists" else None,
-                "status": status,
-            }
-            for matches, status in groups
-            for match in matches
-        ]
 
     findings = {
         int(d["id"]): scan(str(d.get("sql") or "")) for d in sources if d.get("sql")
@@ -169,7 +175,11 @@ def datasets_command(
         for dataset_id, items in sorted(flagged.items()):
             console.print(f"  [cyan]dataset {dataset_id}[/cyan]")
             for finding in items:
+                # esc(), not cell(): cell() returns a rich Text whose "do not
+                # reparse me" protection lives in the object, and an f-string
+                # calls str() on it -- which strips exactly that, handing
+                # console.print a plain string it markup-parses again.
                 console.print(
-                    f"    {cell(finding.kind)} {cell(finding.construct)} — "
-                    f"{cell(finding.message, max_length=160)}"
+                    f"    {esc(finding.kind)} {esc(finding.construct)} — "
+                    f"{esc(shorten(finding.message, 160))}"
                 )

@@ -363,3 +363,51 @@ def test_scan_findings_reach_the_json_output(superset_env, patch_client) -> None
     rows = json.loads(result.output)
     virtual = next(r for r in rows if r["source_id"] == 140)
     assert any(f["construct"] == "DISTINCT ON" for f in virtual["port_findings"])
+
+
+def test_a_dataset_with_no_usable_id_exits_five(superset_env, patch_client) -> None:
+    # plan_migration's _require_dataset_id raises ServiceError for this.
+    # Outside the try/except that wraps it, that would escape fail() and
+    # print a raw traceback instead of the documented exit code.
+    broken_dataset = {
+        # no "id" -- exactly what _require_dataset_id rejects.
+        "table_name": "orders",
+        "schema": "public",
+        "sql": None,
+        "database": {"id": 1},
+        "columns": [],
+        "metrics": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/security/login"):
+            return httpx.Response(200, json={"access_token": "tok"}, request=request)
+        if path.endswith("/dashboard/42/charts"):
+            return httpx.Response(
+                200,
+                json={
+                    "result": [
+                        {"id": 7, "datasource_id": 118, "datasource_type": "table"}
+                    ]
+                },
+                request=request,
+            )
+        if path.endswith("/database/"):
+            return httpx.Response(200, json=DATABASES, request=request)
+        if path.endswith("/dataset/118"):
+            return httpx.Response(200, json={"result": broken_dataset}, request=request)
+        if path.endswith("/dataset/"):
+            return httpx.Response(200, json={"result": []}, request=request)
+        return httpx.Response(404, json={"message": path}, request=request)
+
+    patch_client(handler)
+
+    result = runner.invoke(
+        superset_cli.app,
+        ["dashboards", "datasets", "42", "--to-database", "BetterData"],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SERVICE, result.output
+    assert "Traceback" not in result.output
