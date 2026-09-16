@@ -887,6 +887,70 @@ def test_purge_older_than_recognizes_pre_upgrade_apply_logs(
     assert "no recorded rename" not in result.output
 
 
+def test_purge_refuses_ambiguous_legacy_rename_age_across_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The variant that matters, applied to the rename-age index: an old
+    apply log's "postgres"-labeled entry cannot be safely attributed to
+    demo_pg's grace period vs demo_pg2's -- that information was never
+    recorded. Purging across both (unscoped) with --older-than must refuse
+    the whole invocation rather than apply the recorded age to whichever
+    target happens to have a matching deprecated object, which risks
+    purging one target's object on the strength of another's grace period.
+    See _ambiguous_legacy_conflicts.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    when = datetime.now(UTC) - timedelta(days=30)
+    apply_log = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    apply_log.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(
+        [
+            "purge",
+            "-p",
+            "demo_project",
+            "--no-dry-run",
+            "--yes",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
+
+
 # --- revert -------------------------------------------------------------
 
 
@@ -1063,6 +1127,11 @@ def test_revert_still_works_against_a_log_written_before_this_migration(
     while still reporting success -- and purge, which scans the catalog
     rather than the log, would then permanently drop objects revert claimed
     to have already restored. See _LEGACY_ENGINE_LABELS.
+
+    This is the unambiguous case the fallback exists for: exactly one
+    Postgres target (the `warehouse` fixture's single stubbed engine) is in
+    play, so the legacy value can only mean that target. See the sibling
+    test below for what happens when it cannot.
     """
     warehouse.present[SCHEMA] = {DEPRECATED}
     path = tmp_path / "legacy.log.json"
@@ -1091,6 +1160,60 @@ def test_revert_still_works_against_a_log_written_before_this_migration(
 
     assert result.exit_code == 0, result.output
     assert warehouse.renamed == [(SCHEMA, DEPRECATED, ORPHAN)]
+
+
+def test_revert_refuses_ambiguous_legacy_entries_across_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The variant that matters: an old-format log where *both* entries say
+    "database": "postgres" cannot be safely attributed to demo_pg vs
+    demo_pg2 -- that information was never recorded. Reverting across both
+    (unscoped) must refuse the whole invocation rather than apply every
+    "postgres" entry to both targets, which would be exactly the
+    cross-application Important Finding 4 fixed, reintroduced for legacy
+    logs instead of new ones. See _ambiguous_legacy_conflicts.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log = tmp_path / "legacy.log.json"
+    log.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": "pg_orphan",
+                        "new_name": f"pg_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": "pg2_orphan",
+                        "new_name": f"pg2_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                ],
+            }
+        )
+    )
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(["revert", "-p", "demo_project", "--no-dry-run", "--log", str(log)])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
 
 
 # --- the [engine] line prefix -------------------------------------------

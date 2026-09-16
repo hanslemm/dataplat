@@ -98,15 +98,76 @@ _RENAME_DETAIL = (
 # hazard this migration must not introduce. The write side never produces
 # these anymore; this is read-only backward compatibility.
 #
-# Ambiguous for two targets that share an engine — a legacy log cannot tell
-# them apart, because the distinction it would need did not exist when it
-# was written. That is a real but pre-existing limit of the old format
-# itself, not something this introduces: the original code had the same
-# engine-only identity for every target, always.
+# The legacy value is only safe to trust when exactly one target in the
+# current invocation has that engine. A legacy log cannot tell two
+# same-engine targets apart -- the distinction it would need was never
+# recorded -- so matching it against *every* same-engine target reintroduces
+# the exact cross-application the target-name identity exists to prevent,
+# just for old logs instead of new ones. See _ambiguous_legacy_conflicts:
+# when more than one target shares an engine, the legacy fallback for that
+# engine is refused outright rather than guessed, and the operator is told
+# to rerun scoped to one target with --target.
 _LEGACY_ENGINE_LABELS: dict[SqlEngine, str] = {
     SqlEngine.postgresql: "postgres",
     SqlEngine.redshift: "redshift",
 }
+
+
+def _ambiguous_legacy_conflicts(
+    present_identities: set[str],
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+) -> list[tuple[str, list[str]]]:
+    """``(legacy_label, [target names])`` for every legacy identity that
+    cannot be safely attributed to one target in this invocation.
+
+    A conflict exists when a legacy engine-family value is actually present
+    in the data being read (``present_identities`` — a log's ``database``
+    values for revert, or a rename-age index's keys for purge) *and* more
+    than one target in ``engines`` shares that legacy value's engine. Two
+    different targets on the same engine each independently produce the
+    same legacy value, and nothing recorded which of them a given legacy
+    entry belongs to.
+    """
+    engine_targets: dict[SqlEngine, set[str]] = {}
+    for label, engine, _env_prefix, _project in engines:
+        engine_targets.setdefault(engine, set()).add(label)
+
+    conflicts: list[tuple[str, list[str]]] = []
+    for engine, targets in sorted(engine_targets.items(), key=lambda kv: kv[0].value):
+        if len(targets) <= 1:
+            continue
+        legacy_label = _LEGACY_ENGINE_LABELS.get(engine)
+        if legacy_label is not None and legacy_label in present_identities:
+            conflicts.append((legacy_label, sorted(targets)))
+    return conflicts
+
+
+def _refuse_ambiguous_legacy_entries(
+    present_identities: set[str],
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+    *,
+    context: str,
+) -> None:
+    """Raise if any legacy identity in ``present_identities`` is ambiguous.
+
+    ``context`` names what was read (``"log"`` for revert, ``"rename-age
+    index"`` for purge) so the error says what predates per-target identity.
+    """
+    conflicts = _ambiguous_legacy_conflicts(present_identities, engines)
+    if not conflicts:
+        return
+    detail = "; ".join(
+        f"'{legacy_label}' could mean any of {', '.join(targets)}"
+        for legacy_label, targets in conflicts
+    )
+    raise ValidationError(
+        f"Refusing: this {context} predates per-target identity, and it "
+        f"cannot be attributed safely in this invocation: {detail}. A "
+        "legacy entry recorded only the engine, not which target produced "
+        "it, so applying it to every target that shares that engine risks "
+        "acting on one target using another's history. Rerun scoped to a "
+        "single target with --target to make the attribution unambiguous."
+    )
 
 
 def _tag(label: str) -> str:
@@ -689,6 +750,19 @@ def revert_cmd(
         console.print("[dim]No renames recorded in the log; nothing to revert.[/dim]")
         return
 
+    try:
+        _refuse_ambiguous_legacy_entries(
+            {
+                r.get("database")
+                for r in renames
+                if isinstance(r, dict) and r.get("database") is not None
+            },
+            engines,
+            context="log",
+        )
+    except DataplatError as exc:
+        fail(exc, console=console)
+
     total = 0
     try:
         for label, engine, env_prefix, _project in engines:
@@ -918,6 +992,15 @@ def purge_cmd(
         )
 
     renamed_at = _renamed_at_index() if older_than is not None else None
+    if renamed_at is not None:
+        try:
+            _refuse_ambiguous_legacy_entries(
+                {key[0] for key in renamed_at},
+                engines,
+                context="rename-age index",
+            )
+        except DataplatError as exc:
+            fail(exc, console=console)
     cutoff = (
         datetime.now(UTC) - timedelta(days=older_than)
         if older_than is not None
