@@ -132,3 +132,65 @@ def test_a_rejected_login_exits_four(superset_env, patch_client) -> None:
     result = runner.invoke(superset_cli.app, ["dashboards", "list"], env=WIDE)
 
     assert result.exit_code == ExitCode.AUTH, result.output
+
+
+def test_list_filters_by_database(superset_env, patch_client) -> None:
+    # The join Superset cannot do for us: a dashboard qualifies when one of
+    # its charts reads a dataset on that connection. An inverted `any`, or a
+    # comparison against the wrong field, passes every other test in this file.
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/security/login"):
+            return httpx.Response(200, json={"access_token": "tok"}, request=request)
+        if path.endswith("/database/"):
+            return httpx.Response(
+                200,
+                json={"result": [{"id": 2, "database_name": "BetterData"}]},
+                request=request,
+            )
+        if path.endswith("/dataset/"):
+            return httpx.Response(200, json={"result": [{"id": 887}]}, request=request)
+        if path.endswith("/dashboard/42/charts"):
+            return httpx.Response(
+                200, json={"result": [{"id": 7, "datasource_id": 887}]}, request=request
+            )
+        if path.endswith("/dashboard/43/charts"):
+            return httpx.Response(
+                200, json={"result": [{"id": 8, "datasource_id": 999}]}, request=request
+            )
+        if path.endswith("/dashboard/"):
+            return httpx.Response(200, json={"result": DASHBOARDS}, request=request)
+        return httpx.Response(404, json={"message": path}, request=request)
+
+    patch_client(handler)
+
+    result = runner.invoke(
+        superset_cli.app, ["dashboards", "list", "--database", "BetterData"], env=WIDE
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "Revenue overview" in result.output  # its chart reads dataset 887
+    assert "Ops daily" not in result.output  # its chart reads 999, not on this db
+
+
+def test_an_unknown_database_exits_three(superset_env, patch_client) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/security/login"):
+            return httpx.Response(200, json={"access_token": "tok"}, request=request)
+        if path.endswith("/database/"):
+            return httpx.Response(
+                200,
+                json={"result": [{"id": 2, "database_name": "BetterData"}]},
+                request=request,
+            )
+        return httpx.Response(200, json={"result": DASHBOARDS}, request=request)
+
+    patch_client(handler)
+
+    result = runner.invoke(
+        superset_cli.app, ["dashboards", "list", "--database", "Nope"], env=WIDE
+    )
+
+    assert result.exit_code == ExitCode.CONFIG, result.output
+    assert "BetterData" in result.output  # names what does exist
