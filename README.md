@@ -757,6 +757,27 @@ A dataset on neither the source nor the target connection is reported and left
 alone. A dashboard can read from several databases, and repointing the ones
 nobody was migrating would be a change nobody asked for.
 
+Where the two sides disagree on a name, `--map` is repeatable and takes
+`schema.table=schema.table`:
+
+```bash
+dp bi superset dashboards duplicate 42 \
+    --from-database DataOcean --to-database BetterData \
+    --map public.orders=analytics.orders
+```
+
+An entry naming a dataset this dashboard does not read is an error, not a
+no-op. A typo that is quietly ignored gives you a clean exit and a migration
+that did not do what you asked, which is the worst of both.
+
+`datasets` takes the same `--from-database` on its own, which answers the
+question a retirement actually starts with — which of this dashboard's
+datasets still live on the warehouse you are trying to switch off:
+
+```bash
+dp bi superset dashboards datasets 42 --from-database DataOcean
+```
+
 **Virtual datasets carry SQL, and Redshift is not Postgres.** Before creating
 one, `dp` runs its SQL against the target and reports the engine's own error if
 it will not run. It also scans for constructs known to behave *differently
