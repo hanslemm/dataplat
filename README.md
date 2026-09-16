@@ -801,6 +801,19 @@ not, so sorting on the engines would invent differences. A disagreement exits
 `1`, not `5` — `5` is the retryable code, and a dashboard whose numbers differ
 will not agree because something tried again.
 
+The report names *what* disagrees, not just that something does — a differing
+cell count and any columns present on one side only. That is the case worth
+designing for: a cast that silently rounds returns the same number of rows as
+before, so a row count alone would call it agreement.
+
+`--compare` needs `--verify`, which is on by default; asking for `--compare
+--no-verify` says so rather than quietly doing nothing. Charts it cannot pair
+— two charts sharing a name *and* a dataset are indistinguishable once cloned
+— are reported as not compared rather than compared against the wrong
+original, and the summary line says how many of the charts were actually
+checked. Being unable to check something is not the same as checking it and
+finding it sound, and the report keeps those apart.
+
 The original dashboard, its charts and its datasets are never modified, and
 nothing is ever deleted. If a later step fails, the copy and any created
 datasets stay, and their ids are printed.
