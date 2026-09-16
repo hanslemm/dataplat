@@ -226,18 +226,23 @@ COPY_DASHBOARD: dict[str, Any] = {
     ),
 }
 
+# GET /dashboard/{id}/charts -- the listing shape -- never carries a
+# top-level datasource_id; the dataset survives only inside
+# form_data.datasource, as "<id>__table". CLONE_BY_ID below is the OTHER
+# shape, GET /chart/{id}, which does carry it for real; both id and
+# datasource_id there still matter, so it stays as-is.
 CHARTS = [
     {
         "id": 7,
         "slice_name": "Revenue",
-        "datasource_id": 118,
         "datasource_type": "table",
+        "form_data": {"datasource": "118__table"},
     },
     {
         "id": 8,
         "slice_name": "Signups",
-        "datasource_id": 121,
         "datasource_type": "table",
+        "form_data": {"datasource": "121__table"},
     },
 ]
 
@@ -245,14 +250,14 @@ CLONES = [
     {
         "id": 70,
         "slice_name": "Revenue",
-        "datasource_id": 118,
         "datasource_type": "table",
+        "form_data": {"datasource": "118__table"},
     },
     {
         "id": 80,
         "slice_name": "Signups",
-        "datasource_id": 121,
         "datasource_type": "table",
+        "form_data": {"datasource": "121__table"},
     },
 ]
 CLONE_BY_ID = {
@@ -361,14 +366,14 @@ TARGET_ORDERS = {
 FOREIGN_CHART = {
     "id": 9,
     "slice_name": "External",
-    "datasource_id": 140,
     "datasource_type": "table",
+    "form_data": {"datasource": "140__table"},
 }
 FOREIGN_CLONE = {
     "id": 90,
     "slice_name": "External",
-    "datasource_id": 140,
     "datasource_type": "table",
+    "form_data": {"datasource": "140__table"},
 }
 FOREIGN_DATASET = {
     "id": 140,
@@ -388,8 +393,8 @@ FOREIGN_DATASET = {
 DUPLICATE_ORIGINAL_CHART = {
     "id": 10,
     "slice_name": "Revenue",
-    "datasource_id": 118,
     "datasource_type": "table",
+    "form_data": {"datasource": "118__table"},
 }
 
 

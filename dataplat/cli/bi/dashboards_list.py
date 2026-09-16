@@ -24,6 +24,7 @@ from dataplat.services.superset.client import login as _login
 from dataplat.services.superset.dashboards import dashboard_charts, iter_dashboards
 from dataplat.services.superset.databases import resolve_database_id
 from dataplat.services.superset.datasets import iter_datasets
+from dataplat.services.superset.repoint import chart_datasource_id
 
 __all__ = ["list_command"]
 
@@ -83,7 +84,7 @@ def list_command(
                     d
                     for d in dashboards
                     if any(
-                        chart.get("datasource_id") in dataset_ids
+                        chart_datasource_id(chart) in dataset_ids
                         for chart in dashboard_charts(
                             client, base_url, token, int(d["id"])
                         )

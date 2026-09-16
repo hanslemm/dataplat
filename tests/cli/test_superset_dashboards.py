@@ -152,12 +152,18 @@ def test_list_filters_by_database(superset_env, patch_client) -> None:
         if path.endswith("/dataset/"):
             return httpx.Response(200, json={"result": [{"id": 887}]}, request=request)
         if path.endswith("/dashboard/42/charts"):
+            # The real shape of GET /dashboard/{id}/charts: no top-level
+            # datasource_id, only form_data.datasource as "<id>__table".
             return httpx.Response(
-                200, json={"result": [{"id": 7, "datasource_id": 887}]}, request=request
+                200,
+                json={"result": [{"id": 7, "form_data": {"datasource": "887__table"}}]},
+                request=request,
             )
         if path.endswith("/dashboard/43/charts"):
             return httpx.Response(
-                200, json={"result": [{"id": 8, "datasource_id": 999}]}, request=request
+                200,
+                json={"result": [{"id": 8, "form_data": {"datasource": "999__table"}}]},
+                request=request,
             )
         if path.endswith("/dashboard/"):
             return httpx.Response(200, json={"result": DASHBOARDS}, request=request)
@@ -198,23 +204,26 @@ def test_an_unknown_database_exits_three(superset_env, patch_client) -> None:
 
 
 CHARTS = [
+    # GET /dashboard/{id}/charts never carries a top-level datasource_id --
+    # only form_data.datasource, in its "<id>__table" form. See
+    # repoint.chart_datasource_id.
     {
         "id": 7,
         "slice_name": "Revenue",
-        "datasource_id": 118,
         "datasource_type": "table",
+        "form_data": {"datasource": "118__table"},
     },
     {
         "id": 8,
         "slice_name": "Signups",
-        "datasource_id": 121,
         "datasource_type": "table",
+        "form_data": {"datasource": "121__table"},
     },
     {
         "id": 9,
         "slice_name": "Cohort",
-        "datasource_id": 140,
         "datasource_type": "table",
+        "form_data": {"datasource": "140__table"},
     },
 ]
 
@@ -393,8 +402,16 @@ def _foreign_dataset_handler(request: httpx.Request) -> httpx.Response:
             200,
             json={
                 "result": [
-                    {"id": 7, "datasource_id": 118, "datasource_type": "table"},
-                    {"id": 20, "datasource_id": 205, "datasource_type": "table"},
+                    {
+                        "id": 7,
+                        "datasource_type": "table",
+                        "form_data": {"datasource": "118__table"},
+                    },
+                    {
+                        "id": 20,
+                        "datasource_type": "table",
+                        "form_data": {"datasource": "205__table"},
+                    },
                 ]
             },
             request=request,
@@ -471,7 +488,11 @@ def test_a_dataset_with_no_usable_id_exits_five(superset_env, patch_client) -> N
                 200,
                 json={
                     "result": [
-                        {"id": 7, "datasource_id": 118, "datasource_type": "table"}
+                        {
+                            "id": 7,
+                            "datasource_type": "table",
+                            "form_data": {"datasource": "118__table"},
+                        }
                     ]
                 },
                 request=request,

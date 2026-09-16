@@ -25,7 +25,11 @@ from dataplat.services.superset.client import login as _login
 from dataplat.services.superset.dashboards import dashboard_charts
 from dataplat.services.superset.databases import resolve_database_id
 from dataplat.services.superset.datasets import get_dataset, iter_datasets
-from dataplat.services.superset.repoint import DatasetKey, plan_migration
+from dataplat.services.superset.repoint import (
+    DatasetKey,
+    chart_datasource_id,
+    plan_migration,
+)
 
 __all__ = ["datasets_command"]
 
@@ -38,9 +42,9 @@ def _read_source_datasets(
     charts = dashboard_charts(client, base_url, token, dashboard)
     ids = sorted(
         {
-            int(chart["datasource_id"])
+            dataset_id
             for chart in charts
-            if isinstance(chart.get("datasource_id"), int)
+            if (dataset_id := chart_datasource_id(chart)) is not None
         }
     )
     return [get_dataset(client, base_url, token, dataset_id) for dataset_id in ids]

@@ -57,6 +57,7 @@ from dataplat.services.superset.datasets import (
 from dataplat.services.superset.repoint import (
     DatasetMatch,
     MigrationPlan,
+    chart_datasource_id,
     compare_rows,
     copy_metadata,
     create_payload,
@@ -78,9 +79,9 @@ def _source_datasets(
     charts = dashboard_charts(client, base_url, token, dashboard)
     ids = sorted(
         {
-            int(c["datasource_id"])
+            dataset_id
             for c in charts
-            if isinstance(c.get("datasource_id"), int)
+            if (dataset_id := chart_datasource_id(c)) is not None
         }
     )
     return [get_dataset(client, base_url, token, dataset_id) for dataset_id in ids]

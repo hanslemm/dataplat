@@ -15,6 +15,7 @@ from dataplat.core.errors import ServiceError, ValidationError
 from dataplat.services.superset.repoint import (
     DatasetKey,
     canonical_rows,
+    chart_datasource_id,
     compare_rows,
     copy_metadata,
     create_payload,
@@ -227,6 +228,40 @@ def test_a_chart_with_unparseable_query_context_is_a_service_error() -> None:
     chart = {**CHART, "query_context": "{not json"}
     with pytest.raises(ServiceError):
         repoint_chart(chart, {118: 904})
+
+
+def test_chart_datasource_id_reads_the_top_level_field() -> None:
+    # GET /chart/{id}'s own shape -- what CLONE_BY_ID-style fixtures and the
+    # repoint loop actually see.
+    assert chart_datasource_id({"datasource_id": 118}) == 118
+
+
+def test_chart_datasource_id_reads_form_data_datasource() -> None:
+    # GET /dashboard/{id}/charts's real shape: no top-level datasource_id at
+    # all, only form_data.datasource in its "<id>__table" form.
+    assert chart_datasource_id({"form_data": {"datasource": "983__table"}}) == 983
+
+
+def test_chart_datasource_id_reads_a_nested_int_datasource_id() -> None:
+    assert chart_datasource_id({"form_data": {"datasource_id": 118}}) == 118
+
+
+def test_chart_datasource_id_prefers_the_top_level_field_when_both_agree() -> None:
+    chart = {
+        "datasource_id": 118,
+        "form_data": {"datasource": "118__table"},
+    }
+    assert chart_datasource_id(chart) == 118
+
+
+def test_chart_datasource_id_is_none_when_neither_is_present() -> None:
+    # A legitimate shape -- a markdown header tile reads no dataset -- not a
+    # service error, so callers can skip it rather than this raising.
+    assert chart_datasource_id({"id": 7, "slice_name": "Header"}) is None
+
+
+def test_chart_datasource_id_is_none_for_a_malformed_datasource_string() -> None:
+    assert chart_datasource_id({"form_data": {"datasource": "not-an-id"}}) is None
 
 
 def test_native_filters_are_remapped() -> None:

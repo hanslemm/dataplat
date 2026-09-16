@@ -21,6 +21,7 @@ __all__ = [
     "DatasetMatch",
     "MigrationPlan",
     "canonical_rows",
+    "chart_datasource_id",
     "compare_rows",
     "copy_metadata",
     "create_payload",
@@ -235,6 +236,38 @@ def copy_metadata(dashboard: dict) -> str:
     if positions:
         metadata["positions"] = positions
     return json.dumps(metadata)
+
+
+def chart_datasource_id(chart: dict) -> int | None:
+    """The dataset a chart reads, wherever this endpoint chose to put it.
+
+    ``GET /chart/{id}`` returns a real ``datasource_id``; ``GET
+    /dashboard/{id}/charts`` does not -- there the dataset survives only
+    inside ``form_data.datasource``, in its ``"983__table"`` form. Reading
+    the top-level field alone works against every fixture and against no
+    live Superset, which is how this reached a release candidate.
+
+    None when nothing here yields an id -- a legitimate shape (a markdown
+    header tile reads no dataset at all), not a service error, so callers
+    skip it rather than this raising.
+    """
+    top_level = chart.get("datasource_id")
+    if isinstance(top_level, int):
+        return top_level
+
+    form_data = chart.get("form_data")
+    if isinstance(form_data, dict):
+        nested = form_data.get("datasource_id")
+        if isinstance(nested, int):
+            return nested
+
+        datasource = form_data.get("datasource")
+        if isinstance(datasource, str):
+            raw_id, _, _ = datasource.partition("__")
+            if raw_id.isdigit():
+                return int(raw_id)
+
+    return None
 
 
 def repoint_chart(chart: dict, id_map: dict[int, int]) -> dict | None:
