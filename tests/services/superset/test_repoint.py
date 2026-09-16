@@ -91,6 +91,14 @@ def test_an_override_naming_an_absent_target_is_an_error() -> None:
     assert "nope.gone" in str(excinfo.value)
 
 
+def test_an_override_for_a_dataset_the_dashboard_does_not_read_is_an_error() -> None:
+    # A silently ignored --map is worse than no --map: the user gets a clean
+    # exit and a migration that quietly ignored their instruction.
+    with pytest.raises(ValidationError) as excinfo:
+        _plan({DatasetKey("public", "nope"): DatasetKey("public", "users")})
+    assert "public.nope" in str(excinfo.value)
+
+
 def test_a_dataset_on_another_database_is_reported_and_never_repointed() -> None:
     foreign = {"id": 500, "table_name": "x", "schema": "s", "database": {"id": 9}}
     plan = plan_migration(

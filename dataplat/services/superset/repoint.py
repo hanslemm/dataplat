@@ -136,12 +136,19 @@ def plan_migration(
     there a counterpart for this?" is a useful question before anyone has
     decided which connection counts as the source. Only the reporting command
     passes None; ``duplicate`` always names a source.
+
+    Every key in ``overrides`` must name a dataset the dashboard actually
+    reads, on the source database. An entry that does not is an error, raised
+    only after the whole pass so it can be reported alongside every other
+    problem: a silently ignored ``--map`` is worse than no ``--map`` at all,
+    because it looks identical to one that worked.
     """
     by_key = {DatasetKey.of(d): d for d in target_datasets}
 
     matched: list[DatasetMatch] = []
     to_create: list[DatasetMatch] = []
     foreign: list[DatasetMatch] = []
+    used: set[DatasetKey] = set()
 
     for dataset in source_datasets:
         source_id = _require_dataset_id(dataset)
@@ -160,6 +167,7 @@ def plan_migration(
 
         override = overrides.get(source_key)
         if override is not None:
+            used.add(source_key)
             target = by_key.get(override)
             if target is None:
                 raise ValidationError(
@@ -196,6 +204,12 @@ def plan_migration(
 
         to_create.append(
             DatasetMatch(source_id, source_key, source_key, "create", is_virtual, name)
+        )
+
+    unused = sorted(str(key) for key in overrides if key not in used)
+    if unused:
+        raise ValidationError(
+            "--map names dataset(s) this dashboard does not read: " + ", ".join(unused)
         )
 
     return MigrationPlan(tuple(matched), tuple(to_create), tuple(foreign))

@@ -23,15 +23,32 @@ WIDE = {"COLUMNS": "200"}
 class FakeSuperset:
     """Records every write, so a test can assert that none happened."""
 
-    def __init__(self, *, target_has_orders: bool = True, clone_shared: bool = False):
+    def __init__(
+        self,
+        *,
+        target_has_orders: bool = True,
+        clone_shared: bool = False,
+        virtual_sql_error: str | None = None,
+        with_foreign_dataset: bool = False,
+    ):
         self.writes: list[tuple[str, str, dict]] = []
         self.target_has_orders = target_has_orders
         self.clone_shared = clone_shared
+        self.virtual_sql_error = virtual_sql_error
+        self.with_foreign_dataset = with_foreign_dataset
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         body = json.loads(request.content) if request.content else {}
-        if request.method in {"POST", "PUT"} and "login" not in path:
+        # sqllab/execute is a read-only validation query (SELECT ... LIMIT 0)
+        # run through SQL Lab, not a mutation of any Superset resource -- see
+        # _validate_virtual's docstring. Recording it here would make "nothing
+        # was written" false for a call that changes nothing.
+        if (
+            request.method in {"POST", "PUT"}
+            and "login" not in path
+            and "/sqllab/execute/" not in path
+        ):
             self.writes.append((request.method, path, body))
 
         if path.endswith("/security/login"):
@@ -48,9 +65,11 @@ class FakeSuperset:
                 request=request,
             )
         if path.endswith("/dashboard/42/charts"):
-            return httpx.Response(200, json={"result": CHARTS}, request=request)
+            charts = CHARTS + ([FOREIGN_CHART] if self.with_foreign_dataset else [])
+            return httpx.Response(200, json={"result": charts}, request=request)
         if path.endswith("/dashboard/318/charts"):
-            return httpx.Response(200, json={"result": CLONES}, request=request)
+            clones = CLONES + ([FOREIGN_CLONE] if self.with_foreign_dataset else [])
+            return httpx.Response(200, json={"result": clones}, request=request)
         if path.endswith("/dashboard/42"):
             return httpx.Response(200, json={"result": DASHBOARD}, request=request)
         if path.endswith("/dashboard/318"):
@@ -61,6 +80,10 @@ class FakeSuperset:
             return httpx.Response(200, json={"result": DATASET_118}, request=request)
         if path.endswith("/dataset/121"):
             return httpx.Response(200, json={"result": DATASET_121}, request=request)
+        if path.endswith("/dataset/140"):
+            return httpx.Response(
+                200, json={"result": FOREIGN_DATASET}, request=request
+            )
         if path.endswith("/dataset/904"):
             return httpx.Response(
                 200,
@@ -85,6 +108,12 @@ class FakeSuperset:
                 request=request,
             )
         if path.endswith("/sqllab/execute/"):
+            if self.virtual_sql_error:
+                return httpx.Response(
+                    400,
+                    json={"errors": [{"message": self.virtual_sql_error}]},
+                    request=request,
+                )
             return httpx.Response(200, json={"status": "success"}, request=request)
         return httpx.Response(404, json={"message": path}, request=request)
 
@@ -148,13 +177,22 @@ CLONE_BY_ID = {
         "params": json.dumps({"datasource": "121__table"}),
         "query_context": json.dumps({"datasource": {"id": 121, "type": "table"}}),
     },
+    90: {
+        "id": 90,
+        "datasource_id": 140,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "140__table"}),
+        "query_context": json.dumps({"datasource": {"id": 140, "type": "table"}}),
+    },
 }
 
 DATASET_118 = {
     "id": 118,
     "table_name": "orders",
     "schema": "public",
-    "sql": None,
+    # Virtual: this is what exercises _validate_virtual's execute_sql call,
+    # which every other test in this file leaves untouched.
+    "sql": "select * from orders",
     "database": {"id": 1},
     "columns": [{"column_name": "x"}],
     "metrics": [],
@@ -179,6 +217,30 @@ TARGET_ORDERS = {
     "table_name": "orders",
     "schema": "public",
     "database": {"id": 2},
+}
+
+# A dataset on a THIRD connection -- not --from-database, not --to-database.
+# plan_migration must report it and never repoint it; --map is not involved.
+FOREIGN_CHART = {
+    "id": 9,
+    "slice_name": "External",
+    "datasource_id": 140,
+    "datasource_type": "table",
+}
+FOREIGN_CLONE = {
+    "id": 90,
+    "slice_name": "External",
+    "datasource_id": 140,
+    "datasource_type": "table",
+}
+FOREIGN_DATASET = {
+    "id": 140,
+    "table_name": "external",
+    "schema": "other",
+    "sql": None,
+    "database": {"id": 9},
+    "columns": [],
+    "metrics": [],
 }
 
 
@@ -324,3 +386,49 @@ def test_a_malformed_map_is_invalid_input(superset_env, install) -> None:
     result = _run("--map", "orders=analytics.orders")
 
     assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+
+
+def test_a_well_formed_map_for_an_unread_dataset_is_invalid_input(
+    superset_env, install
+) -> None:
+    # A syntactically fine --map that names a dataset the dashboard does not
+    # read must not be a silent no-op: that looks identical to one that
+    # worked. plan_migration is what raises; this confirms the CLI actually
+    # surfaces it, at the documented exit code, before anything is written.
+    fake = install(FakeSuperset())
+
+    result = _run("--map", "public.nope=public.users")
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert fake.writes == []
+    assert "public.nope" in result.output
+
+
+def test_a_virtual_dataset_whose_sql_fails_on_the_target_writes_nothing(
+    superset_env, install
+) -> None:
+    # The whole point of phase 1: a dataset that cannot be ported is found
+    # BEFORE anything is created, and the engine's own words are reported.
+    fake = install(FakeSuperset(target_has_orders=False))
+    fake.virtual_sql_error = 'relation "borg.events" does not exist'
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert fake.writes == []
+    assert 'relation "borg.events" does not exist' in result.output
+
+
+def test_a_dataset_on_another_database_is_reported_and_left_alone(
+    superset_env, install
+) -> None:
+    # A dashboard can read from several connections. Repointing one nobody
+    # was migrating would be a change nobody asked for.
+    fake = install(FakeSuperset(with_foreign_dataset=True))
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "Left alone" in result.output
+    # The foreign dataset's cloned chart (90) is never the subject of a PUT.
+    assert not [p for m, p, _ in fake.writes if m == "PUT" and p.endswith("/chart/90")]

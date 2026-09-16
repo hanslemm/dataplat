@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import typer
 from rich import box
 from rich.console import Console
@@ -69,7 +70,9 @@ __all__ = ["duplicate_command"]
 console = Console()
 
 
-def _source_datasets(client, base_url: str, token: str, dashboard: str) -> list[dict]:
+def _source_datasets(
+    client: httpx.Client, base_url: str, token: str, dashboard: str
+) -> list[dict]:
     charts = dashboard_charts(client, base_url, token, dashboard)
     ids = sorted(
         {
@@ -82,7 +85,7 @@ def _source_datasets(client, base_url: str, token: str, dashboard: str) -> list[
 
 
 def _validate_virtual(
-    client,
+    client: httpx.Client,
     base_url: str,
     token: str,
     to_id: int,
@@ -263,6 +266,11 @@ def duplicate_command(
 
             # --- Phase 2: create what is missing. ---
             id_map = dict(plan.id_map)
+            if plan.to_create and not create_missing:
+                # Unreachable: phase 1's blocked gate already exited. Kept as
+                # a local statement of the invariant, because the thing this
+                # loop does is create datasets in someone's warehouse.
+                raise typer.Exit(code=ExitCode.FAILURE)
             for match in plan.to_create:
                 source = sources[match.source_id]
                 new_id = create_dataset(
