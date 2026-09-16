@@ -61,3 +61,54 @@ def test_invocation_command_defaults_to_none(
 ) -> None:
     monkeypatch.delenv("DP_DBT_INVOCATION_COMMAND", raising=False)
     assert invocation_command(None) is None
+
+
+def test_excluded_schemas_legacy_var_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "")
+    assert excluded_schemas(None) == frozenset()
+
+
+def test_excluded_schemas_legacy_var_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", raising=False)
+    assert excluded_schemas(None) == DEFAULT_EXCLUDED_SCHEMAS
+
+
+def test_excluded_schemas_per_project_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEMO_PROJECT_DBT_ORPHANS_EXCLUDE_SCHEMAS", "")
+    project = resolve_project("demo_project")
+    assert excluded_schemas(project) == frozenset()
+
+
+def test_excluded_schemas_project_empty_wins_over_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "something")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_ORPHANS_EXCLUDE_SCHEMAS", "")
+    project = resolve_project("demo_project")
+    assert excluded_schemas(project) == frozenset()
+
+
+def test_excluded_schemas_project_unset_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Project variable is unset, legacy is set — should use legacy
+    monkeypatch.delenv("DEMO_PROJECT_DBT_ORPHANS_EXCLUDE_SCHEMAS", raising=False)
+    monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "foo, bar")
+    project = resolve_project("demo_project")
+    assert excluded_schemas(project) == frozenset({"foo", "bar"})
+
+
+def test_invocation_command_project_unset_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Project variable is unset, legacy is set — should use legacy
+    monkeypatch.delenv("DEMO_PROJECT_DBT_INVOCATION_COMMAND", raising=False)
+    monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "test")
+    project = resolve_project("demo_project")
+    assert invocation_command(project) == "test"

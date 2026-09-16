@@ -20,13 +20,18 @@ DEFAULT_EXCLUDED_SCHEMAS: frozenset[str] = frozenset(
 
 
 def _scoped(project: DbtProject | None, suffix: str, legacy: str) -> str | None:
-    """Per-project variable when a project is given, else the legacy global."""
+    """Per-project variable when a project is given, else the legacy global.
+
+    Returns None if unset at all levels, or the value as-is (with any whitespace
+    preserved) if found at the project or legacy level. Callers strip as
+    appropriate for their use case.
+    """
     if project is not None:
-        value = os.getenv(f"{project.env_prefix}_{suffix}", "").strip()
-        if value:
+        value = os.getenv(f"{project.env_prefix}_{suffix}")
+        if value is not None:
             return value
-    value = os.getenv(legacy, "").strip()
-    return value or None
+    value = os.getenv(legacy)
+    return value if value is not None else None
 
 
 def node_prefix(project: DbtProject | None) -> str:
@@ -46,16 +51,31 @@ def excluded_schemas(project: DbtProject | None) -> frozenset[str]:
     """Schemas never scanned for orphans.
 
     A comma-separated list replaces the default set rather than adding to it,
-    which is how the legacy variable already behaved.
+    which is how the legacy variable already behaved. Leading and trailing
+    whitespace around the entire value and around individual schema names is
+    stripped.
     """
     raw = _scoped(
         project, "DBT_ORPHANS_EXCLUDE_SCHEMAS", "DP_DBT_ORPHANS_EXCLUDE_SCHEMAS"
     )
     if raw is None:
         return DEFAULT_EXCLUDED_SCHEMAS
+    raw = raw.strip()
+    if not raw:
+        return frozenset()
     return frozenset(s.strip() for s in raw.split(",") if s.strip())
 
 
 def invocation_command(project: DbtProject | None) -> str | None:
-    """Optional dbt invocation-command filter, or None."""
-    return _scoped(project, "DBT_INVOCATION_COMMAND", "DP_DBT_INVOCATION_COMMAND")
+    """Optional dbt invocation-command filter, or None.
+
+    An explicitly empty or whitespace-only value is treated as unset. Leading
+    and trailing whitespace is stripped for normalization. This differs
+    slightly from the legacy no-strip behavior, preferring to normalize
+    whitespace-only (user error) to None rather than returning it as-is.
+    """
+    raw = _scoped(project, "DBT_INVOCATION_COMMAND", "DP_DBT_INVOCATION_COMMAND")
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
