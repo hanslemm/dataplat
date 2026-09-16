@@ -69,7 +69,10 @@ bi = ["httpx>=0.25.0"]
 # `dp people` spans both, so it needs both: it is the one area that is only
 # interesting because it crosses areas.
 people = ["dataplat[db,bi]"]
-all = ["dataplat[db,duckdb,cloud,ingest,bi,people]"]
+# dbt commands read a project on disk and then talk to its warehouses, so the
+# extra spans both: PyYAML for dbt_project.yml, dataplat[db] for the connection.
+dbt = ["dataplat[db]", "pyyaml>=6.0.1"]
+all = ["dataplat[db,duckdb,cloud,ingest,bi,people,dbt]"]
 
 [project.scripts]
 dp = "dataplat.main:app"

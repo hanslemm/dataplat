@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 
 os.environ.pop("FORCE_COLOR", None)
 os.environ.pop("CLICOLOR", None)
@@ -40,6 +41,16 @@ os.environ["DP_TARGETS"] = (
 )
 os.environ["DEMO_PG_ENGINE"] = "postgresql"
 os.environ["DEMO_PG_REASSIGN_OWNER"] = "demo_pg_root"
+os.environ["DP_DBT_PROJECTS"] = "demo_project,demo_other"
+os.environ["DEMO_PROJECT_DBT_PATH"] = str(
+    Path(__file__).parent / "fixtures" / "demo_project"
+)
+os.environ["DEMO_PROJECT_DBT_TARGETS"] = "demo_pg,demo_rs"
+os.environ["DEMO_OTHER_DBT_PATH"] = str(
+    Path(__file__).parent / "fixtures" / "demo_other"
+)
+os.environ["DEMO_OTHER_DBT_NAME"] = "explicit_name"
+os.environ["DEMO_OTHER_DBT_TARGETS"] = "demo_rs"
 os.environ["DEMO_RS_ENGINE"] = "redshift"
 os.environ["DEMO_RS_REASSIGN_OWNER"] = "admin"
 os.environ.pop("DP_DEFAULT_TARGET", None)
