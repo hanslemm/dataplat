@@ -349,6 +349,129 @@ def test_scan_unknown_target_exits_invalid_input(tmp_path: Path) -> None:
     assert "does not build into" in result.output
 
 
+def test_engines_for_project_falls_back_to_legacy_targets_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Critical regression: DP_DBT_PROJECTS unset must not make this command
+    refuse to run. An installation that has never adopted named projects has
+    to keep working exactly as it always did -- resolving DP_TARGETS
+    directly, with project=None riding along so the legacy env-var readers in
+    dataplat.services.dbt.settings take over.
+
+    tests/conftest.py sets DP_DBT_PROJECTS for the whole suite, so it has to
+    be explicitly unset here -- otherwise this test exercises the named-
+    project path, not the legacy fallback, and would pass for the wrong
+    reason. That gap is exactly how this regression shipped once already:
+    every test in this file goes through the `warehouse` fixture, which
+    stubs `_engines_for_project` outright and so never touches either branch
+    for real.
+    """
+    monkeypatch.delenv("DP_DBT_PROJECTS", raising=False)
+    monkeypatch.delenv("DP_DBT_DEFAULT_PROJECT", raising=False)
+
+    engines = do._engines_for_project(None, None)
+
+    assert {(label, proj) for label, _engine, _env_prefix, proj in engines} == {
+        ("demo_pg", None),
+        ("demo_rs", None),
+    }
+
+
+def test_engines_for_project_with_explicit_project_ignores_the_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy fallback only fires when no ``--project`` was given at all.
+    An operator naming a project explicitly while DP_DBT_PROJECTS happens to
+    be unset asked for that project by name -- silently resolving every
+    DP_TARGETS target instead would scan warehouses that project may never
+    touch, which is a worse failure mode than the honest error below.
+    """
+    monkeypatch.delenv("DP_DBT_PROJECTS", raising=False)
+    monkeypatch.delenv("DP_DBT_DEFAULT_PROJECT", raising=False)
+
+    result = _scan(["--project", "demo_project"])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "No dbt projects configured" in result.output
+
+
+def test_scan_config_error_from_project_resolution_exits_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``default_project_name()`` can raise ``ConfigError`` (a
+    DP_DBT_DEFAULT_PROJECT that names a project DP_DBT_PROJECTS does not
+    declare), not just ``ValidationError`` -- the gate has to catch
+    ``DataplatError``, or this escapes as a raw traceback instead of the
+    documented exit 3. No `warehouse` fixture: this fails during resolution,
+    before any connection is even attempted.
+    """
+    monkeypatch.setenv("DP_DBT_DEFAULT_PROJECT", "not_a_real_project")
+
+    result = _scan(["--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == ExitCode.CONFIG, result.output
+    assert "not_a_real_project" in result.output
+
+
+def test_scan_resolves_a_real_named_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every other test in this file goes through the ``warehouse`` fixture,
+    which stubs ``_engines_for_project`` to always hand back ``project=None``
+    -- the legacy-fallback shape, not what a real ``DP_DBT_PROJECTS``
+    installation (conftest's own demo_project/demo_other) actually produces.
+    That gap is exactly how the legacy-fallback regression above once passed
+    a green suite: every test here exercised the one path production could no
+    longer reach. This one runs the real resolution --
+    ``_engines_for_project``, ``node_prefix``, ``invocation_command``,
+    ``excluded_schemas`` all resolve against the genuine ``demo_project``
+    fixture -- and only stubs the warehouse layer below it (connection,
+    cursor, catalog queries).
+    """
+    state = SimpleNamespace(present={SCHEMA: {ORPHAN, "kept"}})
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: {"kept"}}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {SCHEMA: {ORPHAN, "kept"}},
+    )
+
+    def _classify(cur: object, schema: str, name: str, **kw: object) -> str | None:
+        return "table" if name in state.present.get(schema, set()) else None
+
+    monkeypatch.setattr(do, "classify_object", _classify)
+
+    result = _scan(
+        ["-p", "demo_project", "-t", "demo_pg", "--log", str(tmp_path / "s.json")]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The identity threaded through the summary and the log is the target's
+    # own name, not its engine family -- "demo_pg", not "postgres" -- so two
+    # same-engine targets in one fan-out can never be confused with each
+    # other (see _engines_for_project's docstring).
+    assert "[demo_pg]" in result.output
+    logged = json.loads((tmp_path / "s.json").read_text())
+    assert logged["dry_run"] is True
+    assert logged["renames"][0]["database"] == "demo_pg"
+
+
 def test_scan_unset_dbt_project_exits_config(
     warehouse: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -956,5 +1079,33 @@ def test_all_refuses_when_one_target_cannot_rename(
     _forbid_connections(monkeypatch)
 
     result = _scan(["--log", str(tmp_path / "s.json")])
+
+    _assert_rename_refusal(result)
+
+
+def test_all_refuses_across_a_genuinely_multi_project_fan_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The all-or-nothing refusal proven again across *projects*, not just
+    across targets within one project (see
+    ``test_all_refuses_when_one_target_cannot_rename`` above): demo_project's
+    own targets are fine, but demo_other now declares a DuckDB target that
+    cannot rename-with-dependents, and the whole ``-p all`` invocation must
+    refuse before any connection is opened for *any* project -- including
+    demo_project's, which would otherwise have worked.
+
+    demo_project (demo_pg, demo_rs) and demo_other (ddb) declare disjoint
+    targets here, deliberately -- overlapping targets are a different refusal
+    (see test_dbt_orphans_project.py's
+    test_orphans_refuses_projects_that_share_a_target), and this test would
+    hit that one first instead of the capability gate it means to exercise.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,ddb")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_rs")
+    monkeypatch.setenv("DEMO_OTHER_DBT_TARGETS", "ddb")
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["-p", "all", "--log", str(tmp_path / "s.json")])
 
     _assert_rename_refusal(result)

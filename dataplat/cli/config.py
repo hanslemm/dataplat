@@ -548,8 +548,9 @@ def _offline_checks() -> list[CheckResult]:
             _warn(
                 "dbt legacy vars",
                 f"{', '.join(legacy)} set without DP_DBT_PROJECTS",
-                "These still work, but `dp dbt` needs named projects; "
-                "see DP_DBT_PROJECTS.",
+                "`dp dbt orphans` falls back to these automatically -- "
+                "nothing to fix. Set DP_DBT_PROJECTS to also unlock "
+                "--project and multi-project fan-out.",
             )
         )
 

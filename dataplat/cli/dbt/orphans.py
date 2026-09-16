@@ -47,7 +47,8 @@ from dataplat.services.db.orphans import (
     rename_object,
     resolve_orphans_connection_params,
 )
-from dataplat.services.dbt.projects import DbtProject
+from dataplat.services.db.targets import ALL_TARGETS, DbTarget, resolve_targets
+from dataplat.services.dbt.projects import DbtProject, default_project_name
 from dataplat.services.dbt.settings import (
     excluded_schemas,
     invocation_command,
@@ -75,14 +76,6 @@ LEGACY_LOG_DIR = Path("local")
 APPLY_LOG_PREFIX = "dbt_orphans"
 PURGE_LOG_PREFIX = "dbt_orphans_purge"
 
-# Log entries keep the historical engine labels so old logs stay revertable.
-# Only the engines this command can act on appear here; _engines_for_project
-# refuses the others before it reaches this mapping.
-_ENGINE_LABELS: dict[SqlEngine, str] = {
-    SqlEngine.postgresql: "postgres",
-    SqlEngine.redshift: "redshift",
-}
-
 # Why this command needs `rename_with_dependents`, which the capability's own
 # reason ("renames fail when a view depends on the table") does not say. Written
 # once and passed to every check, because all three subcommands — apply, revert
@@ -97,11 +90,14 @@ _RENAME_DETAIL = (
 
 
 def _tag(label: str) -> str:
-    """The ``[<engine>]`` prefix every progress line carries.
+    """The ``[<target>]`` prefix every progress line carries.
 
-    ``[postgres]`` and ``[redshift]`` are well-formed Rich tags, so unescaped
-    the prefix was parsed as a style name and silently dropped — leaving the
-    reader unable to tell which cluster a rename or drop line belonged to.
+    ``label`` is the target's own name (``demo_pg``, not ``postgres``) — see
+    ``_engines_for_project`` for why — and a target name is exactly as
+    user-chosen as a schema or relation name. A target happening to be named
+    after a real Rich style (``red``, ``bold``) is a well-formed tag that,
+    left unescaped, would be parsed as a style and silently dropped, leaving
+    the reader unable to tell which target a rename or drop line belonged to.
     """
     return esc(f"[{label}]")
 
@@ -140,10 +136,57 @@ def _find_latest_log(prefix: str) -> str | None:
     return matches[-1] if matches else None
 
 
+def _refuse_overlapping_targets(
+    pairs: list[tuple[DbtProject | None, list[DbTarget]]],
+) -> None:
+    """Refuse a fan-out where two or more resolved projects share a target.
+
+    Each project's live dbt model set is scoped to that project alone (see
+    ``_engines_for_project``), so scanning the same physical target once per
+    project that declares it does not fail safe: each pass would see every
+    *other* project's live tables as its own orphans, because the live sets
+    are never unioned across the fan-out. With ``--no-dry-run`` that is two
+    projects' production tables quarantined in one invocation.
+
+    Unioning the live sets instead was considered and rejected: a fan-out
+    whose safety depends on a set union being exactly right, with no test
+    surface today, is not something a command that renames and drops things
+    should carry. Refusing outright is boring and obviously correct — the
+    operator reruns the overlapping projects one at a time.
+    """
+    owners: dict[str, list[str]] = {}
+    for proj, targets in pairs:
+        if proj is None:
+            continue
+        for tgt in targets:
+            owners.setdefault(tgt.name, []).append(proj.name)
+    conflicts = {name: projs for name, projs in owners.items() if len(projs) > 1}
+    if not conflicts:
+        return
+    detail = "; ".join(
+        f"{name} (built into by {', '.join(projs)})"
+        for name, projs in sorted(conflicts.items())
+    )
+    raise ValidationError(
+        "Refusing: more than one project builds into the same target in this "
+        f"invocation: {detail}. Each project's live dbt model set is its own, "
+        "so scanning a shared target once per project would rename one "
+        "project's live tables as another's orphans. Run the overlapping "
+        "projects one at a time (--project <name>) instead."
+    )
+
+
 def _engines_for_project(
     project: str | None, target: str | None
-) -> list[tuple[str, SqlEngine, str, DbtProject]]:
+) -> list[tuple[str, SqlEngine, str, DbtProject | None]]:
     """Return ``(label, engine, env_prefix, project)`` per target of the named project.
+
+    ``label`` is the target's own name, not its engine family: the summary,
+    the audit log's ``database`` field and revert's log filter all key on it,
+    and two targets that share an engine (two Postgres clusters, say) would
+    be indistinguishable from each other if it were the engine name instead —
+    revert could then rename one cluster's objects back on the strength of
+    another cluster's log entries.
 
     Still the one gate every subcommand passes through, which is why the
     capability check stays here. An engine that cannot rename a relation a view
@@ -151,17 +194,36 @@ def _engines_for_project(
     targets would have worked: this command renames and drops, so "did some of
     it" is the outcome worth avoiding most.
 
+    No ``--project`` given and no project configured at all — ``DP_DBT_PROJECTS``
+    unset, nothing to default to — falls back to resolving ``DP_TARGETS``
+    directly instead of refusing to run: that is the legacy, pre-named-project
+    shape this command has always supported, and ``project=None`` rides along
+    so ``node_prefix``/``excluded_schemas``/``invocation_command`` read the
+    legacy single-project env vars the way they always did. Passing an
+    explicit ``--project`` still resolves (and can still fail) normally even
+    when nothing is configured — the operator asked for a specific project by
+    name, so silently falling back to "all targets" would run the command
+    against warehouses that project may never touch.
+
     The ``project`` carried alongside each target (rather than resolved once
     for the whole run) is what makes ``--project all`` correct: each project
     fanned out by :func:`projects_and_targets` has its own node prefix and
-    exclusion settings, and a target that two projects both declare must be
-    scanned once per project, against that project's own live-model set.
+    exclusion settings. See ``_refuse_overlapping_targets`` for what happens
+    when two of them declare the same target.
     """
     try:
-        pairs = projects_and_targets(project, target)
-    except ValidationError as exc:
+        if project is None and default_project_name() is None:
+            targets = resolve_targets(target or ALL_TARGETS)
+            pairs: list[tuple[DbtProject | None, list[DbTarget]]] = [(None, targets)]
+        else:
+            pairs = [
+                (proj, tgts) for proj, tgts in projects_and_targets(project, target)
+            ]
+        _refuse_overlapping_targets(pairs)
+    except DataplatError as exc:
         fail(exc, console=console)
-    resolved: list[tuple[str, SqlEngine, str, DbtProject]] = []
+
+    resolved: list[tuple[str, SqlEngine, str, DbtProject | None]] = []
     for proj, targets in pairs:
         for tgt in targets:
             try:
@@ -177,9 +239,7 @@ def _engines_for_project(
                 # alone would not say which target brought the command to a stop.
                 # fail() escapes the brackets before Rich sees them.
                 fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
-            resolved.append(
-                (_ENGINE_LABELS[tgt.engine], tgt.engine, tgt.env_prefix, proj)
-            )
+            resolved.append((tgt.name, tgt.engine, tgt.env_prefix, proj))
     return resolved
 
 
