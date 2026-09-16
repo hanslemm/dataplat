@@ -154,6 +154,39 @@ def _report_blockers(
                 )
 
 
+def _report_scan(plan: MigrationPlan, sources: dict[int, dict]) -> None:
+    """Findings for every virtual dataset that would be created.
+
+    Runs whether or not the dataset's SQL passed the live check: the live
+    check only proves the SQL RUNS on the target, not that it returns the
+    same answer -- a bare ``::numeric`` cast builds fine and every test
+    passes while silently rounding every row, which is exactly the case
+    the live check cannot see through. Printed before the confirmation
+    prompt, and under ``--dry-run`` too, because the read this calls for
+    happens before a migration, not after one has already run.
+    """
+    flagged = [
+        (match, scan(str(sources[match.source_id].get("sql") or "")))
+        for match in plan.to_create
+        if match.is_virtual
+    ]
+    flagged = [(match, findings) for match, findings in flagged if findings]
+    if not flagged:
+        return
+
+    console.print(
+        f"\n[yellow]Virtual SQL worth reading before it moves[/yellow] "
+        f"[dim](port table synced {SOURCE_SYNCED})[/dim]"
+    )
+    for match, findings in flagged:
+        console.print(f"  {esc(match.source_key)} [dim](id {match.source_id})[/dim]")
+        for finding in findings:
+            console.print(
+                f"    {esc(finding.kind)} {esc(finding.construct)} — "
+                f"{esc(shorten(finding.message, 200))}"
+            )
+
+
 def _verify_charts(
     client,
     base_url: str,
@@ -223,32 +256,51 @@ def _verify_charts(
                     entry["paired"] = False
                     entry["status"] = "not compared: original has no query context"
                 else:
-                    entry["paired"] = True
+                    readable = True
                     try:
-                        old_rows = chart_data(
-                            client, base_url, token, json.loads(original_context)
+                        original_query_context = json.loads(original_context)
+                    except (ValueError, TypeError):
+                        # A malformed or non-str query_context on the
+                        # ORIGINAL, not the clone -- by this point the copy
+                        # and any created datasets already exist, so this
+                        # must not escape as a raw traceback, which would
+                        # skip the "Left in place" report entirely. This is
+                        # not a check that ran and found a divergence, the
+                        # way the clone's own unreadable context is -- it is
+                        # a check that never ran, so it must not flip `ok`.
+                        readable = False
+                        entry["paired"] = False
+                        entry["status"] = (
+                            "not compared: unreadable original query context"
                         )
-                    except ServiceError as exc:
-                        entry["status"] = f"original failed: {exc}"
-                        ok = False
-                    else:
-                        result = compare_rows(old_rows, new_rows)
-                        entry["source_rows"] = result.left_rows
-                        entry["differing_cells"] = result.differing_cells
-                        entry["missing_columns"] = list(result.missing_columns)
-                        entry["agrees"] = result.agrees
-                        if result.agrees:
-                            entry["status"] = "ok"
-                        else:
-                            status = "differs"
-                            if result.missing_columns:
-                                status += (
-                                    " (missing columns: "
-                                    + ", ".join(result.missing_columns)
-                                    + ")"
-                                )
-                            entry["status"] = status
+
+                    if readable:
+                        entry["paired"] = True
+                        try:
+                            old_rows = chart_data(
+                                client, base_url, token, original_query_context
+                            )
+                        except ServiceError as exc:
+                            entry["status"] = f"original failed: {exc}"
                             ok = False
+                        else:
+                            result = compare_rows(old_rows, new_rows)
+                            entry["source_rows"] = result.left_rows
+                            entry["differing_cells"] = result.differing_cells
+                            entry["missing_columns"] = list(result.missing_columns)
+                            entry["agrees"] = result.agrees
+                            if result.agrees:
+                                entry["status"] = "ok"
+                            else:
+                                status = "differs"
+                                if result.missing_columns:
+                                    status += (
+                                        " (missing columns: "
+                                        + ", ".join(result.missing_columns)
+                                        + ")"
+                                    )
+                                entry["status"] = status
+                                ok = False
 
         rows.append(entry)
 
@@ -358,6 +410,9 @@ def duplicate_command(
         )
     console.print(table)
 
+    if create_missing:
+        _report_scan(plan, sources)
+
     blocked = bool(failures) or (bool(plan.to_create) and not create_missing)
     if blocked:
         _report_blockers(plan, failures, sources, create_missing=create_missing)
@@ -430,22 +485,30 @@ def duplicate_command(
                 if c.get("id") is not None
             ]
 
+            # Fail CLOSED: a chart is trusted as a clone of THIS dashboard
+            # only when its own "dashboards" list says exactly that, one
+            # entry naming new_dashboard_id and nothing else. An absent or
+            # empty list must refuse the same as a foreign id does -- this
+            # guard is the only thing standing between a bad copy and
+            # rewriting a live dashboard's charts, so "we could not confirm
+            # it" has to refuse, not pass by default.
             shared = [
                 chart
                 for chart in full
                 if [
-                    d
+                    d.get("id") if isinstance(d, dict) else d
                     for d in (chart.get("dashboards") or [])
-                    if isinstance(d, dict) and d.get("id") != new_dashboard_id
                 ]
+                != [new_dashboard_id]
             ]
             if shared:
                 # duplicate_slices did not take effect -- almost always the
                 # positions merge in phase 3. Writing would edit the ORIGINAL.
                 console.print(
                     "\n[red]Refusing to repoint: "
-                    f"{len(shared)} chart(s) on dashboard {new_dashboard_id} also "
-                    "belong to another dashboard, so they were never cloned.[/red]"
+                    f"{len(shared)} chart(s) on dashboard {new_dashboard_id} are not "
+                    "confirmed clones of it alone (missing, empty, or foreign "
+                    "'dashboards' list).[/red]"
                 )
                 for chart in shared:
                     console.print(f"  chart {esc(chart.get('id'))}")
@@ -513,6 +576,15 @@ def duplicate_command(
                 update_chart(client, base_url, token, int(chart["id"]), payload)
                 console.print(f"[green]✓ repointed chart {chart['id']}[/green]")
 
+            # The COPY's own metadata, not the original's: Superset rewrote
+            # every chartId in it during /copy/ (that is what copy_metadata's
+            # "positions" merge was FOR), and dashboard_metadata's job is to
+            # remap ids on top of that rewrite, not undo it. PUTting the
+            # original's metadata back here reverts those rewrites, leaving
+            # the copy's filter_scopes / chart_configuration naming the
+            # ORIGINAL's chart ids -- a copy whose cross-filter scoping lists
+            # charts that are not on it.
+            copy = get_dashboard(client, base_url, token, new_dashboard_id)
             update_dashboard(
                 client,
                 base_url,
@@ -520,7 +592,7 @@ def duplicate_command(
                 new_dashboard_id,
                 {
                     "json_metadata": dashboard_metadata(
-                        original.get("json_metadata") or "{}", id_map
+                        copy.get("json_metadata") or "{}", id_map
                     )
                 },
             )
@@ -551,6 +623,13 @@ def duplicate_command(
                 f"dataset(s) {', '.join(str(c) for c in created) or '—'}[/dim]"
             )
         fail(exc, console=console)
+
+    payload = {
+        "dashboard_id": new_dashboard_id,
+        "title": new_title,
+        "created_datasets": created,
+        "verification": verification,
+    }
 
     if verify and new_dashboard_id:
         table = Table(
@@ -604,20 +683,16 @@ def duplicate_command(
             console.print(
                 "\n[yellow]The copy exists, and the charts do not all agree.[/yellow]"
             )
+            if as_json:
+                # --json's only reason to exist is to hand a non-interactive
+                # caller this exact evidence; exiting before this ran would
+                # give that caller no output at all in the one case the
+                # evidence exists for.
+                typer.echo(json.dumps(payload, indent=2))
             raise typer.Exit(code=ExitCode.FAILURE)
 
     if as_json:
-        typer.echo(
-            json.dumps(
-                {
-                    "dashboard_id": new_dashboard_id,
-                    "title": new_title,
-                    "created_datasets": created,
-                    "verification": verification,
-                },
-                indent=2,
-            )
-        )
+        typer.echo(json.dumps(payload, indent=2))
         return
 
     console.print(f"\n[green]Done:[/green] {esc(new_title)} ({new_dashboard_id})")

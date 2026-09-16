@@ -31,6 +31,10 @@ class FakeSuperset:
         virtual_sql_error: str | None = None,
         with_foreign_dataset: bool = False,
         duplicate_original_chart: bool = False,
+        dataset_118_sql: str | None = None,
+        dashboards_field: str = "normal",  # "normal" | "missing" | "empty"
+        original_no_query_context: bool = False,
+        original_bad_query_context: bool = False,
     ):
         self.writes: list[tuple[str, str, dict]] = []
         self.target_has_orders = target_has_orders
@@ -38,6 +42,19 @@ class FakeSuperset:
         self.virtual_sql_error = virtual_sql_error
         self.with_foreign_dataset = with_foreign_dataset
         self.duplicate_original_chart = duplicate_original_chart
+        # Overrides DATASET_118's "sql" field, so a test can give the ONE
+        # dataset that goes through plan.to_create a construct the live check
+        # would accept but the scan should still flag (fix round 12, finding
+        # 1) -- the live check is a real Postgres-shaped SELECT, the scan
+        # target does not need to be.
+        self.dataset_118_sql = dataset_118_sql
+        self.dashboards_field = dashboards_field
+        # Chart 7 pairs with clone 70 ("Revenue", datasource 118) in every
+        # --compare test; these two flip its query_context specifically, to
+        # exercise the ORIGINAL's context being missing or unreadable without
+        # touching any other chart's pairing (fix round 12, finding 3).
+        self.original_no_query_context = original_no_query_context
+        self.original_bad_query_context = original_bad_query_context
         self.chart_rows: list[dict] = [{"a": 1}]
         self.original_rows: list[dict] | None = None
         self.chart_error: str | None = None
@@ -91,11 +108,16 @@ class FakeSuperset:
         if path.endswith("/dashboard/42"):
             return httpx.Response(200, json={"result": DASHBOARD}, request=request)
         if path.endswith("/dashboard/318"):
-            return httpx.Response(200, json={"result": {"id": 318}}, request=request)
+            return httpx.Response(
+                200, json={"result": {"id": 318, **COPY_DASHBOARD}}, request=request
+            )
         if path.endswith("/copy/"):
             return httpx.Response(201, json={"result": {"id": 318}}, request=request)
         if path.endswith("/dataset/118"):
-            return httpx.Response(200, json={"result": DATASET_118}, request=request)
+            dataset = dict(DATASET_118)
+            if self.dataset_118_sql is not None:
+                dataset["sql"] = self.dataset_118_sql
+            return httpx.Response(200, json={"result": dataset}, request=request)
         if path.endswith("/dataset/121"):
             return httpx.Response(200, json={"result": DATASET_121}, request=request)
         if path.endswith("/dataset/140"):
@@ -136,9 +158,6 @@ class FakeSuperset:
             )
         if "/chart/" in path:
             chart_id = int(path.rsplit("/", 1)[-1])
-            dashboards = [{"id": 318}]
-            if self.clone_shared:
-                dashboards.append({"id": 99})
             chart = dict(CLONE_BY_ID[chart_id])
             if chart_id in self.repointed:
                 new = self.repointed[chart_id]
@@ -146,11 +165,24 @@ class FakeSuperset:
                 chart["query_context"] = json.dumps(
                     {"datasource": {"id": new, "type": "table"}}
                 )
-            return httpx.Response(
-                200,
-                json={"result": {**chart, "dashboards": dashboards}},
-                request=request,
-            )
+            # Chart 7 is the original paired with clone 70 ("Revenue",
+            # datasource 118) in every --compare test; these flip only ITS
+            # query_context, so the "original missing/unreadable context"
+            # cases can be exercised without disturbing chart 8/80's pairing.
+            if chart_id == 7 and self.original_no_query_context:
+                chart.pop("query_context", None)
+            elif chart_id == 7 and self.original_bad_query_context:
+                chart["query_context"] = "{not json"
+            if self.dashboards_field == "missing":
+                pass  # no "dashboards" key at all -- the absent-field case
+            elif self.dashboards_field == "empty":
+                chart["dashboards"] = []
+            else:
+                dashboards = [{"id": 318}]
+                if self.clone_shared:
+                    dashboards.append({"id": 99})
+                chart["dashboards"] = dashboards
+            return httpx.Response(200, json={"result": chart}, request=request)
         if path.endswith("/sqllab/execute/"):
             if self.virtual_sql_error:
                 return httpx.Response(
@@ -175,6 +207,23 @@ DASHBOARD: dict[str, Any] = {
     ),
     "position_json": json.dumps({"CHART-a": {"meta": {"chartId": 7}}}),
     "css": "",
+}
+
+# GET /dashboard/318's own json_metadata -- deliberately DIFFERENT from
+# DASHBOARD's (color_scheme, and F2 rather than F1) so a test can prove phase
+# 4's metadata PUT reads and remaps the COPY's metadata rather than silently
+# putting the original's back (fix round 12, finding 4). Superset rewrote
+# every chartId into THIS metadata during /copy/; that rewrite is what would
+# be reverted by reusing DASHBOARD's own json_metadata here instead.
+COPY_DASHBOARD: dict[str, Any] = {
+    "json_metadata": json.dumps(
+        {
+            "color_scheme": "copy-own-scheme",
+            "native_filter_configuration": [
+                {"id": "F2", "targets": [{"datasetId": 121, "column": {"name": "x"}}]}
+            ],
+        }
+    ),
 }
 
 CHARTS = [
@@ -473,6 +522,27 @@ def test_native_filters_are_remapped_on_the_copy(superset_env, install) -> None:
     assert metadata["native_filter_configuration"][0]["targets"][0]["datasetId"] == 887
 
 
+def test_phase_4_metadata_put_carries_the_copys_own_metadata_not_the_originals(
+    superset_env, install
+) -> None:
+    # PUTting the ORIGINAL's metadata back would revert every chartId
+    # rewrite Superset made during /copy/ -- filter_scopes,
+    # chart_configuration, expanded_slices would all still name the
+    # ORIGINAL's charts. dashboard/318 and dashboard/42 are given
+    # deliberately different json_metadata in this fixture (COPY_DASHBOARD
+    # vs DASHBOARD) so this can tell which one the PUT actually reflects.
+    fake = install(FakeSuperset())
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    update = next(
+        b for m, p, b in fake.writes if m == "PUT" and p.endswith("/dashboard/318")
+    )
+    metadata = json.loads(update["json_metadata"])
+    assert metadata["color_scheme"] == "copy-own-scheme"
+
+
 def test_a_chart_on_another_dashboard_refuses_without_writing_to_it(
     superset_env, install
 ) -> None:
@@ -487,6 +557,32 @@ def test_a_chart_on_another_dashboard_refuses_without_writing_to_it(
     assert "318" in result.output  # the copy's id, so it can be cleaned up
 
 
+def test_a_clone_with_no_dashboards_field_at_all_is_refused_with_no_chart_put(
+    superset_env, install
+) -> None:
+    # The guard used to check only for a FOREIGN id in "dashboards" -- an
+    # absent list passed straight through, since it contains no foreign id
+    # either. It must fail CLOSED instead: refuse whenever the list is not
+    # confirmed to be exactly [new_dashboard_id] (fix round 12, finding 7).
+    fake = install(FakeSuperset(dashboards_field="missing"))
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert not [p for m, p, _ in fake.writes if m == "PUT" and "/chart/" in p]
+
+
+def test_a_clone_with_an_empty_dashboards_list_is_refused_with_no_chart_put(
+    superset_env, install
+) -> None:
+    fake = install(FakeSuperset(dashboards_field="empty"))
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert not [p for m, p, _ in fake.writes if m == "PUT" and "/chart/" in p]
+
+
 def test_a_created_dataset_is_given_its_metrics(superset_env, install) -> None:
     fake = install(FakeSuperset(target_has_orders=False))
 
@@ -499,6 +595,28 @@ def test_a_created_dataset_is_given_its_metrics(superset_env, install) -> None:
     # Every synced column survives: the PUT replaces the list wholesale.
     assert {c["column_name"] for c in put["columns"]} >= {"x"}
     assert "metrics" in put
+
+
+def test_a_construct_scan_finding_is_reported_even_when_the_live_check_passes(
+    superset_env, install
+) -> None:
+    # The live check only proves the SQL RUNS on the target -- a bare
+    # ::numeric cast is a perfectly ordinary SELECT as far as Redshift is
+    # concerned, so it passes the live check every time. The scan is the
+    # only thing that would ever catch the truncation this construct stands
+    # in for, so it has to run over every dataset that would be created, not
+    # only the ones the live check rejected (fix round 12, finding 1).
+    fake = install(
+        FakeSuperset(
+            target_has_orders=False, dataset_118_sql="select x::numeric from orders"
+        )
+    )
+
+    result = _run("--dry-run")
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert fake.writes == []
+    assert "bare ::numeric cast" in result.output
 
 
 def test_a_malformed_map_is_invalid_input(superset_env, install) -> None:
@@ -659,6 +777,39 @@ def test_compare_reports_when_the_original_cannot_run(superset_env, install) -> 
     assert "differs" not in result.output.lower()
 
 
+def test_compare_reports_the_original_has_no_query_context(
+    superset_env, install
+) -> None:
+    # Every other fixture chart carries a query_context; this is the one
+    # case with none. It must read as missing evidence, not a disagreement --
+    # chart 8/80 still agrees normally, so the run succeeds overall.
+    fake = install(FakeSuperset())
+    fake.original_no_query_context = True
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "not compared: original has no query context" in result.output.lower()
+
+
+def test_compare_reports_an_unreadable_original_query_context_without_crashing(
+    superset_env, install
+) -> None:
+    # A malformed (or non-str) query_context on the ORIGINAL used to raise
+    # ValueError/TypeError past every except clause here -- at a point where
+    # the copy and its datasets already exist, so it produced a raw
+    # traceback instead of the "Left in place" report. Being unable to check
+    # is not the same as checking and finding a divergence, so this must not
+    # flip the run to a failure by itself (fix round 12, finding 3).
+    fake = install(FakeSuperset())
+    fake.original_bad_query_context = True
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "not compared: unreadable original query context" in result.output.lower()
+
+
 def test_compare_marks_an_ambiguous_pairing_not_compared_and_still_succeeds(
     superset_env, install
 ) -> None:
@@ -718,3 +869,35 @@ def test_json_output_carries_verification_rows(superset_env, install) -> None:
     # same as every other output in this command -- so only the tail is JSON.
     payload = json.loads(result.output[result.output.index('{\n  "dashboard_id"') :])
     assert {row["rows"] for row in payload["verification"]} == {2}
+
+
+def test_compare_json_prints_the_evidence_even_on_a_disagreement(
+    superset_env, install
+) -> None:
+    # The disagreement exit used to raise BEFORE the as_json block ever ran,
+    # so a non-interactive caller got no output at all in exactly the case
+    # --compare's evidence exists for (fix round 12, finding 5).
+    fake = install(FakeSuperset())
+    fake.original_rows = [{"a": 1}, {"a": 2}]
+    fake.chart_rows = [{"a": 1}]
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+            "--compare",
+            "--json",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    payload = json.loads(result.output[result.output.index('{\n  "dashboard_id"') :])
+    assert payload["verification"]
