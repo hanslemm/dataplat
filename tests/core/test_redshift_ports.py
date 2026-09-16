@@ -52,10 +52,12 @@ def test_a_scaled_cast_is_not_read_as_a_call() -> None:
 
 
 def test_a_jinja_comment_containing_a_dash_dash_does_not_swallow_the_query() -> None:
-    # Stripping line comments first would eat the block's closing tag and leave
-    # the whole comment in the scanned text.
-    sql = "{# note: 99.9% -- see ticket #}\nselect pg_sleep(1) from t"
-    assert "pg_sleep" in _kinds(sql)["UNKNOWN"]
+    # Stripping line comments BEFORE Jinja comments eats the block's closing
+    # tag, leaving the comment body in the scanned text -- where `pg_sleep(1)`
+    # then reads as a real call. The token must sit inside the comment and on
+    # the same line as the `--`, or the ordering cannot be discriminated at all.
+    sql = "{# note: pg_sleep(1) -- see ticket #}\nselect 1 from t"
+    assert _kinds(sql)["UNKNOWN"] == set()
 
 
 def test_a_string_literal_is_not_read_as_a_call() -> None:
@@ -67,6 +69,14 @@ def test_row_number_with_a_function_in_its_order_by_is_not_a_false_positive() ->
     # The regex form stops at md5's own paren and reports a total-order
     # violation on a window that has one.
     sql = "select row_number() over (partition by r order by c desc, md5(n)) from t"
+    assert "row_number() with no ORDER BY" not in _kinds(sql)["SYNTAX"]
+
+
+def test_a_function_inside_partition_by_is_not_a_false_positive() -> None:
+    # The truncating-regex bug needs the nested call BEFORE the ORDER BY:
+    # `[^)]*` stops at md5's own paren, the span has no "order by" left in it,
+    # and a window that HAS an ORDER BY gets flagged as having none.
+    sql = "select row_number() over (partition by md5(r) order by c) from t"
     assert "row_number() with no ORDER BY" not in _kinds(sql)["SYNTAX"]
 
 
