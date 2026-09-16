@@ -24,16 +24,15 @@ from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import JsonOption, YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import cell, esc
+from dataplat.cli.bi import dashboards as dashboards_app
+from dataplat.cli.bi._superset_auth import load_auth_context
 from dataplat.core.errors import (
     AuthError,
     ConfigError,
     ServiceError,
     ValidationError,
 )
-from dataplat.services.superset.client import (
-    build_client,
-    get_auth_config_from_env,
-)
+from dataplat.services.superset.client import build_client
 from dataplat.services.superset.client import (
     create_user as _create_user,
 )
@@ -95,6 +94,7 @@ groups_app = typer.Typer(
 app.add_typer(users_app, name="users")
 app.add_typer(roles_app, name="roles")
 app.add_typer(groups_app, name="groups")
+app.add_typer(dashboards_app.app, name="dashboards")
 
 console = Console()
 
@@ -122,11 +122,7 @@ class UserRoleMatch(str, Enum):
 
 
 def _load_auth_context() -> tuple[str, str, str]:
-    try:
-        cfg = get_auth_config_from_env()
-    except ConfigError as exc:
-        fail(exc, console=console)
-    return cfg.base_url, cfg.username, cfg.password
+    return load_auth_context(console)
 
 
 @roles_app.command("list")
