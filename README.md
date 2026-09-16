@@ -448,9 +448,14 @@ drops what it finds:
   its entries belong to any target in this invocation, it refuses rather than
   reporting a hollow "Reverted 0 object(s)" success — the log is very likely
   the wrong one (a different project's run), not proof there was nothing to
-  revert. Pass `--log` explicitly to confirm which log you mean; an
-  explicitly passed log that matches nothing is your own call and is left
-  alone.
+  revert. The same reasoning covers a log with no renames recorded at all: an
+  auto-picked empty log could just as easily be the wrong log as a clean
+  scan, so `revert` run unconditionally straight after a scan — a runbook, a
+  CI step — now exits non-zero on a run that found nothing, where it used to
+  exit 0. Pass `--log` explicitly to confirm which log you mean, which is
+  also what keeps that kind of run non-interactive; an explicitly passed log
+  that matches nothing, or has nothing recorded, is your own call and is
+  left alone.
 
 A project with a compiled manifest (`target/manifest.json`, from `dbt compile`
 or `dbt docs generate`) gets one more thing: a relation the manifest still

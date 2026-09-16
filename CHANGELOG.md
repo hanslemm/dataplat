@@ -54,10 +54,10 @@
   being the *only* way to survive: a relation the manifest still claims to
   produce is spared too, even if it did not rebuild inside the window. The
   legacy no-project path is unaffected: there is no manifest there, so the
-  window stays the sole criterion. The scan still assumes it
-  is the only dbt project writing into the schemas it scans
-  — sharing a schema with an unrelated dbt project outside a declared
-  `DP_DBT_PROJECTS` overlap remains an undetected hazard.
+  window stays the sole criterion. The scan still assumes it is the only dbt
+  project writing into the schemas it scans — sharing a schema with an
+  unrelated dbt project outside a declared `DP_DBT_PROJECTS` overlap remains
+  an undetected hazard.
 
 - **`dp db schema drop` says what depends on the schema.** It could already
   show what a schema *contains*; what breaks when it goes was a question only
