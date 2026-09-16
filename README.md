@@ -269,8 +269,9 @@ success having done nothing.
 ⁶ Moved out of `dp db` into its own area — see [dbt projects](#dbt-projects).
 `dp db dbt-orphans` still works exactly as before (same subcommands, same
 flags); both `dp db --help` and its own `--help` mark it **(deprecated)** with
-a pointer to `dp dbt orphans`, and running it prints a `DeprecationWarning` to
-stderr, where it cannot corrupt `--json` or other scripted output.
+a pointer to `dp dbt orphans`. The deprecation is help-only: running the old
+path behaves identically and emits no extra warning, so a script or cron job
+calling it keeps working untouched — and equally, will not be told it moved.
 
 A refused command **exits 2** — "a combination of arguments that cannot work",
 the same code as an unknown flag or an unknown target — and says which engine
