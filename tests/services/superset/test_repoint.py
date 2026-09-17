@@ -444,6 +444,21 @@ SYNCED = {
         {"id": 50, "column_name": "created_at"},
         {"id": 51, "column_name": "revenue_eur"},
     ],
+    # Every dataset Superset creates gets one of these, unasked -- measured
+    # live (id 2890, on the dataset that motivated this whole module).
+    "metrics": [{"id": 2890, "metric_name": "count"}],
+}
+
+# SOURCE_DATASET's own metrics happen to have no name in common with the
+# metric Superset auto-creates. This variant does: it is the exact live
+# case that returned 422 -- a source metric literally named "count",
+# alongside one that is not.
+SOURCE_DATASET_WITH_COUNT_METRIC = {
+    **SOURCE_DATASET,
+    "metrics": [
+        {"metric_name": "count", "expression": "COUNT(*)"},
+        {"metric_name": "missing_wfe", "expression": "sum(is_missing_wfe)"},
+    ],
 }
 
 
@@ -491,9 +506,34 @@ def test_calculated_columns_are_created_without_an_id() -> None:
 def test_metrics_travel_without_their_source_ids() -> None:
     # A chart names its metrics as strings -- params.metrics: ["revenue"].
     # Without this the datasource id is right and the chart renders broken.
+    # SYNCED's auto-created "count" metric does not collide with "revenue",
+    # so this is the no-collision path -- exercised for real, since SYNCED
+    # now carries a metric to look up and fail to match, rather than an
+    # empty list that would pass vacuously either way.
     payload = semantic_payload(SOURCE_DATASET, SYNCED)
     assert payload["metrics"][0]["metric_name"] == "revenue"
     assert "id" not in payload["metrics"][0]
+
+
+def test_a_source_metric_matching_an_auto_created_one_carries_its_id() -> None:
+    # The exact live case: Superset auto-creates "count" on every new
+    # dataset. Sending the source's own "count" with no id reads as "create
+    # a duplicate", and Superset rejects the whole PUT with 422 ("metrics:
+    # One or more metrics already exist"). A source metric with a name
+    # Superset did not also invent -- "missing_wfe" -- still goes without one.
+    payload = semantic_payload(SOURCE_DATASET_WITH_COUNT_METRIC, SYNCED)
+    by_name = {m["metric_name"]: m for m in payload["metrics"]}
+    assert by_name["count"]["id"] == 2890
+    assert "id" not in by_name["missing_wfe"]
+
+
+def test_an_auto_created_metric_the_source_lacks_is_retained() -> None:
+    # metrics is a full replacement exactly like columns: leaving out the
+    # "count" Superset auto-created, because SOURCE_DATASET never asked for
+    # it, would delete it -- and this feature deletes nothing.
+    payload = semantic_payload(SOURCE_DATASET, SYNCED)
+    by_name = {m["metric_name"]: m for m in payload["metrics"]}
+    assert by_name["count"]["id"] == 2890
 
 
 def test_rows_in_a_different_order_agree() -> None:

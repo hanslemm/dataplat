@@ -124,11 +124,36 @@ class FakeSuperset:
             return httpx.Response(
                 200, json={"result": FOREIGN_DATASET}, request=request
             )
+        if path.endswith("/dataset/904") and request.method == "PUT":
+            # Real Superset auto-creates a `count` metric on every new
+            # dataset (id 2890 below, matching the live case) and rejects
+            # the WHOLE put with 422 if a metric of that name arrives with no
+            # id -- it reads as "create a duplicate". The fixtures used to
+            # return a freshly created dataset with no metrics at all, which
+            # is exactly why nothing here ever caught semantic_payload
+            # sending "count" back namelessly.
+            sent = body.get("metrics") or []
+            collides = any(
+                m.get("metric_name") == "count" and "id" not in m for m in sent
+            )
+            if collides:
+                return httpx.Response(
+                    422,
+                    json={
+                        "message": {"metrics": ["One or more metrics already exist"]}
+                    },
+                    request=request,
+                )
+            return httpx.Response(200, json={"result": {}}, request=request)
         if path.endswith("/dataset/904"):
             return httpx.Response(
                 200,
                 json={
-                    "result": {"id": 904, "columns": [{"id": 50, "column_name": "x"}]}
+                    "result": {
+                        "id": 904,
+                        "columns": [{"id": 50, "column_name": "x"}],
+                        "metrics": [{"id": 2890, "metric_name": "count"}],
+                    }
                 },
                 request=request,
             )
@@ -363,7 +388,11 @@ DATASET_118 = {
     "sql": "select * from orders",
     "database": {"id": 1},
     "columns": [{"column_name": "x"}],
-    "metrics": [],
+    # Named "count" on purpose: this is the dataset the create-path clones
+    # (target_has_orders=False), and Superset auto-creates a metric of this
+    # exact name on every dataset it creates -- the live collision this
+    # module is named for.
+    "metrics": [{"metric_name": "count", "expression": "COUNT(*)"}],
 }
 DATASET_121 = {
     "id": 121,
@@ -630,6 +659,26 @@ def test_a_created_dataset_is_given_its_metrics(superset_env, install) -> None:
     # Every synced column survives: the PUT replaces the list wholesale.
     assert {c["column_name"] for c in put["columns"]} >= {"x"}
     assert "metrics" in put
+
+
+def test_a_metric_named_like_an_auto_created_one_does_not_abort_the_migration(
+    superset_env, install
+) -> None:
+    # DATASET_118 names a "count" metric, and the fake's /dataset/904 PUT
+    # branch rejects it with a real 422 unless semantic_payload carries the
+    # auto-created metric's own id forward -- exactly what a live Superset
+    # does. Measured live, this aborted a real migration partway through
+    # (dataset created, dashboard never copied) before this fix.
+    fake = install(FakeSuperset(target_has_orders=False))
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    put = next(
+        b for m, p, b in fake.writes if m == "PUT" and p.endswith("/dataset/904")
+    )
+    by_name = {m["metric_name"]: m for m in put["metrics"]}
+    assert by_name["count"]["id"] == 2890
 
 
 def test_a_construct_scan_finding_is_reported_even_when_the_live_check_passes(

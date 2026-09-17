@@ -483,9 +483,18 @@ def semantic_payload(source: dict, synced: dict) -> dict:
     synced physical columns are carried through with their ids -- sending only
     the calculated ones would drop every column Superset had just discovered.
 
-    Metrics go across with no id, because they do not exist on the new dataset
-    yet and a chart names them as strings: without them the datasource id is
-    perfectly correct and the chart renders broken.
+    Metrics are merged the same way, by ``metric_name`` rather than id --
+    measured live: Superset pre-creates a ``count`` metric on every new
+    dataset, so a source metric also named ``count``, sent with no id, reads
+    as "create another one" and the whole PUT is rejected with 422
+    (``metrics: One or more metrics already exist``). A name match carries
+    the synced id forward so it updates instead of duplicating; a synced
+    metric the source does not name is kept too, for the same reason synced
+    columns are -- this list is a full replacement, and leaving one out
+    deletes it. None of this would matter if a chart referenced its metrics
+    by id, but it names them as strings (``params.metrics: ["revenue"]``):
+    get the name wrong or the metric missing and the datasource id is
+    perfectly correct while the chart renders broken.
     """
     synced_by_name = {
         str(c.get("column_name")): c for c in (synced.get("columns") or [])
@@ -519,15 +528,41 @@ def semantic_payload(source: dict, synced: dict) -> dict:
                 calculated[field] = origin[field]
         columns.append(calculated)
 
+    source_metrics = source.get("metrics") or []
+    synced_metrics_by_name = {
+        str(m.get("metric_name")): m for m in (synced.get("metrics") or [])
+    }
+    source_metric_names = {
+        str(m.get("metric_name")) for m in source_metrics if m.get("metric_name")
+    }
+
     metrics: list[dict] = []
-    for origin in source.get("metrics") or []:
-        metric = {
+    for origin in source_metrics:
+        if not origin.get("metric_name"):
+            continue
+        metric: dict[str, object] = {
             field: origin[field]
             for field in _METRIC_FIELDS
             if origin.get(field) is not None
         }
-        if metric.get("metric_name"):
-            metrics.append(metric)
+        synced_metric = synced_metrics_by_name.get(str(origin["metric_name"]))
+        if synced_metric is not None:
+            synced_id = synced_metric.get("id")
+            if isinstance(synced_id, int):
+                metric["id"] = synced_id
+        metrics.append(metric)
+
+    # Whatever Superset auto-created that the source never named -- "count",
+    # almost always -- survives the full replacement above only if it is sent
+    # back explicitly.
+    for name, synced_metric in synced_metrics_by_name.items():
+        if name in source_metric_names:
+            continue
+        retained: dict[str, object] = {"metric_name": name}
+        synced_id = synced_metric.get("id")
+        if isinstance(synced_id, int):
+            retained["id"] = synced_id
+        metrics.append(retained)
 
     payload: dict[str, object] = {"columns": columns, "metrics": metrics}
     for field in (
