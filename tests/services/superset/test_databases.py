@@ -7,6 +7,7 @@ import pytest
 
 from dataplat.core.errors import ConfigError, ServiceError
 from dataplat.services.superset.databases import (
+    _sqllab_detail,
     execute_sql,
     resolve_database_id,
     validation_query,
@@ -72,6 +73,37 @@ def test_a_rejected_statement_carries_the_engine_message() -> None:
         execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
 
     assert 'relation "borg.events" does not exist' in str(excinfo.value)
+
+
+def test_sqllab_detail_is_none_without_an_errors_envelope() -> None:
+    """A body that is not SQL Lab's own shape (a generic gateway error, say)
+    has nothing for this helper to extract; the shared fallback should get a
+    turn instead."""
+    request = httpx.Request("POST", f"{BASE_URL}/api/v1/sqllab/execute/")
+    response = httpx.Response(
+        500, json={"message": "database is unreachable"}, request=request
+    )
+
+    assert _sqllab_detail(response) is None
+
+
+def test_a_failure_without_the_errors_envelope_still_surfaces_a_reason() -> None:
+    """No ``errors[]`` in the body -- ``_sqllab_detail`` has nothing to give,
+    so ``service_error``'s own fallback (``error_detail``) must engage and
+    the caller still sees a reason, not a bare status line."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, json={"message": "database is unreachable"}, request=request
+        )
+
+    with (
+        httpx.Client(transport=_serve(handler)) as client,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
+
+    assert "database is unreachable" in str(excinfo.value)
 
 
 def test_a_statement_that_runs_returns_the_payload() -> None:

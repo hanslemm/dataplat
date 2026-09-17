@@ -12,8 +12,8 @@ from collections.abc import Iterator
 
 import httpx
 
-from dataplat.core.errors import ConfigError, ServiceError
-from dataplat.services._http import error_detail, raise_for_status
+from dataplat.core.errors import ConfigError
+from dataplat.services._http import raise_for_status, service_error
 from dataplat.services.superset.client import auth_headers
 
 __all__ = ["execute_sql", "iter_databases", "resolve_database_id", "validation_query"]
@@ -107,17 +107,29 @@ def execute_sql(
         timeout=300,
     )
     if response.status_code >= 400:
-        detail = ""
-        try:
-            body = response.json() or {}
-            errors = body.get("errors")
-            if isinstance(errors, list) and errors:
-                detail = str((errors[0] or {}).get("message") or "")
-        except ValueError:
-            detail = ""
-        detail = detail or error_detail(response)
-        raise ServiceError(
-            f"Superset refused the statement ({response.status_code} "
-            f"{response.reason_phrase})" + (f": {detail}" if detail else "")
+        raise service_error(
+            response,
+            "run SQL on the target database",
+            detail=_sqllab_detail(response),
         )
     return response.json() if response.text else {}
+
+
+def _sqllab_detail(response: httpx.Response) -> str | None:
+    """SQL Lab's own message, which it nests under ``errors[]``.
+
+    ``error_detail`` knows the ``{"message": ...}`` envelope and not this
+    one, and against a body it does not recognise it falls back to the raw
+    text -- where the engine's message arrives with its quotes escaped.
+    Returning None when there is nothing here lets the shared extraction
+    have the last word.
+    """
+    try:
+        body = response.json() or {}
+    except ValueError:
+        return None
+    errors = body.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    message = (errors[0] or {}).get("message")
+    return str(message) if message else None
