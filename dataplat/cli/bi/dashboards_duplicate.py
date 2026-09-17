@@ -102,6 +102,12 @@ def _validate_virtual(
     query fails for reasons worth reading verbatim -- `type "jsonb" does not
     exist`, `function concat_ws(...) does not exist` -- and no category this
     could invent would be more useful.
+
+    ``validation_query`` itself refuses SQL that carries a statement
+    separator, raising ``ValidationError`` rather than building a wrapper a
+    second statement could escape through. That refusal is caught here too:
+    it is content we were handed, not a service failure, so it belongs in the
+    same "cannot be ported" report as the engine's own errors, not a crash.
     """
     failures: list[tuple[DatasetMatch, str]] = []
     for match in pending:
@@ -117,7 +123,7 @@ def _validate_virtual(
                 sql=validation_query(sql),
                 schema=match.target_key.schema,
             )
-        except ServiceError as exc:
+        except (ServiceError, ValidationError) as exc:
             failures.append((match, str(exc)))
     return failures
 

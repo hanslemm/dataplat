@@ -800,6 +800,27 @@ def test_a_virtual_dataset_whose_sql_fails_on_the_target_writes_nothing(
     assert 'relation "borg.events" does not exist' in result.output
 
 
+def test_a_dataset_whose_sql_carries_a_statement_separator_writes_nothing(
+    superset_env, install
+) -> None:
+    # validation_query refuses before any request reaches SQL Lab -- this
+    # Superset runs multi-statement SQL and returns the last statement's
+    # result, so the refusal has to happen before the wrapper is ever sent,
+    # not be one more error the engine reports back.
+    fake = install(
+        FakeSuperset(
+            target_has_orders=False,
+            dataset_118_sql="select 1; select 2 from orders",
+        )
+    )
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert fake.writes == []
+    assert "statement separator" in result.output
+
+
 def test_a_dataset_on_another_database_is_reported_and_left_alone(
     superset_env, install
 ) -> None:
