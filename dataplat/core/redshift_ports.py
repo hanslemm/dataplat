@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from dataplat.core.sql_text import strip_comments, strip_literals
+
 __all__ = [
     "Finding",
     "SOURCE_PATH",
@@ -328,45 +330,24 @@ def _rownumber_without_order(sql: str) -> bool:
     return False
 
 
-def _strip_comments(sql: str) -> str:
-    """Remove comments only, in the one order that works.
-
-    Jinja comments FIRST: a ``{# ... #}`` block may legitimately contain ``--``,
-    and stripping line comments first eats the block's closing tag, leaving the
-    whole comment in the scanned text.
-
-    String literals are deliberately left alone here. This is the text the
-    SYNTAX_CHECKS pass runs against, and three of those checks -- the Perl
-    regex class, the interval-with-month/year literal, the regex
-    lookahead/non-capturing group -- look for content that only ever appears
-    INSIDE a string literal (a ``regexp_replace`` pattern argument, an
-    ``interval '1 month'`` literal). Blanking literals before this pass would
-    make those three permanently unable to match anything.
-    """
-    sql = re.sub(r"\{#.*?#\}", "", sql, flags=re.S)
-    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
-    return re.sub(r"--[^\n]*", "", sql)
-
-
-def _strip_literals(sql: str) -> str:
-    """Blank string literals, on top of comment stripping.
-
-    Only for the CALL-NAME scan (KNOWN_SAFE/KNOWN_RISKY/UNKNOWN) and the
-    row_number check: German label text like ``'Verdauungssystem (Magen)'``
-    is otherwise read as a call to ``verdauungssystem()``. The upstream
-    scanner this was vendored from strips literals before looking for calls,
-    not before its syntax pass -- see :func:`_strip_comments`.
-    """
-    return re.sub(r"'(?:[^']|'')*'", "''", sql)
-
-
 def scan(sql: str) -> tuple[Finding, ...]:
-    """Every construct in ``sql`` that is risky, unknown, or bad syntax on Redshift."""
+    """Every construct in ``sql`` that is risky, unknown, or bad syntax on Redshift.
+
+    Comments are stripped before both passes below, but literals are blanked
+    only for the CALL-NAME scan (KNOWN_SAFE/KNOWN_RISKY/UNKNOWN) and the
+    row_number check, not for SYNTAX_CHECKS. A German label like
+    ``'Verdauungssystem (Magen)'`` would otherwise be read as a call to
+    ``verdauungssystem()`` -- but three of the syntax checks (the Perl regex
+    class, the interval-with-month/year literal, the regex
+    lookahead/non-capturing group) look for content that only ever appears
+    INSIDE a string literal, and blanking literals before that pass would make
+    those three permanently unable to match anything.
+    """
     if not sql or not sql.strip():
         return ()
 
-    comments_stripped = _strip_comments(sql)
-    calls_text = _strip_literals(comments_stripped)
+    comments_stripped = strip_comments(sql)
+    calls_text = strip_literals(comments_stripped)
 
     # A token preceded by '::' is a CAST, not a call -- ``::numeric(38, 6)`` is
     # the standard fix for the bare-::numeric trap, and reading it as a call to

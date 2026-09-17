@@ -12,7 +12,8 @@ from collections.abc import Iterator
 
 import httpx
 
-from dataplat.core.errors import ConfigError
+from dataplat.core.errors import ConfigError, ValidationError
+from dataplat.core.sql_text import strip_comments, strip_literals
 from dataplat.services._http import raise_for_status, service_error
 from dataplat.services.superset.client import auth_headers, write_headers
 
@@ -69,11 +70,31 @@ def resolve_database_id(
 def validation_query(sql: str) -> str:
     """Wrap ``sql`` so it is parsed and planned but returns nothing.
 
-    The trailing semicolon has to go: dataset SQL routinely ends with one, and
-    inside a subquery it closes the statement early for a syntax error that
-    says nothing about the SQL being tested.
+    Refuses input carrying a statement separator. The wrapper is string
+    interpolation into SQL, and this Superset executes multi-statement input,
+    returning the last statement's result -- so a dataset whose SQL closes the
+    wrapper's paren and opens a statement of its own would run that statement
+    on the target warehouse under the operator's credentials. Measured, not
+    theorised: sending the dataset's SQL to a live instance let a planted
+    second statement's result come back instead of the first's. The separator
+    is looked for with comments and string literals removed, so a ``;`` inside
+    a literal is not mistaken for one.
+
+    The trailing semicolon is still stripped: dataset SQL routinely ends with
+    one and it is not an escape -- there is nothing after it for a second
+    statement to be.
     """
-    return f"SELECT * FROM (\n{sql.strip().rstrip(';')}\n) AS dp_validate LIMIT 0"
+    body = sql.strip().rstrip(";")
+    if ";" in strip_literals(strip_comments(body)):
+        raise ValidationError(
+            "This dataset's SQL contains a statement separator (';') and is "
+            "refused: the validation wrapper is string interpolation, and this "
+            "Superset runs multi-statement SQL, so anything after the "
+            "separator would execute on the target warehouse under the "
+            "operator's credentials. Rewrite the dataset's SQL as a single "
+            "statement."
+        )
+    return f"SELECT * FROM (\n{body}\n) AS dp_validate LIMIT 0"
 
 
 def execute_sql(

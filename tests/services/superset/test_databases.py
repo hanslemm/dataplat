@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from dataplat.core.errors import ConfigError, ServiceError
+from dataplat.core.errors import ConfigError, ServiceError, ValidationError
 from dataplat.services.superset.databases import (
     _sqllab_detail,
     execute_sql,
@@ -56,6 +56,40 @@ def test_a_trailing_semicolon_cannot_break_the_wrapper() -> None:
     # A dataset's SQL routinely ends with one, and it would close the
     # subquery early: `... FROM (select 1;) AS dp_validate`.
     assert ";" not in validation_query("select 1 from t;")
+
+
+def test_the_live_exploit_payload_is_refused() -> None:
+    # Reproduced live: this wraps to two syntactically complete statements,
+    # and this Superset accepted it and returned the SECOND statement's
+    # result (columns came back as ['pwned']) -- not a theoretical injection.
+    # Pinned verbatim.
+    sql = "select 1) AS x; SELECT 424242 AS pwned FROM (select 1"
+    with pytest.raises(ValidationError):
+        validation_query(sql)
+
+
+def test_an_embedded_separator_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        validation_query("select 1; select 2")
+
+
+def test_a_trailing_semicolon_alone_is_still_accepted() -> None:
+    # The common real case: dataset SQL ending with one must not regress
+    # into a refusal.
+    wrapped = validation_query("select 1 from t;")
+    assert "select 1 from t" in wrapped
+
+
+def test_a_semicolon_inside_a_string_literal_is_not_a_separator() -> None:
+    # Without stripping literals first, this would be a false refusal that
+    # breaks a legitimate dataset whose label text contains a semicolon.
+    wrapped = validation_query("select 'a;b' as x from t")
+    assert "'a;b'" in wrapped
+
+
+def test_a_semicolon_inside_a_comment_is_not_a_separator() -> None:
+    wrapped = validation_query("select 1 -- note; here\nfrom t")
+    assert "select 1" in wrapped
 
 
 def test_a_rejected_statement_carries_the_engine_message() -> None:
