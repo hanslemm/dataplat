@@ -25,7 +25,7 @@ from rich.table import Table
 
 from dataplat.cli._exit import fail
 from dataplat.cli._options import JsonOption
-from dataplat.cli._render import cell
+from dataplat.cli._render import cell, esc
 from dataplat.core.errors import AuthError, ConfigError, ServiceError
 from dataplat.services.impact import (
     ConnectionRef,
@@ -166,7 +166,7 @@ def impact_command(
         )
         return
 
-    console.print(f"\n[bold]What depends on schema[/bold] {cell(schema)}\n")
+    console.print(f"\n[bold]What depends on schema[/bold] {esc(schema)}\n")
 
     if datasets:
         table = Table(
@@ -190,17 +190,17 @@ def impact_command(
 
     for destination in destinations:
         console.print(
-            f"[cyan]Airbyte destination[/cyan] {cell(destination.name)} "
-            f"[dim](database {cell(destination.database)})[/dim]"
+            f"[cyan]Airbyte destination[/cyan] {esc(destination.name)} "
+            f"[dim](database {esc(destination.database)})[/dim]"
         )
     for connection in connections:
         console.print(
-            f"  [dim]connection[/dim] {cell(connection.name)} "
-            f"[dim]({cell(connection.status)})[/dim]"
+            f"  [dim]connection[/dim] {esc(connection.name)} "
+            f"[dim]({esc(connection.status)})[/dim]"
         )
 
     for note in notes:
-        console.print(f"[dim]{cell(note)}[/dim]")
+        console.print(f"[dim]{esc(note)}[/dim]")
 
     total = len(datasets) + len(destinations) + len(connections)
     if total == 0:

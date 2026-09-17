@@ -44,7 +44,7 @@ from dataplat.cli._credentials import (
 from dataplat.cli._exit import fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
-from dataplat.cli._render import cell, esc
+from dataplat.cli._render import esc
 from dataplat.cli.db._common import (
     ConnCliParams,
     DatabaseOption,
@@ -277,5 +277,5 @@ def grant_command(
     if created:
         console.print(
             "[dim]New users have no privileges beyond the role(s) just "
-            f"granted: {cell(', '.join(n for n, _ in created))}[/dim]"
+            f"granted: {esc(', '.join(n for n, _ in created))}[/dim]"
         )
