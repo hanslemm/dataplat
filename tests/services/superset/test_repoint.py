@@ -461,6 +461,40 @@ SOURCE_DATASET_WITH_COUNT_METRIC = {
     ],
 }
 
+# The both-sides case, with SYNCED's own "count" carrying an expression that
+# deliberately DISAGREES with the source's -- "COUNT(1)" here vs "COUNT(*)"
+# on SOURCE_DATASET_WITH_COUNT_METRIC. A payload that copied the synced
+# metric's fields instead of the source's would still pass a test that only
+# checked "id" or "expression is present"; only a mismatched value like this
+# one catches that mistake.
+SYNCED_WITH_COUNT_METRIC = {
+    **SYNCED,
+    "metrics": [
+        {"id": 2890, "metric_name": "count", "expression": "COUNT(1)"},
+    ],
+}
+
+# The exact live shape Superset returns for its auto-created metric --
+# measured on the dataset that aborted a real migration: full descriptive
+# fields, not just a name and an id.
+SYNCED_WITH_RICH_AUTO_METRIC = {
+    **SYNCED,
+    "metrics": [
+        {
+            "id": 3004,
+            "metric_name": "count",
+            "expression": "COUNT(*)",
+            "metric_type": "count",
+            "verbose_name": "COUNT(*)",
+        }
+    ],
+}
+
+# The live case that aborted a real migration: a source dataset with NO
+# metrics of its own, so the retained auto-created "count" ends up as the
+# ENTIRE metrics payload.
+SOURCE_DATASET_WITHOUT_METRICS = {**SOURCE_DATASET, "metrics": []}
+
 
 def test_the_create_payload_carries_sql_for_a_virtual_dataset() -> None:
     payload = create_payload(SOURCE_DATASET, 2, DatasetKey("analytics", "cohort"))
@@ -534,6 +568,51 @@ def test_an_auto_created_metric_the_source_lacks_is_retained() -> None:
     payload = semantic_payload(SOURCE_DATASET, SYNCED)
     by_name = {m["metric_name"]: m for m in payload["metrics"]}
     assert by_name["count"]["id"] == 2890
+
+
+def test_a_retained_metric_carries_its_expression() -> None:
+    # The exact live failure: a source dataset with no metrics of its own,
+    # so the retained "count" is the WHOLE metrics payload.
+    # DatasetMetricsPutSchema requires "expression", so a retained metric
+    # sent as just {metric_name, id} gets the entire PUT rejected with 422 --
+    # this is what aborted a real migration partway through, with eight
+    # datasets created and none of their charts repointed.
+    payload = semantic_payload(
+        SOURCE_DATASET_WITHOUT_METRICS, SYNCED_WITH_RICH_AUTO_METRIC
+    )
+    metrics = payload["metrics"]
+    assert len(metrics) == 1
+    assert metrics[0]["id"] == 3004
+    assert metrics[0]["metric_name"] == "count"
+    assert metrics[0]["expression"] == "COUNT(*)"
+
+
+def test_a_retained_metric_keeps_its_other_descriptive_fields() -> None:
+    # Not just the one field the schema requires -- the retained metric
+    # should not be silently degraded relative to what Superset returned.
+    payload = semantic_payload(
+        SOURCE_DATASET_WITHOUT_METRICS, SYNCED_WITH_RICH_AUTO_METRIC
+    )
+    metric = payload["metrics"][0]
+    assert metric["metric_type"] == "count"
+    assert metric["verbose_name"] == "COUNT(*)"
+
+
+def test_a_shared_metric_still_prefers_source_fields_over_the_synced_id() -> None:
+    # Pins the asymmetry: present on BOTH sides, the copy should look like
+    # the SOURCE (whatever the user edited) plus the synced id, so the PUT
+    # updates it rather than duplicating it. Only a metric that exists ONLY
+    # on the synced side (test_a_retained_metric_carries_its_expression, just
+    # above) keeps its own fields instead. SYNCED_WITH_COUNT_METRIC's
+    # "count" carries a deliberately different expression, "COUNT(1)", so a
+    # regression that copied the synced fields instead of the source's would
+    # be caught here.
+    payload = semantic_payload(
+        SOURCE_DATASET_WITH_COUNT_METRIC, SYNCED_WITH_COUNT_METRIC
+    )
+    by_name = {m["metric_name"]: m for m in payload["metrics"]}
+    assert by_name["count"]["id"] == 2890
+    assert by_name["count"]["expression"] == "COUNT(*)"
 
 
 def test_rows_in_a_different_order_agree() -> None:

@@ -487,14 +487,19 @@ def semantic_payload(source: dict, synced: dict) -> dict:
     measured live: Superset pre-creates a ``count`` metric on every new
     dataset, so a source metric also named ``count``, sent with no id, reads
     as "create another one" and the whole PUT is rejected with 422
-    (``metrics: One or more metrics already exist``). A name match carries
-    the synced id forward so it updates instead of duplicating; a synced
-    metric the source does not name is kept too, for the same reason synced
-    columns are -- this list is a full replacement, and leaving one out
-    deletes it. None of this would matter if a chart referenced its metrics
-    by id, but it names them as strings (``params.metrics: ["revenue"]``):
-    get the name wrong or the metric missing and the datasource id is
-    perfectly correct while the chart renders broken.
+    (``metrics: One or more metrics already exist``). A name match takes the
+    SOURCE's fields (so the copy reflects whatever the user edited) plus the
+    synced id, so it updates instead of duplicating; a synced metric the
+    source does not name is kept too, for the same reason synced columns are
+    -- this list is a full replacement, and leaving one out deletes it -- but
+    with its OWN fields, not the source's, since there is no source metric to
+    take them from. Either way ``expression`` has to survive: it is required
+    by the PUT schema, and a metric sent without one gets the whole payload
+    rejected with 422, not just itself dropped. None of this would matter if
+    a chart referenced its metrics by id, but it names them as strings
+    (``params.metrics: ["revenue"]``): get the name wrong or the metric
+    missing and the datasource id is perfectly correct while the chart
+    renders broken.
     """
     synced_by_name = {
         str(c.get("column_name")): c for c in (synced.get("columns") or [])
@@ -554,11 +559,21 @@ def semantic_payload(source: dict, synced: dict) -> dict:
 
     # Whatever Superset auto-created that the source never named -- "count",
     # almost always -- survives the full replacement above only if it is sent
-    # back explicitly.
+    # back explicitly, and with its OWN fields, not just a name and an id:
+    # DatasetMetricsPutSchema requires "expression", so a bare {metric_name,
+    # id} is rejected with 422 even though every other part of the payload is
+    # fine -- measured live, on a dataset with no metrics of its own, where
+    # this retained "count" was the ENTIRE metrics payload and the rejection
+    # aborted a real migration partway through, with eight datasets built and
+    # none of their charts repointed.
     for name, synced_metric in synced_metrics_by_name.items():
         if name in source_metric_names:
             continue
-        retained: dict[str, object] = {"metric_name": name}
+        retained: dict[str, object] = {
+            field: synced_metric[field]
+            for field in _METRIC_FIELDS
+            if synced_metric.get(field) is not None
+        }
         synced_id = synced_metric.get("id")
         if isinstance(synced_id, int):
             retained["id"] = synced_id

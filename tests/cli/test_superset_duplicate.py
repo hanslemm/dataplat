@@ -27,6 +27,7 @@ class FakeSuperset:
         self,
         *,
         target_has_orders: bool = True,
+        target_has_users: bool = True,
         clone_shared: bool = False,
         virtual_sql_error: str | None = None,
         with_foreign_dataset: bool = False,
@@ -38,6 +39,7 @@ class FakeSuperset:
     ):
         self.writes: list[tuple[str, str, dict]] = []
         self.target_has_orders = target_has_orders
+        self.target_has_users = target_has_users
         self.clone_shared = clone_shared
         self.virtual_sql_error = virtual_sql_error
         self.with_foreign_dataset = with_foreign_dataset
@@ -144,6 +146,24 @@ class FakeSuperset:
                     },
                     request=request,
                 )
+            # DatasetMetricsPutSchema requires "expression" on every metric --
+            # measured live, this rejected a retained auto-created metric
+            # that carried only its name and id (fix round 13).
+            missing_expression = any(not m.get("expression") for m in sent)
+            if missing_expression:
+                return httpx.Response(
+                    422,
+                    json={
+                        "errors": [
+                            {
+                                "message": "The schema of the submitted payload "
+                                "is invalid.",
+                                "error_type": "MARSHMALLOW_ERROR",
+                            }
+                        ]
+                    },
+                    request=request,
+                )
             return httpx.Response(200, json={"result": {}}, request=request)
         if path.endswith("/dataset/904"):
             return httpx.Response(
@@ -152,7 +172,14 @@ class FakeSuperset:
                     "result": {
                         "id": 904,
                         "columns": [{"id": 50, "column_name": "x"}],
-                        "metrics": [{"id": 2890, "metric_name": "count"}],
+                        "metrics": [
+                            {
+                                "id": 2890,
+                                "metric_name": "count",
+                                "expression": "COUNT(*)",
+                                "metric_type": "count",
+                            }
+                        ],
                     }
                 },
                 request=request,
@@ -160,7 +187,9 @@ class FakeSuperset:
         if path.endswith("/dataset/") and request.method == "POST":
             return httpx.Response(201, json={"id": 904}, request=request)
         if path.endswith("/dataset/"):
-            rows = [TARGET_USERS] + ([TARGET_ORDERS] if self.target_has_orders else [])
+            rows = ([TARGET_USERS] if self.target_has_users else []) + (
+                [TARGET_ORDERS] if self.target_has_orders else []
+            )
             return httpx.Response(200, json={"result": rows}, request=request)
         if path.endswith("/chart/data"):
             # 118/121 are the originals' datasets; anything else is the copy's.
@@ -659,6 +688,35 @@ def test_a_created_dataset_is_given_its_metrics(superset_env, install) -> None:
     # Every synced column survives: the PUT replaces the list wholesale.
     assert {c["column_name"] for c in put["columns"]} >= {"x"}
     assert "metrics" in put
+
+
+def test_a_created_dataset_with_no_source_metrics_still_gets_a_valid_put(
+    superset_env, install
+) -> None:
+    # The live case that aborted a real migration: DATASET_121 ("users") has
+    # NO metrics of its own. Once it is created, the retained auto-created
+    # "count" is the ENTIRE metrics payload -- and the fake's /dataset/904
+    # PUT branch rejects any metric missing "expression", exactly as the
+    # real DatasetMetricsPutSchema does. The fixtures used to always create
+    # the "orders" dataset instead, which DOES name its own metrics, which
+    # is why nothing here caught semantic_payload sending back only a name
+    # and an id.
+    fake = install(FakeSuperset(target_has_users=False))
+
+    result = _run()
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    put = next(
+        b for m, p, b in fake.writes if m == "PUT" and p.endswith("/dataset/904")
+    )
+    assert put["metrics"] == [
+        {
+            "id": 2890,
+            "metric_name": "count",
+            "expression": "COUNT(*)",
+            "metric_type": "count",
+        }
+    ]
 
 
 def test_a_metric_named_like_an_auto_created_one_does_not_abort_the_migration(
