@@ -12,7 +12,7 @@ import httpx
 
 from dataplat.core.errors import ServiceError
 from dataplat.services._http import raise_for_status
-from dataplat.services.superset.client import auth_headers
+from dataplat.services.superset.client import auth_headers, write_headers
 
 __all__ = [
     "create_dataset",
@@ -89,11 +89,15 @@ def create_dataset(
     POST accepts only database, catalog, schema, table_name and sql -- columns
     and metrics exist solely on the PUT schema, which is why creating a usable
     dataset is two calls and not one.
+
+    Superset requires CSRF on this endpoint (measured live: a Bearer token
+    alone gets ``400: The CSRF token is missing``), hence ``write_headers``
+    rather than ``auth_headers``.
     """
     response = client.post(
         f"{base_url}/api/v1/dataset/",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=write_headers(client, base_url, access_token),
         timeout=120,
     )
     raise_for_status(response, "create Superset dataset")
@@ -122,11 +126,13 @@ def update_dataset(
     update, entries without are created, and anything omitted is DELETED. The
     caller must send the whole list, which is why the creation path reads the
     synced columns back before writing.
+
+    CSRF-enforced like ``create_dataset``, hence ``write_headers``.
     """
     response = client.put(
         f"{base_url}/api/v1/dataset/{dataset_id}",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=write_headers(client, base_url, access_token),
         timeout=120,
     )
     raise_for_status(response, "update Superset dataset")

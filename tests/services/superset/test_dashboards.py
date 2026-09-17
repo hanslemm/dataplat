@@ -58,6 +58,8 @@ def test_the_charts_of_a_dashboard_are_returned() -> None:
 
 def test_a_copy_returns_the_new_id() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
         assert request.method == "POST"
         assert request.url.path.endswith("/42/copy/")
         assert json.loads(request.content)["duplicate_slices"] is True
@@ -96,6 +98,8 @@ def test_an_update_sends_exactly_the_payload_given() -> None:
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
         assert request.method == "PUT"
         assert request.url.path.endswith("/dashboard/318")
         seen.append(json.loads(request.content))
@@ -105,6 +109,29 @@ def test_an_update_sends_exactly_the_payload_given() -> None:
         update_dashboard(client, BASE_URL, "tok", 318, {"json_metadata": "{}"})
 
     assert seen == [{"json_metadata": "{}"}]
+
+
+def test_a_copy_sends_the_csrf_token() -> None:
+    # Measured live: POST /dashboard/{id}/copy/ without it is refused.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        assert request.headers["x-csrftoken"] == "csrf-abc"
+        return httpx.Response(201, json={"result": {"id": 318}}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        copy_dashboard(client, BASE_URL, "tok", 42, {"json_metadata": "{}"})
+
+
+def test_an_update_sends_the_csrf_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        assert request.headers["x-csrftoken"] == "csrf-abc"
+        return httpx.Response(200, json={"result": {}}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        update_dashboard(client, BASE_URL, "tok", 318, {"json_metadata": "{}"})
 
 
 def test_a_copy_with_non_int_id_is_rejected() -> None:

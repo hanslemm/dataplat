@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 
 from dataplat.services._http import raise_for_status
-from dataplat.services.superset.client import auth_headers
+from dataplat.services.superset.client import auth_headers, write_headers
 
 __all__ = ["chart_data", "get_chart", "update_chart"]
 
@@ -41,11 +41,15 @@ def update_chart(
     chart_id: int,
     payload: dict,
 ) -> dict:
-    """Update a chart."""
+    """Update a chart.
+
+    CSRF-enforced (measured live), hence ``write_headers`` rather than
+    ``auth_headers`` -- unlike ``chart_data`` below, which is not.
+    """
     response = client.put(
         f"{base_url}/api/v1/chart/{chart_id}",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=write_headers(client, base_url, access_token),
         timeout=120,
     )
     raise_for_status(response, "update Superset chart")
@@ -55,7 +59,13 @@ def update_chart(
 def chart_data(
     client: httpx.Client, base_url: str, access_token: str, query_context: dict
 ) -> list[dict]:
-    """Run a query context and return the rows of its first result."""
+    """Run a query context and return the rows of its first result.
+
+    Deliberately stays on ``auth_headers``, not ``write_headers``: verified
+    live that this endpoint does not enforce CSRF, and it runs once per chart
+    during ``--compare`` -- fetching a token it does not need would be pure
+    waste on that hot path.
+    """
     response = client.post(
         f"{base_url}/api/v1/chart/data",
         json=query_context,

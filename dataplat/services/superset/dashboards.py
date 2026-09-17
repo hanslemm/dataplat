@@ -14,7 +14,7 @@ import httpx
 
 from dataplat.core.errors import ServiceError
 from dataplat.services._http import raise_for_status
-from dataplat.services.superset.client import auth_headers
+from dataplat.services.superset.client import auth_headers, write_headers
 
 __all__ = [
     "copy_dashboard",
@@ -99,11 +99,14 @@ def copy_dashboard(
     metadata it is SENT in order to remap ``chartId`` to the cloned charts, so
     metadata passed through as received produces a copy still wired to the
     original's charts.
+
+    CSRF-enforced (measured live): a Bearer token alone is refused, hence
+    ``write_headers`` rather than ``auth_headers``.
     """
     response = client.post(
         f"{base_url}/api/v1/dashboard/{dashboard_id}/copy/",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=write_headers(client, base_url, access_token),
         timeout=300,
     )
     raise_for_status(response, "copy Superset dashboard")
@@ -128,11 +131,14 @@ def update_dashboard(
     dashboard_id: int,
     payload: dict,
 ) -> dict:
-    """Update a dashboard."""
+    """Update a dashboard.
+
+    CSRF-enforced like ``copy_dashboard``, hence ``write_headers``.
+    """
     response = client.put(
         f"{base_url}/api/v1/dashboard/{dashboard_id}",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=write_headers(client, base_url, access_token),
         timeout=120,
     )
     raise_for_status(response, "update Superset dashboard")

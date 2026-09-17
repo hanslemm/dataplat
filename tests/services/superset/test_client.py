@@ -194,3 +194,89 @@ def test_every_call_reports_the_servers_reason(call: Callable, action: str) -> N
         call(c)
 
     assert f"Failed to {action} (403 Forbidden): sorry, no" == str(excinfo.value)
+
+
+# --- write_headers / CSRF --------------------------------------------------
+# Every mutating Superset call (datasets, dashboards, charts, SQL Lab) goes
+# through this one helper. Its own contract -- token fetched, both headers
+# added, cached per client -- is tested here; each call site only needs to
+# prove it actually calls this helper (tested alongside that call site).
+
+
+def test_write_headers_carries_the_csrf_token_and_referer() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/security/csrf_token/")
+        return httpx.Response(200, json={"result": "csrf-xyz"}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as c:
+        headers = client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+
+    assert headers["X-CSRFToken"] == "csrf-xyz"
+    assert headers["Referer"] == BASE_URL
+    # Still a valid auth header, not a replacement for it.
+    assert headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+
+
+def test_write_headers_falls_back_to_auth_headers_without_a_token() -> None:
+    # An instance with CSRF disabled (or an older API surface): the token
+    # endpoint 404s, and the caller must still get usable headers back.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as c:
+        headers = client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+
+    assert "X-CSRFToken" not in headers
+    assert "Referer" not in headers
+    assert headers == client.auth_headers(ACCESS_TOKEN)
+
+
+def test_write_headers_fetches_the_csrf_token_once_per_client() -> None:
+    # The duplicate flow calls this many times against one client in a
+    # single run; each call re-fetching the token would be a GET Superset
+    # does not need to see again.
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(200, json={"result": "csrf-xyz"}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as c:
+        first = client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+        second = client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+
+    assert calls["count"] == 1
+    assert first["X-CSRFToken"] == second["X-CSRFToken"] == "csrf-xyz"
+
+
+def test_write_headers_caches_the_no_token_case_too() -> None:
+    # An instance without CSRF enforcement should not be re-asked on every
+    # write either -- "no token" is cached exactly like a real one.
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(404, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as c:
+        client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+        client.write_headers(c, BASE_URL, ACCESS_TOKEN)
+
+    assert calls["count"] == 1
+
+
+def test_write_headers_fetches_a_separate_token_per_client() -> None:
+    # The cache is keyed by client, not by access token: a token is bound to
+    # the session cookie of the client that fetched it, so a second client
+    # must not reuse the first's.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": "csrf-xyz"}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as c1,
+        httpx.Client(transport=httpx.MockTransport(handler)) as c2,
+    ):
+        client.write_headers(c1, BASE_URL, ACCESS_TOKEN)
+        headers = client.write_headers(c2, BASE_URL, ACCESS_TOKEN)
+
+    assert headers["X-CSRFToken"] == "csrf-xyz"

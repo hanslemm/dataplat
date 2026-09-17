@@ -134,6 +134,8 @@ def test_an_update_puts_the_payload() -> None:
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
         assert request.method == "PUT"
         seen.append(json.loads(request.content))
         return httpx.Response(200, json={"result": {}}, request=request)
@@ -144,3 +146,27 @@ def test_an_update_puts_the_payload() -> None:
         )
 
     assert seen[0]["metrics"][0]["metric_name"] == "r"
+
+
+def test_creation_sends_the_csrf_token() -> None:
+    # Measured live: POST /dataset/ without it is a flat 400, "The CSRF
+    # token is missing" -- create_dataset must go through write_headers.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        assert request.headers["x-csrftoken"] == "csrf-abc"
+        return httpx.Response(201, json={"id": 904}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        create_dataset(client, BASE_URL, "tok", {"table_name": "orders"})
+
+
+def test_an_update_sends_the_csrf_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        assert request.headers["x-csrftoken"] == "csrf-abc"
+        return httpx.Response(200, json={"result": {}}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        update_dataset(client, BASE_URL, "tok", 904, {"metrics": []})

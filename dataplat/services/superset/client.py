@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -43,6 +44,7 @@ __all__ = [
     "update_user",
     "user_group_ids",
     "user_role_ids",
+    "write_headers",
 ]
 
 
@@ -100,6 +102,78 @@ def auth_headers(access_token: str) -> dict[str, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+
+
+# Keyed by the httpx.Client instance, not the access token: the token is tied
+# to the session cookie a specific client holds (see ``_csrf_token`` below),
+# so that is the only key that means anything. Weak so a client that a caller
+# is done with is not kept alive by this cache alone.
+_CSRF_TOKENS: weakref.WeakKeyDictionary[httpx.Client, str | None] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _csrf_token(client: httpx.Client, base_url: str, access_token: str) -> str | None:
+    """Superset's CSRF token, which its write endpoints require and the
+    Bearer token is not.
+
+    Fetched with the caller's own client, deliberately: Superset ties the
+    token to the session cookie that this request establishes, and httpx
+    carries cookies per client instance. Fetching it through a second client
+    yields a token for a session the write is not part of, which Superset
+    rejects with the same error as sending none at all.
+
+    Returns None when the endpoint is absent or unhappy, so an instance that
+    does not enforce CSRF still works -- the write simply goes without it.
+    """
+    try:
+        response = client.get(
+            f"{base_url}/api/v1/security/csrf_token/",
+            headers=auth_headers(access_token),
+            timeout=60,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        token = (response.json() or {}).get("result")
+    except ValueError:
+        return None
+    return str(token) if token else None
+
+
+def write_headers(
+    client: httpx.Client, base_url: str, access_token: str
+) -> dict[str, str]:
+    """Headers for a request that CHANGES something in Superset.
+
+    Superset enforces CSRF on its write endpoints, and the Bearer token alone
+    does not satisfy it -- every POST and PUT below ``/api/v1/`` outside
+    ``/security/`` comes back "The CSRF token is missing". The token is bound
+    to the session cookie established by fetching it, and httpx keeps cookies
+    per client, so it MUST be fetched with the SAME client that then writes --
+    do not "tidy" this into a helper with its own client, that silently
+    breaks every write.
+
+    Falls back to plain auth headers when no token can be had, so an instance
+    with CSRF disabled keeps working.
+
+    Fetched once per client and cached here: the duplicate flow writes many
+    times in one run against one client, and re-fetching on every call would
+    be a GET this endpoint does not need to see again. A client that never
+    yields a token (CSRF disabled, or the endpoint is absent) is cached too,
+    for the same reason -- "no token" is as much an answer as a token is.
+    """
+    headers = auth_headers(access_token)
+    if client in _CSRF_TOKENS:
+        token = _CSRF_TOKENS[client]
+    else:
+        token = _csrf_token(client, base_url, access_token)
+        _CSRF_TOKENS[client] = token
+    if token:
+        return {**headers, "X-CSRFToken": token, "Referer": base_url}
+    return headers
 
 
 def extract_id_list(items: object) -> list[int]:
