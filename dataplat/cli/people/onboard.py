@@ -28,7 +28,7 @@ from dataplat.cli._credentials import (
 from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
-from dataplat.cli._render import cell
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import ConnCliParams, db_session, resolve_params_or_exit
 from dataplat.core.errors import (
     AuthError,
@@ -189,8 +189,8 @@ def render_plan(plan: OnboardPlan) -> None:
     only complete picture of what was meant to happen is this table.
     """
     console.print(
-        f"\n[bold]Onboarding[/bold] {cell(plan.identity.email)} "
-        f"[dim]copying[/dim] {cell(plan.reference.email)}\n"
+        f"\n[bold]Onboarding[/bold] {esc(plan.identity.email)} "
+        f"[dim]copying[/dim] {esc(plan.reference.email)}\n"
     )
 
     if plan.accounts:
@@ -228,14 +228,14 @@ def render_plan(plan: OnboardPlan) -> None:
             for name, held in account.unusual
         )
         console.print(
-            f"[yellow]![/yellow] {cell(account.scope)}: "
-            f"{cell(account.username)} would receive "
-            f"[yellow]{cell(rare)}[/yellow] — few accounts here have {it}, "
+            f"[yellow]![/yellow] {esc(account.scope)}: "
+            f"{esc(account.username)} would receive "
+            f"[yellow]{esc(rare)}[/yellow] — few accounts here have {it}, "
             f"so check {it} is intended."
         )
 
     for scope, why in plan.skipped:
-        console.print(f"[dim]skipped {cell(scope)}: {cell(why)}[/dim]")
+        console.print(f"[dim]skipped {esc(scope)}: {esc(why)}[/dim]")
 
     if plan.nothing_to_do:
         console.print("\n[yellow]Nothing to create[/yellow]")
@@ -352,7 +352,7 @@ def _execute(plan: OnboardPlan, targets: dict, path: Path) -> list[BaseException
                 RuntimeError,
                 ValueError,
             ) as exc:
-                console.print(f"[red]✗ {cell(account.scope)}: {cell(exc)}[/red]")
+                console.print(f"[red]✗ {esc(account.scope)}: {esc(exc)}[/red]")
                 failures.append(exc)
                 continue
 
@@ -366,8 +366,8 @@ def _execute(plan: OnboardPlan, targets: dict, path: Path) -> list[BaseException
             )
             creds_file.flush()
             console.print(
-                f"[green]✓ {cell(account.scope)}[/green] "
-                f"[dim]{cell(account.username)}[/dim]"
+                f"[green]✓ {esc(account.scope)}[/green] "
+                f"[dim]{esc(account.username)}[/dim]"
             )
     finally:
         creds_file.close()
@@ -430,10 +430,10 @@ def onboard(
         plan, {t.name: t for t in _selected_targets(targets).values()}, path
     )
 
-    console.print(f"\n[dim]Credentials written to {cell(path)}[/dim]")
+    console.print(f"\n[dim]Credentials written to {esc(path)}[/dim]")
     if not file_mode_secure(path):
         console.print(
-            f"[yellow]![/yellow] [dim]{cell(path)} is readable by others; "
+            f"[yellow]![/yellow] [dim]{esc(path)} is readable by others; "
             "chmod 600 it.[/dim]"
         )
 

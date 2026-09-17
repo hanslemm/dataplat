@@ -200,13 +200,13 @@ def drop_command(
             if dependants:
                 console.print("\n[bold]Depends on this:[/bold]")
                 for line in dependants:
-                    console.print(f"  [yellow]{cell(line)}[/yellow]")
+                    console.print(f"  [yellow]{esc(line)}[/yellow]")
             elif not notes:
                 console.print(
                     "\n[dim]Nothing outside the database references it.[/dim]"
                 )
             for note in notes:
-                console.print(f"[dim]{cell(note)}[/dim]")
+                console.print(f"[dim]{esc(note)}[/dim]")
 
         print_ops(console, plan.ops, conn)
 

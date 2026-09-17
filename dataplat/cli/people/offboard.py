@@ -18,7 +18,7 @@ from rich.table import Table
 from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
-from dataplat.cli._render import cell
+from dataplat.cli._render import cell, esc
 from dataplat.cli.db._common import ConnCliParams, db_session, resolve_params_or_exit
 from dataplat.core.errors import (
     AuthError,
@@ -119,7 +119,7 @@ def _superset_facts(identity: PersonIdentity) -> OffboardFacts:
 
 
 def render_plan(plan: OffboardPlan) -> None:
-    console.print(f"\n[bold]Offboarding[/bold] {cell(plan.identity.email)}\n")
+    console.print(f"\n[bold]Offboarding[/bold] {esc(plan.identity.email)}\n")
 
     if plan.accounts:
         table = Table(
@@ -142,7 +142,7 @@ def render_plan(plan: OffboardPlan) -> None:
         console.print(table)
 
     for scope, why in plan.skipped:
-        console.print(f"[dim]skipped {cell(scope)}: {cell(why)}[/dim]")
+        console.print(f"[dim]skipped {esc(scope)}: {esc(why)}[/dim]")
 
     if plan.nothing_to_do:
         console.print("\n[yellow]Nothing to disable[/yellow]")
@@ -263,12 +263,11 @@ def offboard(
             # from the first warehouse used to abort the run before Superset
             # was ever reached, which left access half-revoked and the summary
             # silent about the half that was skipped.
-            console.print(f"[red]✗ {cell(account.scope)}: {cell(exc)}[/red]")
+            console.print(f"[red]✗ {esc(account.scope)}: {esc(exc)}[/red]")
             failures.append(exc)
             continue
         console.print(
-            f"[green]✓ {cell(account.scope)}[/green] "
-            f"[dim]{cell(account.username)}[/dim]"
+            f"[green]✓ {esc(account.scope)}[/green] [dim]{esc(account.username)}[/dim]"
         )
 
     if failures:
