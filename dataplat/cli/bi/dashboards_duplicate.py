@@ -66,6 +66,7 @@ from dataplat.services.superset.repoint import (
     plan_migration,
     repoint_chart,
     semantic_payload,
+    verification_context,
 )
 
 __all__ = ["duplicate_command"]
@@ -197,6 +198,7 @@ def _verify_charts(
     originals: dict[int, dict],
     ambiguous: set[int],
     compare: bool,
+    id_map: dict[int, int],
 ) -> tuple[list[dict], bool]:
     """Run each new chart's query, and optionally the original's beside it.
 
@@ -219,15 +221,15 @@ def _verify_charts(
     for clone in clones:
         clone_id = int(clone["id"])
         name = str(clone.get("slice_name") or clone.get("id"))
-        raw = clone.get("query_context")
-        if not raw:
+        original = originals.get(clone_id)
+        # Superset's copy endpoint drops query_context from every cloned
+        # slice, so the clone almost never has its own -- verification_context
+        # falls back to the paired original's, rewritten to the new dataset.
+        # Reported as missing evidence rather than a failure either way: not
+        # being able to check is not proof the two engines disagree.
+        context = verification_context(clone, original, id_map)
+        if context is None:
             rows.append({"chart": name, "status": "no query context"})
-            continue
-        try:
-            context = json.loads(raw)
-        except ValueError:
-            rows.append({"chart": name, "status": "unreadable query context"})
-            ok = False
             continue
 
         try:
@@ -248,7 +250,6 @@ def _verify_charts(
                 entry["paired"] = False
                 entry["status"] = "not compared: ambiguous pairing"
             else:
-                original = originals.get(clone_id)
                 original_context = (original or {}).get("query_context")
                 if original is None:
                     entry["paired"] = False
@@ -530,7 +531,11 @@ def duplicate_command(
             # silently compare a clone against a metric that is not its own.
             originals_for_clone: dict[int, dict] = {}
             ambiguous_clones: set[int] = set()
-            if compare and verify:
+            # --verify needs the pairing too, not only --compare: a cloned
+            # slice almost never carries its own query_context (Superset's
+            # copy endpoint drops it), and the original -- rewritten to the
+            # new dataset -- is verification_context's only fallback.
+            if verify:
                 original_charts = {
                     int(c["id"]): c
                     for c in [
@@ -616,6 +621,7 @@ def duplicate_command(
                     originals=originals_for_clone,
                     ambiguous=ambiguous_clones,
                     compare=compare,
+                    id_map=id_map,
                 )
     except (AuthError, ServiceError, ConfigError) as exc:
         if new_dashboard_id or created:

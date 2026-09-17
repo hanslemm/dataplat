@@ -159,12 +159,34 @@ class FakeSuperset:
         if "/chart/" in path:
             chart_id = int(path.rsplit("/", 1)[-1])
             chart = dict(CLONE_BY_ID[chart_id])
+            # These three flags exercise --compare's OWN pairing quirks
+            # (missing/unreadable/ambiguous original), which only show up
+            # once the clone's own query -- via verification_context's
+            # fallback or otherwise -- has already succeeded. Giving clone 70
+            # its own context here (as some Superset versions do) isolates
+            # that from the fallback, so what breaks is only ever the
+            # ORIGINAL side these flags target.
+            if chart_id == 70 and (
+                self.original_no_query_context
+                or self.original_bad_query_context
+                or self.duplicate_original_chart
+            ):
+                chart["query_context"] = json.dumps(
+                    {"datasource": {"id": chart["datasource_id"], "type": "table"}}
+                )
             if chart_id in self.repointed:
                 new = self.repointed[chart_id]
                 chart["datasource_id"] = new
-                chart["query_context"] = json.dumps(
-                    {"datasource": {"id": new, "type": "table"}}
-                )
+                # A real PUT never CREATES a query_context that was not
+                # already there -- repoint_chart only rewrites one it finds.
+                # Fabricating one here unconditionally is exactly what used
+                # to hide the bug this fixture now models (see the CLONE_BY_ID
+                # comment above): the clones have none, and repointing them
+                # must not manufacture one.
+                if "query_context" in chart:
+                    chart["query_context"] = json.dumps(
+                        {"datasource": {"id": new, "type": "table"}}
+                    )
             # Chart 7 is the original paired with clone 70 ("Revenue",
             # datasource 118) in every --compare test; these flip only ITS
             # query_context, so the "original missing/unreadable context"
@@ -302,13 +324,19 @@ CLONE_BY_ID = {
         "params": json.dumps({"datasource": "118__table"}),
         "query_context": json.dumps({"datasource": {"id": 118, "type": "table"}}),
     },
+    # 70/80/90 are CLONES, deliberately given no "query_context" -- measured
+    # against a live instance, POST /dashboard/{id}/copy/ drops it from every
+    # cloned slice: 14 of 14 originals had one, 0 of 14 fresh clones did, with
+    # no repoint involved. Giving these a query_context, as earlier fixtures
+    # did, hid the bug this file exists to catch: verification silently had
+    # nothing to run against a real Superset. See
+    # test_verify_falls_back_to_the_original_when_the_clone_has_no_query_context.
     70: {
         "id": 70,
         "slice_name": "Revenue",
         "datasource_id": 118,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "118__table"}),
-        "query_context": json.dumps({"datasource": {"id": 118, "type": "table"}}),
     },
     80: {
         "id": 80,
@@ -316,7 +344,6 @@ CLONE_BY_ID = {
         "datasource_id": 121,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "121__table"}),
-        "query_context": json.dumps({"datasource": {"id": 121, "type": "table"}}),
     },
     90: {
         "id": 90,
@@ -324,7 +351,6 @@ CLONE_BY_ID = {
         "datasource_id": 140,
         "datasource_type": "table",
         "params": json.dumps({"datasource": "140__table"}),
-        "query_context": json.dumps({"datasource": {"id": 140, "type": "table"}}),
     },
 }
 
@@ -510,7 +536,11 @@ def test_every_cloned_chart_is_repointed_in_all_three_places(
     }
     assert chart_writes[70]["datasource_id"] == 904
     assert json.loads(chart_writes[70]["params"])["datasource"] == "904__table"
-    assert json.loads(chart_writes[70]["query_context"])["datasource"]["id"] == 904
+    # Clone 70 has no query_context (Superset's copy endpoint never gave it
+    # one) -- the PUT correctly omits it rather than inventing one. Two other
+    # places, not three, is what "all three places a chart CAN store its
+    # dataset" actually means when one of them is absent.
+    assert "query_context" not in chart_writes[70]
     assert chart_writes[80]["datasource_id"] == 887
 
 
@@ -699,6 +729,56 @@ def test_verify_reports_a_chart_that_returns_rows(superset_env, install) -> None
 
     assert result.exit_code == ExitCode.SUCCESS, result.output
     assert "2" in result.output
+
+
+def test_verify_falls_back_to_the_original_when_the_clone_has_no_query_context(
+    superset_env, install
+) -> None:
+    # The bug this whole file exists to catch: measured on a live instance,
+    # POST /dashboard/{id}/copy/ drops query_context from every cloned
+    # slice -- CLONE_BY_ID's 70/80/90 model that directly, with none at all.
+    # Before verification_context's fallback, this ran with --verify (the
+    # default) and reported "no query context" for every chart -- a copy
+    # that succeeded, and a verification step that silently checked nothing.
+    fake = install(FakeSuperset())
+    fake.chart_rows = [{"a": 1}, {"a": 2}]
+
+    result = runner.invoke(
+        superset_cli.app,
+        [
+            "dashboards",
+            "duplicate",
+            "42",
+            "--from-database",
+            "DataOcean",
+            "--to-database",
+            "BetterData",
+            "--yes",
+        ],
+        env=WIDE,
+    )
+
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    assert "no query context" not in result.output.lower()
+    assert "2" in result.output
+
+
+def test_compare_still_works_when_clones_have_no_query_context(
+    superset_env, install
+) -> None:
+    # --compare's own read of the original is unchanged by the fallback --
+    # only the clone side gained one. This proves both sides still get
+    # queried, and a real disagreement still surfaces, in the fixture shape
+    # that actually matches a live Superset (no query_context on any clone).
+    fake = install(FakeSuperset())
+    fake.original_rows = [{"a": 1}, {"a": 2}]
+    fake.chart_rows = [{"a": 1}]
+
+    result = _run_compare()
+
+    assert result.exit_code == ExitCode.FAILURE, result.output
+    assert "no query context" not in result.output.lower()
+    assert "differs" in result.output.lower()
 
 
 def test_a_chart_that_fails_to_run_exits_one_not_five(superset_env, install) -> None:

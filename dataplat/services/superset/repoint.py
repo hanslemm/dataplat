@@ -31,6 +31,7 @@ __all__ = [
     "repoint_chart",
     "repoint_metadata",
     "semantic_payload",
+    "verification_context",
 ]
 
 
@@ -326,6 +327,64 @@ def repoint_chart(chart: dict, id_map: dict[int, int]) -> dict | None:
             payload["query_context"] = json.dumps(context)
 
     return payload
+
+
+def verification_context(
+    clone: dict, original: dict | None, id_map: dict[int, int]
+) -> dict | None:
+    """The query context to verify a cloned chart with.
+
+    Superset's copy endpoint does not carry ``query_context`` onto a cloned
+    slice -- measured on a live instance: 14 of 14 originals had one, 0 of 14
+    fresh clones did, with no repoint involved. Without a fallback the whole
+    verification step has nothing to run and reports "no query context" for
+    every chart, which is honest and useless.
+
+    So: the clone's own context when it has one, otherwise the original's with
+    its datasource rewritten to the clone's. Returns None when neither yields
+    one, which stays a reported status rather than an error.
+    """
+    raw_clone = clone.get("query_context")
+    if raw_clone:
+        try:
+            context = json.loads(raw_clone)
+        except ValueError:
+            return None
+        return context if isinstance(context, dict) else None
+
+    if original is None:
+        return None
+
+    raw_original = original.get("query_context")
+    if not raw_original:
+        return None
+    try:
+        context = json.loads(raw_original)
+    except ValueError:
+        return None
+    if not isinstance(context, dict):
+        return None
+
+    # Same lookup repoint_chart does -- the OLD id this context names, mapped
+    # to the new one -- just sourced from the original chart rather than the
+    # one being mutated. Any failure to resolve or rewrite it means returning
+    # a query that would verify the copy against the OLD dataset, which is
+    # worse than not verifying at all: it would report success for a chart
+    # that was never actually tested.
+    old_id = original.get("datasource_id")
+    if not isinstance(old_id, int) or old_id not in id_map:
+        return None
+    new_id = id_map[old_id]
+    datasource_type = str(
+        clone.get("datasource_type") or original.get("datasource_type") or "table"
+    )
+
+    datasource = context.get("datasource")
+    if not isinstance(datasource, dict):
+        return None
+    datasource["id"] = new_id
+    datasource["type"] = datasource_type
+    return context
 
 
 def repoint_metadata(json_metadata: str, id_map: dict[int, int]) -> str:

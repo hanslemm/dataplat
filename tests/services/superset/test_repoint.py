@@ -25,6 +25,7 @@ from dataplat.services.superset.repoint import (
     repoint_chart,
     repoint_metadata,
     semantic_payload,
+    verification_context,
 )
 
 SOURCE = [
@@ -262,6 +263,73 @@ def test_chart_datasource_id_is_none_when_neither_is_present() -> None:
 
 def test_chart_datasource_id_is_none_for_a_malformed_datasource_string() -> None:
     assert chart_datasource_id({"form_data": {"datasource": "not-an-id"}}) is None
+
+
+CLONE_WITH_CONTEXT = {
+    "id": 70,
+    "datasource_id": 904,
+    "datasource_type": "table",
+    "query_context": json.dumps(
+        {"datasource": {"id": 904, "type": "table"}, "queries": [{"metrics": ["x"]}]}
+    ),
+}
+
+CLONE_NO_CONTEXT = {"id": 70, "datasource_id": 904, "datasource_type": "table"}
+
+ORIGINAL_WITH_CONTEXT = {
+    "id": 7,
+    "datasource_id": 118,
+    "datasource_type": "table",
+    "query_context": json.dumps(
+        {"datasource": {"id": 118, "type": "table"}, "queries": [{"metrics": ["x"]}]}
+    ),
+}
+
+
+def test_verification_context_prefers_the_clones_own_context() -> None:
+    # Untouched -- no fallback is even considered when the clone has one.
+    id_map = {118: 904}
+    context = verification_context(CLONE_WITH_CONTEXT, ORIGINAL_WITH_CONTEXT, id_map)
+    assert context == json.loads(CLONE_WITH_CONTEXT["query_context"])
+
+
+def test_verification_context_falls_back_to_the_rewritten_original() -> None:
+    context = verification_context(CLONE_NO_CONTEXT, ORIGINAL_WITH_CONTEXT, {118: 904})
+    assert context is not None
+    # The whole point: verifying against the OLD dataset would report success
+    # for a chart that was never actually tested.
+    assert context["datasource"]["id"] == 904
+    assert context["datasource"]["type"] == "table"
+    assert context["queries"] == [{"metrics": ["x"]}]
+
+
+def test_verification_context_is_none_with_no_context_on_either_side() -> None:
+    clone = {"id": 70, "datasource_id": 904}
+    original = {"id": 7, "datasource_id": 118}
+    assert verification_context(clone, original, {118: 904}) is None
+
+
+def test_verification_context_is_none_when_there_is_no_original() -> None:
+    assert verification_context(CLONE_NO_CONTEXT, None, {118: 904}) is None
+
+
+def test_verification_context_is_none_for_malformed_clone_json() -> None:
+    clone = {**CLONE_NO_CONTEXT, "query_context": "{not json"}
+    assert verification_context(clone, ORIGINAL_WITH_CONTEXT, {118: 904}) is None
+
+
+def test_verification_context_is_none_for_malformed_original_json() -> None:
+    original = {**ORIGINAL_WITH_CONTEXT, "query_context": "{not json"}
+    assert verification_context(CLONE_NO_CONTEXT, original, {118: 904}) is None
+
+
+def test_verification_context_is_none_when_the_original_dataset_is_not_in_the_map() -> (
+    None
+):
+    # The original's dataset was never migrated -- rewriting it would be a
+    # guess, not a fact.
+    context = verification_context(CLONE_NO_CONTEXT, ORIGINAL_WITH_CONTEXT, {999: 1000})
+    assert context is None
 
 
 def test_native_filters_are_remapped() -> None:
