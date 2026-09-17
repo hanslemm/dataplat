@@ -119,3 +119,94 @@ def test_a_statement_that_runs_returns_the_payload() -> None:
             ]
             == "success"
         )
+
+
+def test_execute_sql_sends_the_csrf_token_and_referer() -> None:
+    # SQL Lab enforces CSRF where /chart/data does not (verified live); the
+    # POST is rejected without both of these, not just the token.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        captured["post"] = request
+        return httpx.Response(
+            200, json={"status": "success", "data": []}, request=request
+        )
+
+    with httpx.Client(transport=_serve(handler)) as client:
+        execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
+
+    post = captured["post"]
+    assert post.headers["x-csrftoken"] == "csrf-abc"
+    assert post.headers["referer"] == BASE_URL
+
+
+def test_the_csrf_token_is_fetched_before_the_sqllab_post() -> None:
+    # The token is bound to the session cookie the GET establishes; fetched
+    # out of order (or through a different client) it would be a token for a
+    # session the POST is not part of.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        return httpx.Response(
+            200, json={"status": "success", "data": []}, request=request
+        )
+
+    with httpx.Client(transport=_serve(handler)) as client:
+        execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
+
+    assert calls == ["/api/v1/security/csrf_token/", "/api/v1/sqllab/execute/"]
+
+
+def test_a_missing_csrf_endpoint_does_not_break_execute_sql() -> None:
+    # An instance with CSRF disabled (or an older API surface) still works:
+    # the POST goes out without the header instead of the call failing.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(404, request=request)
+        captured["post"] = request
+        return httpx.Response(
+            200, json={"status": "success", "data": []}, request=request
+        )
+
+    with httpx.Client(transport=_serve(handler)) as client:
+        result = execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
+
+    assert result["status"] == "success"
+    assert "x-csrftoken" not in captured["post"].headers
+
+
+def test_a_500_with_the_errors_envelope_still_surfaces_the_engine_message() -> None:
+    # Live behaviour against Redshift: a rejected statement comes back as
+    # 500, not 400, but SQL Lab nests the message the same way either time.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/security/csrf_token/"):
+            return httpx.Response(200, json={"result": "csrf-abc"}, request=request)
+        return httpx.Response(
+            500,
+            json={
+                "errors": [
+                    {
+                        "message": (
+                            'redshift error: relation "definitely_not_a_table_xyz" '
+                            "does not exist"
+                        )
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    with (
+        httpx.Client(transport=_serve(handler)) as client,
+        pytest.raises(ServiceError) as excinfo,
+    ):
+        execute_sql(client, BASE_URL, "tok", database_id=2, sql="select 1")
+
+    assert "definitely_not_a_table_xyz" in str(excinfo.value)

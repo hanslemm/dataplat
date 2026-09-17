@@ -76,6 +76,36 @@ def validation_query(sql: str) -> str:
     return f"SELECT * FROM (\n{sql.strip().rstrip(';')}\n) AS dp_validate LIMIT 0"
 
 
+def _csrf_token(client: httpx.Client, base_url: str, access_token: str) -> str | None:
+    """Superset's CSRF token, which SQL Lab requires and the Bearer token is not.
+
+    Fetched with the caller's own client, deliberately: Superset ties the
+    token to the session cookie that this request establishes, and httpx
+    carries cookies per client instance. Fetching it through a second client
+    yields a token for a session the POST is not part of, which Superset
+    rejects with the same error as sending none at all.
+
+    Returns None when the endpoint is absent or unhappy, so an instance that
+    does not enforce CSRF still works -- the POST simply goes without it, as
+    it does today.
+    """
+    try:
+        response = client.get(
+            f"{base_url}/api/v1/security/csrf_token/",
+            headers=auth_headers(access_token),
+            timeout=60,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        token = (response.json() or {}).get("result")
+    except ValueError:
+        return None
+    return str(token) if token else None
+
+
 def execute_sql(
     client: httpx.Client,
     base_url: str,
@@ -90,6 +120,11 @@ def execute_sql(
     The engine's own message is what reaches the caller. ``type "jsonb" does
     not exist`` is more useful than any category this could sort it into, and
     a classifier here would be a third hand-maintained list to keep correct.
+
+    SQL Lab enforces CSRF where ``chart/data`` does not, so this is the one
+    endpoint in this module that needs the extra header pair -- a Bearer
+    token alone gets ``400: The CSRF token is missing`` before the SQL is
+    even looked at.
     """
     payload: dict[str, object] = {
         "database_id": database_id,
@@ -100,10 +135,15 @@ def execute_sql(
     if schema:
         payload["schema"] = schema
 
+    headers = auth_headers(access_token)
+    csrf = _csrf_token(client, base_url, access_token)
+    if csrf:
+        headers = {**headers, "X-CSRFToken": csrf, "Referer": base_url}
+
     response = client.post(
         f"{base_url}/api/v1/sqllab/execute/",
         json=payload,
-        headers=auth_headers(access_token),
+        headers=headers,
         timeout=300,
     )
     if response.status_code >= 400:
