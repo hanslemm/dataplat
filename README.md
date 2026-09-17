@@ -421,6 +421,10 @@ private key reaches docker through the process environment, never argv.
 | `SUPERSET_BASE_URL`, `SUPERSET_ADMIN_USERNAME`, `SUPERSET_ADMIN_PASSWORD` | Superset API access. |
 | `<NAME>_USERNAME_TEMPLATE` | Username convention for `dp people` on this target, e.g. `bd_{first_initial}{last}`. **A target without one gets no accounts** — which is how an SSO-managed warehouse opts out. |
 | `SUPERSET_USERNAME_TEMPLATE` | The same for Superset. Defaults to `{local}` (the email name), since that is what Superset usernames almost always are. |
+| `DP_SUPERSET_USAGE_TARGET` | Name of the `DP_TARGETS` entry holding Superset's `logs` table — its metadata database, or a replica. Required by `dashboards usage` and `dashboards list --by-usage`. |
+| `DP_SUPERSET_USAGE_LOGS_TABLE` | Where that target keeps Superset's action log. Default `public.logs`, which is Superset's own name for it. |
+| `DP_SUPERSET_USAGE_USERS_TABLE` | The same for the user table. Default `public.ab_user`. |
+| `DP_SUPERSET_USAGE_EXCLUDE_USERS` | Comma-separated usernames never counted as viewers. Usually unnecessary — service traffic is excluded by its log *action* — but useful where automation runs as a real account. |
 | `DP_AWS_PROFILE` | Default AWS profile for `dp cloud aws` commands. |
 | `DP_AWS_PROFILE_ALIASES` | Short aliases, e.g. `prod=AdminAccess-Prod,qa=AdminAccess-QA`. |
 | `DP_AWS_REGION` | Default AWS region (falls back to `AWS_REGION`, then the profile). |
@@ -817,6 +821,66 @@ finding it sound, and the report keeps those apart.
 The original dashboard, its charts and its datasets are never modified, and
 nothing is ever deleted. If a later step fails, the copy and any created
 datasets stay, and their ids are printed.
+
+### Which dashboards does anybody actually open?
+
+Before migrating a dashboard, it is worth knowing whether anyone reads it:
+
+```bash
+dp bi superset dashboards usage
+dp bi superset dashboards usage --unused
+dp bi superset dashboards list --database DataOcean --by-usage
+```
+
+That last one is the retirement question in a single command — of the
+dashboards still reading a warehouse, which does nobody open? Those you delete
+rather than migrate.
+
+**This reads Superset's own tables, not a modelled copy of them.** Every
+instance records what happens to it in `logs` (Flask-AppBuilder's action log:
+`action`, `user_id`, `dashboard_id`, `dttm`) and `ab_user`. Point `dp` at a
+database target holding them and there is nothing to map, because the column
+names are Superset's on every install:
+
+```bash
+export DP_SUPERSET_USAGE_TARGET=metadata          # a DP_TARGETS name
+```
+
+One variable is the whole setup when the target *is* your Superset metadata
+database — the table names default to `public.logs` and `public.ab_user`. If
+you replicate those into a warehouse instead, name the copies:
+
+```bash
+export DP_SUPERSET_USAGE_TARGET=warehouse
+export DP_SUPERSET_USAGE_LOGS_TABLE=_raw.raw_superset__logs
+export DP_SUPERSET_USAGE_USERS_TABLE=_raw.raw_superset__ab_user
+```
+
+**Cache warm-ups and thumbnails are excluded by what they are, not by who runs
+them.** Superset logs a human opening a dashboard as `dashboard`, and its own
+machinery under separate names — on one real instance, 90 days held 271,922
+`ChartRestApi.warm_up_cache` events next to the `dashboard` ones. Filtering on
+the action therefore works before you know a single service-account name.
+`--actions` prints your instance's vocabulary so you can check:
+
+```bash
+dp bi superset dashboards usage --actions
+```
+
+If your Superset spells a dashboard open differently, pass it to
+`--view-action` (repeatable). `DP_SUPERSET_USAGE_EXCLUDE_USERS` is a second
+net, for an instance whose automation logs under a real account.
+
+Two limits worth knowing before you delete anything:
+
+- **`--unused` only covers dashboards the API account can see.** Superset
+  filters its dashboard list by permission, so a non-admin gets a short one.
+  When the logs name dashboards the listing does not, the report says so and
+  how many — run as an admin for the complete picture.
+- **The metadata database must be reachable as a `dp` target.** Superset's
+  `/api/v1/log/` endpoint cannot stand in for it: on an instance with real
+  history it times out even asking for a single row. MySQL-backed Superset is
+  out of scope, since `dp` targets are Postgres, Redshift or DuckDB.
 
 ### Onboarding and offboarding
 

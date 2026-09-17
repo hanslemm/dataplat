@@ -12,6 +12,7 @@ import typer
 from dataplat.cli.bi.dashboards_datasets import datasets_command
 from dataplat.cli.bi.dashboards_duplicate import duplicate_command
 from dataplat.cli.bi.dashboards_list import list_command
+from dataplat.cli.bi.dashboards_usage import usage_command
 
 __all__ = ["app"]
 
@@ -29,3 +30,7 @@ app.command(
     "duplicate",
     help="Copy a dashboard and repoint the copy onto another database.",
 )(duplicate_command)
+app.command(
+    "usage",
+    help="Rank dashboards by how many people open them, from Superset's logs.",
+)(usage_command)

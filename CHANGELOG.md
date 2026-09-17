@@ -12,6 +12,34 @@
   runs each chart on both databases and diffs the results. Nothing is deleted
   on any path.
 
+- **`dp bi superset dashboards usage` ranks dashboards by who opens them**,
+  with `--unused` for the ones nobody does and `--by-usage` on `list` for the
+  question a warehouse retirement actually asks: of the dashboards still
+  reading this database, which does nobody open?
+
+  It reads Superset's own `logs` and `ab_user` tables through a `dp` database
+  target, so it is configuration rather than modelling — the column names are
+  Superset's on every install, and `DP_SUPERSET_USAGE_TARGET` alone is enough
+  when the target is the metadata database itself. Superset's REST API cannot
+  serve this: `/api/v1/log/` times out on an instance with real history.
+
+  Cache warm-ups and thumbnail generation are excluded by their log *action*,
+  not by a list of local service accounts, so the filter holds on an instance
+  nobody has configured yet. `--actions` prints the vocabulary your Superset
+  actually uses, since a version that spells a dashboard open differently is
+  otherwise indistinguishable from one nobody visits.
+
+  `--unused` is never capped by `--limit` — a capped scan would report every
+  dashboard past the cap as never opened — and it says how many viewed
+  dashboards fell outside the API account's permission-filtered list, because
+  "3 unused" from an account that can see a third of the estate is a number
+  somebody would otherwise act on.
+
+### Changed
+
+- Every `dp` command and every option is now covered by a test asserting it has
+  help text. Both guards were confirmed to fail when help is removed.
+
 ## 0.10.0
 
 ### Added
