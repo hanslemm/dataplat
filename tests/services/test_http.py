@@ -83,6 +83,43 @@ def test_the_detail_never_carries_a_request_header() -> None:
     assert "s3cret-token" not in str(_http.service_error(response, "list things"))
 
 
+def test_an_explicit_detail_overrides_the_bodys_own_envelope() -> None:
+    """A caller that already pulled a line out of an envelope this module does
+    not recognise (SQL Lab's ``errors: [{"message": ...}]``) hands it over
+    verbatim, instead of whatever ``error_detail`` would have read from the
+    body."""
+    response = _respond(400, json={"message": "generic body text"})
+
+    error = _http.service_error(response, "run SQL", detail="the real engine message")
+
+    assert str(error) == "Failed to run SQL (400 Bad Request): the real engine message"
+    assert "generic body text" not in str(error)
+
+
+def test_detail_left_out_is_unchanged_from_before_the_parameter_existed() -> None:
+    """The five existing call sites all omit ``detail``; this is what they see."""
+    response = _respond(404, json={"message": "workspace ws-1 not found"})
+
+    assert str(_http.service_error(response, "list things")) == str(
+        _http.service_error(response, "list things", detail=None)
+    )
+    assert (
+        str(_http.service_error(response, "list things"))
+        == "Failed to list things (404 Not Found): workspace ws-1 not found"
+    )
+
+
+def test_an_empty_string_detail_means_there_is_none() -> None:
+    """A caller passing "" is saying "I checked, there is no detail" -- not
+    "fall back to the body". The message ends at the status, no trailing
+    colon."""
+    response = _respond(400, json={"message": "this must not appear"})
+
+    error = _http.service_error(response, "run SQL", detail="")
+
+    assert str(error) == "Failed to run SQL (400 Bad Request)"
+
+
 # --- raise_for_status -----------------------------------------------------
 
 

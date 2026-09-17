@@ -116,9 +116,23 @@ def error_detail(response: httpx.Response) -> str:
     return text
 
 
-def service_error(response: httpx.Response, action: str) -> ServiceError:
-    """The one shape a failed call reports, the server's reason included."""
-    detail = error_detail(response)
+def service_error(
+    response: httpx.Response, action: str, *, detail: str | None = None
+) -> ServiceError:
+    """The one shape a failed call reports, the server's reason included.
+
+    ``detail`` is an escape hatch, not a second way to extract one: it exists
+    for a caller that has already pulled the server's message out of an
+    envelope this module does not recognise (Superset's SQL Lab nests its
+    message under ``errors: [{"message": ...}]``, not ``message``) and would
+    otherwise have to hand-build its own sentence to say so. Teaching
+    ``error_detail`` every service's envelope would turn it into a registry
+    of other people's shapes; accepting the already-extracted line here keeps
+    the sentence itself shared. Left at its default, this is exactly
+    ``error_detail(response)``, as it always was.
+    """
+    if detail is None:
+        detail = error_detail(response)
     return ServiceError(
         f"Failed to {action} ({response.status_code} {response.reason_phrase})"
         + (f": {detail}" if detail else "")
