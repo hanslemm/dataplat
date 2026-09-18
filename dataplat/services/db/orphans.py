@@ -9,7 +9,7 @@ schema itself are always excluded.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Literal, TypedDict
@@ -17,7 +17,7 @@ from typing import Any, Literal, TypedDict
 import psycopg
 from psycopg import sql
 
-from dataplat.core.errors import ConfigError, ServiceError
+from dataplat.core.errors import ServiceError
 from dataplat.services.db._like import LIKE_ESCAPE_CLAUSE, like_escape
 from dataplat.services.db.connection import (
     DbConnectionParams,
@@ -26,44 +26,24 @@ from dataplat.services.db.connection import (
 )
 
 DEPRECATED_SUFFIX = "_deprecated"
-DBT_ARTIFACTS_SCHEMA = "dbt_artifacts"
 
-_DEFAULT_EXCLUDED_SCHEMAS: frozenset[str] = frozenset(
-    {"raw", "_raw", DBT_ARTIFACTS_SCHEMA}
-)
-
-
-def excluded_schemas() -> frozenset[str]:
-    """Schemas never scanned for orphans.
-
-    ``DP_DBT_ORPHANS_EXCLUDE_SCHEMAS`` (comma-separated) replaces the
-    default set (``raw``, ``_raw``, ``dbt_artifacts``) when set.
-    """
-    raw = os.getenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS")
-    if raw is None:
-        return _DEFAULT_EXCLUDED_SCHEMAS
-    return frozenset(s.strip() for s in raw.split(",") if s.strip())
-
-
-def node_prefix() -> str:
-    """dbt node-id prefix (``model.<project>.``) from ``DP_DBT_PROJECT``."""
-    project = os.getenv("DP_DBT_PROJECT", "").strip()
-    if not project:
-        raise ConfigError(
-            "DP_DBT_PROJECT must be set (your dbt project name) to scan for "
-            "dbt orphans."
-        )
-    return f"model.{project}."
-
-
-def invocation_command() -> str | None:
-    """Optional ``invocation_command`` filter from ``DP_DBT_INVOCATION_COMMAND``.
-
-    When unset, all ``dbt build`` invocations count.
-    """
-    return os.getenv("DP_DBT_INVOCATION_COMMAND") or None
-
-
+# excluded_schemas / node_prefix / invocation_command used to live here as this
+# module's own env-var readers (DP_DBT_PROJECT, DP_DBT_ORPHANS_EXCLUDE_SCHEMAS,
+# DP_DBT_INVOCATION_COMMAND), scoped to the single legacy project a whole
+# installation shared. Named dbt projects made that scope wrong -- the same
+# warehouse can now be scanned on behalf of different projects with different
+# settings -- so they moved to dataplat.services.dbt.settings, which takes the
+# project explicitly. They are not re-exported from here: nothing in this
+# module calls them (the functions below that share their names --
+# fetch_deprecated_objects's excluded_schemas parameter, diff_orphans's,
+# fetch_live_model_relations's invocation_command/node_prefix -- take the
+# already-resolved value as an argument instead), and this module stays a
+# generic multi-engine SQL service with no dependency on the dbt project
+# registry. DBT_ARTIFACTS_SCHEMA moved with them -- it is what
+# dataplat.services.dbt.settings's DEFAULT_EXCLUDED_SCHEMAS is built from, and
+# is not redefined here a second time. The CLI (dataplat.cli.dbt.orphans),
+# the one real caller, imports them straight from
+# dataplat.services.dbt.settings.
 LIVE_STATUSES: frozenset[str] = frozenset({"success", "error"})
 
 ObjectKind = Literal["table", "view", "matview"]
@@ -503,12 +483,24 @@ def diff_orphans(
     excluded_schemas: frozenset[str],
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
+    is_produced: Callable[[str], bool] | None = None,
 ) -> dict[str, list[str]]:
     """Return ``{schema: [names]}`` of orphans after applying all exclusions.
 
     An object is an orphan when it exists in the warehouse but is not in the
     live dbt model set. Names already ending in ``DEPRECATED_SUFFIX`` are
     skipped, as are the excluded schemas and user-excluded relations.
+
+    ``is_produced``, when given, is one more way for a name to survive the
+    live-model check: a name it accepts is not an orphan even though it was
+    absent from ``live`` (e.g. a dbt project's own manifest still claims it,
+    or it is a partition child of something the manifest claims). It is
+    folded into the same candidate-building comprehension as the other
+    checks rather than applied as a separate pass afterward, so there is one
+    place where orphan status is decided, not two that could disagree.
+    Optional and defaulting to ``None`` so a caller with no manifest to
+    consult (the legacy, pre-named-project path this module has always
+    supported) gets the exact behaviour it always had.
     """
     orphans: dict[str, list[str]] = {}
     for schema, names in existing.items():
@@ -521,6 +513,7 @@ def diff_orphans(
             if name not in live_names
             and not name.endswith(DEPRECATED_SUFFIX)
             and (schema, name) not in excluded_user_relations
+            and (is_produced is None or not is_produced(name))
         }
         if candidates:
             orphans[schema] = sorted(candidates)

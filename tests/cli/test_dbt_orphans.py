@@ -12,8 +12,8 @@ import pytest
 from typer.testing import CliRunner
 
 from dataplat.cli import _prompt
-from dataplat.cli.db import dbt_orphans as do
-from dataplat.cli.db.dbt_orphans import _parse_exclusions
+from dataplat.cli.dbt import orphans as do
+from dataplat.cli.dbt.orphans import _parse_exclusions
 from dataplat.core.errors import ConfigError, ExitCode, ValidationError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import DEPRECATED_SUFFIX
@@ -118,7 +118,15 @@ runner = CliRunner()
 SCHEMA = "ana[/x]lytics"
 ORPHAN = "orders[bold]"
 DEPRECATED = f"{ORPHAN}{DEPRECATED_SUFFIX}"
-LABEL = "postgres"
+# A target name, not an engine family: this is what production actually
+# produces as the identity threaded through the summary, the audit log's
+# `database` field, and revert's log filter (see _engines_for_project's
+# docstring). It used to be "postgres" here, which no real invocation can
+# write anymore -- a label the fixture alone could still produce hid the
+# Critical where revert's post-fix filter could no longer match any log
+# written before that fix (see _LEGACY_ENGINE_LABELS for the backward
+# compatibility that now covers that case for real logs).
+LABEL = "demo_pg"
 
 
 class _Cursor:
@@ -159,6 +167,43 @@ def no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_prompt, "sys", SimpleNamespace(stdin=_Stdin(False)))
 
 
+def _give_project_a_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    prefix: str,
+    *,
+    project_name: str,
+    produced: set[str] = frozenset({"kept"}),
+) -> None:
+    """Point ``<prefix>_DBT_PATH`` at a throwaway project with a manifest.
+
+    conftest's demo_project/demo_other fixtures are tracked in git and have
+    no target/manifest.json -- writing one into them directly would leave
+    residue behind after the run (the same reason
+    tests/services/dbt/test_manifest.py builds its own throwaway projects
+    under tmp_path). ``_preflight_produced`` now reads the manifest for
+    every named project resolved for the run, so any test that reaches it
+    through a real project needs one to exist; this builds a disposable
+    stand-in instead of touching the tracked fixture.
+
+    ``produced`` defaults to ``{"kept"}`` -- the name every test in this file
+    already treats as the live, non-orphan relation -- so a test that does
+    not care about manifest-awareness itself still gets a non-empty produced
+    set (an empty one is refused) that does not happen to spare ``ORPHAN``.
+    """
+    project_dir = tmp_path / f"{prefix.lower()}_manifest_project"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").write_text(f"name: {project_name}\n")
+    target_dir = project_dir / "target"
+    target_dir.mkdir()
+    nodes = {
+        f"model.demo.{name}": {"name": name, "resource_type": "model"}
+        for name in produced
+    }
+    (target_dir / "manifest.json").write_text(json.dumps({"nodes": nodes}))
+    monkeypatch.setenv(f"{prefix}_DBT_PATH", str(project_dir))
+
+
 @pytest.fixture
 def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     """A one-orphan warehouse with every write recorded instead of executed."""
@@ -173,8 +218,8 @@ def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
     monkeypatch.setattr(do, "LOG_DIR", state.log_dir)
     monkeypatch.setattr(
         do,
-        "_engines_for_target",
-        lambda name: [(LABEL, SqlEngine.postgresql, "DEMO_PG")],
+        "_engines_for_project",
+        lambda project, target: [(LABEL, SqlEngine.postgresql, "DEMO_PG", None)],
     )
     monkeypatch.setattr(
         do,
@@ -187,8 +232,8 @@ def warehouse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         yield _Conn()
 
     monkeypatch.setattr(do, "open_transactional_connection", _open)
-    monkeypatch.setattr(do, "node_prefix", lambda: "model.demo.")
-    monkeypatch.setattr(do, "invocation_command", lambda: None)
+    monkeypatch.setattr(do, "node_prefix", lambda project=None: "model.demo.")
+    monkeypatch.setattr(do, "invocation_command", lambda project=None: None)
     monkeypatch.setattr(
         do,
         "fetch_live_model_relations",
@@ -340,10 +385,275 @@ def test_scan_rejects_zero_window(warehouse: SimpleNamespace) -> None:
 
 
 def test_scan_unknown_target_exits_invalid_input(tmp_path: Path) -> None:
-    """No `warehouse` fixture: that one stubs out target resolution entirely."""
+    """No `warehouse` fixture: that one stubs out project/target resolution
+    entirely. ``nope`` isn't declared by the default project (``demo_project``),
+    so it is rejected the same way a target outside the project always is.
+    """
     result = _scan(["--target", "nope", "--log", str(tmp_path / "s.json")])
     assert result.exit_code == ExitCode.INVALID_INPUT
-    assert "Unknown target" in result.output
+    assert "does not build into" in result.output
+
+
+def test_engines_for_project_falls_back_to_legacy_targets_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Critical regression: DP_DBT_PROJECTS unset must not make this command
+    refuse to run. An installation that has never adopted named projects has
+    to keep working exactly as it always did -- resolving DP_TARGETS
+    directly, with project=None riding along so the legacy env-var readers in
+    dataplat.services.dbt.settings take over.
+
+    tests/conftest.py sets DP_DBT_PROJECTS for the whole suite, so it has to
+    be explicitly unset here -- otherwise this test exercises the named-
+    project path, not the legacy fallback, and would pass for the wrong
+    reason. That gap is exactly how this regression shipped once already:
+    every test in this file goes through the `warehouse` fixture, which
+    stubs `_engines_for_project` outright and so never touches either branch
+    for real.
+    """
+    monkeypatch.delenv("DP_DBT_PROJECTS", raising=False)
+    monkeypatch.delenv("DP_DBT_DEFAULT_PROJECT", raising=False)
+
+    engines = do._engines_for_project(None, None)
+
+    assert {(label, proj) for label, _engine, _env_prefix, proj in engines} == {
+        ("demo_pg", None),
+        ("demo_pg2", None),
+        ("demo_rs", None),
+    }
+
+
+def test_engines_for_project_with_explicit_project_ignores_the_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy fallback only fires when no ``--project`` was given at all.
+    An operator naming a project explicitly while DP_DBT_PROJECTS happens to
+    be unset asked for that project by name -- silently resolving every
+    DP_TARGETS target instead would scan warehouses that project may never
+    touch, which is a worse failure mode than the honest error below.
+    """
+    monkeypatch.delenv("DP_DBT_PROJECTS", raising=False)
+    monkeypatch.delenv("DP_DBT_DEFAULT_PROJECT", raising=False)
+
+    result = _scan(["--project", "demo_project"])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT
+    assert "No dbt projects configured" in result.output
+
+
+def test_scan_config_error_from_project_resolution_exits_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``default_project_name()`` can raise ``ConfigError`` (a
+    DP_DBT_DEFAULT_PROJECT that names a project DP_DBT_PROJECTS does not
+    declare), not just ``ValidationError`` -- the gate has to catch
+    ``DataplatError``, or this escapes as a raw traceback instead of the
+    documented exit 3. No `warehouse` fixture: this fails during resolution,
+    before any connection is even attempted.
+    """
+    monkeypatch.setenv("DP_DBT_DEFAULT_PROJECT", "not_a_real_project")
+
+    result = _scan(["--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == ExitCode.CONFIG, result.output
+    assert "not_a_real_project" in result.output
+
+
+def test_scan_resolves_a_real_named_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every other test in this file goes through the ``warehouse`` fixture,
+    which stubs ``_engines_for_project`` to always hand back ``project=None``
+    -- the legacy-fallback shape, not what a real ``DP_DBT_PROJECTS``
+    installation (conftest's own demo_project/demo_other) actually produces.
+    That gap is exactly how the legacy-fallback regression above once passed
+    a green suite: every test here exercised the one path production could no
+    longer reach. This one runs the real resolution --
+    ``_engines_for_project``, ``node_prefix``, ``invocation_command``,
+    ``excluded_schemas`` all resolve against the genuine ``demo_project``
+    fixture -- and only stubs the warehouse layer below it (connection,
+    cursor, catalog queries).
+    """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
+    state = SimpleNamespace(present={SCHEMA: {ORPHAN, "kept"}})
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: {"kept"}}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {SCHEMA: {ORPHAN, "kept"}},
+    )
+
+    def _classify(cur: object, schema: str, name: str, **kw: object) -> str | None:
+        return "table" if name in state.present.get(schema, set()) else None
+
+    monkeypatch.setattr(do, "classify_object", _classify)
+
+    result = _scan(
+        ["-p", "demo_project", "-t", "demo_pg", "--log", str(tmp_path / "s.json")]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The identity threaded through the summary and the log is the target's
+    # own name, not its engine family -- "demo_pg", not "postgres" -- so two
+    # same-engine targets in one fan-out can never be confused with each
+    # other (see _engines_for_project's docstring).
+    assert "[demo_pg]" in result.output
+    logged = json.loads((tmp_path / "s.json").read_text())
+    assert logged["dry_run"] is True
+    assert logged["renames"][0]["database"] == "demo_pg"
+
+
+def test_summary_distinguishes_two_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Important Finding 4's motivating case: two targets that share an
+    engine (demo_pg, demo_pg2 -- both postgresql, see tests/conftest.py) must
+    produce two distinguishable summary blocks, not two identical-looking
+    ``[postgres]`` ones. Before the fix, the label threaded through
+    ``_print_summary`` was ``_ENGINE_LABELS[tgt.engine]`` -- the engine
+    family, not the target -- so this exact scenario would have printed the
+    same tag twice with no way to tell which block belonged to which cluster.
+    """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do, "fetch_live_model_relations", lambda cur, **kw: {SCHEMA: {"kept"}}
+    )
+    monkeypatch.setattr(
+        do,
+        "fetch_existing_relations",
+        lambda cur, schemas, **kw: {SCHEMA: {ORPHAN, "kept"}},
+    )
+    monkeypatch.setattr(do, "classify_object", lambda cur, schema, name, **kw: "table")
+
+    result = _scan(["-p", "demo_project", "--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == 0, result.output
+    assert "[demo_pg]" in result.output
+    assert "[demo_pg2]" in result.output
+    # Two distinct summary blocks, not the same tag printed twice.
+    assert result.output.count("live dbt models") == 2
+
+
+def test_revert_filters_log_entries_by_target_not_by_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The data-correctness case Important Finding 4 exists to prevent: two
+    targets sharing an engine (demo_pg, demo_pg2) must never have their audit
+    log entries cross-applied during revert. Before the fix, the audit log's
+    ``database`` field held the *engine* label, so demo_pg's and demo_pg2's
+    entries would have been indistinguishable from each other's -- revert
+    could restore one cluster's objects using the other cluster's history.
+
+    Each ``rename_object`` call here records which target's connection was
+    open when it happened (via the stubbed ``resolve_orphans_connection_params``
+    / ``open_transactional_connection``, which thread the env_prefix through
+    as a stand-in for "params"), so cross-contamination would show up as a
+    rename recorded under the wrong target's connection, not merely as an
+    entry being skipped.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log = tmp_path / "revert.log.json"
+    log.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "demo_pg",
+                        "schema": SCHEMA,
+                        "old_name": "pg_orphan",
+                        "new_name": f"pg_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                    {
+                        "database": "demo_pg2",
+                        "schema": SCHEMA,
+                        "old_name": "pg2_orphan",
+                        "new_name": f"pg2_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                ],
+            }
+        )
+    )
+
+    present = {f"pg_orphan{DEPRECATED_SUFFIX}", f"pg2_orphan{DEPRECATED_SUFFIX}"}
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: env_prefix,
+    )
+
+    open_connections: list[str] = []
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        open_connections.append(str(params))
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+    monkeypatch.setattr(
+        do,
+        "classify_object",
+        lambda cur, schema, name, **kw: "table" if name in present else None,
+    )
+
+    reverted: list[tuple[str, str, str]] = []
+
+    def _rename(
+        cur: object, schema: str, old: str, new: str, kind: str, **kw: object
+    ) -> None:
+        reverted.append((open_connections[-1], old, new))
+
+    monkeypatch.setattr(do, "rename_object", _rename)
+
+    result = _scan(["revert", "-p", "demo_project", "--no-dry-run", "--log", str(log)])
+
+    assert result.exit_code == 0, result.output
+    assert reverted == [
+        ("DEMO_PG", f"pg_orphan{DEPRECATED_SUFFIX}", "pg_orphan"),
+        ("DEMO_PG2", f"pg2_orphan{DEPRECATED_SUFFIX}", "pg2_orphan"),
+    ]
 
 
 def test_scan_unset_dbt_project_exits_config(
@@ -357,7 +667,9 @@ def test_scan_unset_dbt_project_exits_config(
     when nothing about retrying can set an environment variable.
     """
     monkeypatch.setattr(
-        do, "node_prefix", lambda: (_ for _ in ()).throw(ConfigError("DP_DBT_PROJECT"))
+        do,
+        "node_prefix",
+        lambda project=None: (_ for _ in ()).throw(ConfigError("DP_DBT_PROJECT")),
     )
     log = tmp_path / "s.json"
 
@@ -567,6 +879,190 @@ def test_purge_older_than_drops_once_past_the_grace_period(
     assert warehouse.dropped == [(SCHEMA, DEPRECATED)]
 
 
+def test_purge_older_than_recognizes_pre_upgrade_apply_logs(
+    warehouse: SimpleNamespace, no_tty: None, tmp_path: Path
+) -> None:
+    """The rename-age index has the same legacy-value problem revert's log
+    filter does: an apply log written before target-name identity existed
+    keys its entries on the engine family ("postgres"), not a target name.
+    ``--older-than`` has to keep recognizing it as a recorded rename, or
+    every pre-upgrade rename looks unrecorded and is skipped (silently,
+    without --include-unknown) instead of purged once its grace period has
+    actually passed. See _LEGACY_ENGINE_LABELS.
+    """
+    when = datetime.now(UTC) - timedelta(days=30)
+    path = warehouse.log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        # The legacy value: what an apply log written before
+                        # this migration actually contains.
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = _scan(
+        [
+            "purge",
+            "--no-dry-run",
+            "--yes",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert warehouse.dropped == [(SCHEMA, DEPRECATED)]
+    assert "no recorded rename" not in result.output
+
+
+def test_purge_refuses_ambiguous_legacy_rename_age_across_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The variant that matters, applied to the rename-age index: an old
+    apply log's "postgres"-labeled entry cannot be safely attributed to
+    demo_pg's grace period vs demo_pg2's -- that information was never
+    recorded. Purging across both (unscoped) with --older-than must refuse
+    the whole invocation rather than apply the recorded age to whichever
+    target happens to have a matching deprecated object, which risks
+    purging one target's object on the strength of another's grace period.
+    See _ambiguous_legacy_conflicts.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    when = datetime.now(UTC) - timedelta(days=30)
+    apply_log = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    apply_log.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(
+        [
+            "purge",
+            "-p",
+            "demo_project",
+            "--no-dry-run",
+            "--yes",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
+
+
+def test_purge_ambiguity_check_runs_before_the_confirmation_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``purge`` used to run ``confirm_or_exit`` before the legacy-ambiguity
+    check, so an operator confirmed an irreversible drop and was *then*
+    refused -- training people to confirm blind. Proven by making
+    ``confirm_or_exit`` itself raise if it is ever reached: with the ordering
+    fixed, the ambiguity refusal fires first and ``confirm_or_exit`` is never
+    called at all (not even reached to check ``--yes``, which is why this
+    test does not pass it).
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    when = datetime.now(UTC) - timedelta(days=30)
+    apply_log = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    apply_log.write_text(
+        json.dumps(
+            {
+                "generated_at": when.isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    def _forbid_confirm(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "the ambiguity refusal must fire before the operator is asked to confirm"
+        )
+
+    monkeypatch.setattr(do, "confirm_or_exit", _forbid_confirm)
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(
+        [
+            "purge",
+            "-p",
+            "demo_project",
+            "--no-dry-run",
+            "--older-than",
+            "7",
+            "--log",
+            str(tmp_path / "p.json"),
+        ]
+    )
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
+
+
 # --- revert -------------------------------------------------------------
 
 
@@ -733,6 +1229,285 @@ def test_revert_warns_when_the_log_was_a_dry_run(
     assert "generated in dry-run mode" in result.output
 
 
+def test_revert_still_works_against_a_log_written_before_this_migration(
+    warehouse: SimpleNamespace, tmp_path: Path
+) -> None:
+    """A log written before target-name identity existed carries the legacy
+    engine-family value ("postgres"/"redshift") as `database`, not a target
+    name. Revert has to keep matching it: refusing to recognize the legacy
+    value at all would make revert silently no-op every pre-upgrade rename
+    while still reporting success -- and purge, which scans the catalog
+    rather than the log, would then permanently drop objects revert claimed
+    to have already restored. See _LEGACY_ENGINE_LABELS.
+
+    This is the unambiguous case the fallback exists for: exactly one
+    Postgres target (the `warehouse` fixture's single stubbed engine) is in
+    play, so the legacy value can only mean that target. See the sibling
+    test below for what happens when it cannot.
+    """
+    warehouse.present[SCHEMA] = {DEPRECATED}
+    path = tmp_path / "legacy.log.json"
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        # The legacy value: what a log written before this
+                        # migration actually contains, not a target name.
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = _scan(["revert", "--no-dry-run", "--log", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert warehouse.renamed == [(SCHEMA, DEPRECATED, ORPHAN)]
+
+
+def test_revert_refuses_ambiguous_legacy_entries_across_same_engine_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The variant that matters: an old-format log where *both* entries say
+    "database": "postgres" cannot be safely attributed to demo_pg vs
+    demo_pg2 -- that information was never recorded. Reverting across both
+    (unscoped) must refuse the whole invocation rather than apply every
+    "postgres" entry to both targets, which would be exactly the
+    cross-application Important Finding 4 fixed, reintroduced for legacy
+    logs instead of new ones. See _ambiguous_legacy_conflicts.
+    """
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_pg2,demo_rs")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_pg2")
+
+    log = tmp_path / "legacy.log.json"
+    log.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": "pg_orphan",
+                        "new_name": f"pg_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                    {
+                        "database": "postgres",
+                        "schema": SCHEMA,
+                        "old_name": "pg2_orphan",
+                        "new_name": f"pg2_orphan{DEPRECATED_SUFFIX}",
+                        "kind": "table",
+                    },
+                ],
+            }
+        )
+    )
+
+    def _forbid_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused invocation must not open a connection")
+
+    monkeypatch.setattr(do, "open_transactional_connection", _forbid_open)
+
+    result = _scan(["revert", "-p", "demo_project", "--no-dry-run", "--log", str(log)])
+
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert "postgres" in result.output
+    assert "demo_pg" in result.output
+    assert "demo_pg2" in result.output
+
+
+def test_revert_refuses_when_the_auto_selected_log_matches_no_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The false-success shape a whole-branch review caught: two apply logs
+    sit on disk, the newest belongs to a target this invocation was never
+    scoped to, ``--log`` is not passed, and revert auto-selects that newest
+    log. Before this fix that printed "No entries in log" and "Reverted 0
+    object(s)" and exited 0 -- the operator believes the renames were
+    undone, and ``purge`` (which scans the catalog, not the log) would later
+    drop them for good. Same shape as the pre-upgrade-log Critical this
+    branch already fixed for a *mismatched engine label*; this is the
+    mismatched-log-entirely variant. Only the auto-selected case refuses --
+    see the sibling test below for an explicitly passed log, which must not.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    def _write_log(path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "dry_run": False,
+                    "source": "dbt-orphans",
+                    # demo_project's target (see conftest.py), not one
+                    # demo_other declares -- DEMO_OTHER_DBT_TARGETS=demo_rs.
+                    "renames": [
+                        {
+                            "database": "demo_pg",
+                            "schema": SCHEMA,
+                            "old_name": ORPHAN,
+                            "new_name": DEPRECATED,
+                            "kind": "table",
+                        }
+                    ],
+                }
+            )
+        )
+
+    older = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    newer = log_dir / f"{do.APPLY_LOG_PREFIX}-20240202T000000Z.log.json"
+    _write_log(older)
+    _write_log(newer)
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert str(newer) in out
+    assert "auto-selected" in out
+    assert "--log" in out
+
+
+def test_revert_explicit_log_matching_no_target_still_reports_zero_reverted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sibling of the test above: an *explicitly* passed ``--log``
+    matching no target in the invocation is the operator's own choice, and
+    keeps the pre-existing behaviour -- "No entries in log", "Reverted 0
+    object(s)", exit 0. Only the auto-selected case (above) refuses.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    mismatched = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    mismatched.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [
+                    {
+                        "database": "demo_pg",
+                        "schema": SCHEMA,
+                        "old_name": ORPHAN,
+                        "new_name": DEPRECATED,
+                        "kind": "table",
+                    }
+                ],
+            }
+        )
+    )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other", "--log", str(mismatched)])
+
+    out = _flat(result.output)
+    assert result.exit_code == 0, result.output
+    assert "No entries in log" in out
+    assert "Reverted 0 object(s)" in out
+
+
+def test_revert_refuses_when_the_auto_selected_log_has_no_renames_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same false-success door, reached differently: the log this time
+    has *zero* renames recorded at all (not merely zero matching this
+    invocation's targets) -- the early "nothing to revert" return, which
+    sits before the per-target matching this file's other new tests cover.
+    An empty log is exactly as likely to be the wrong log (a later scan
+    that happened to find nothing, written under the same prefix) as it is
+    proof there was nothing to revert, so the auto-selected case refuses
+    here too. Only reachable now that the apply path's own preflight
+    refusal (see test_dbt_orphans_manifest.py) writes exactly this shape of
+    log -- a bad manifest refuses before any renames, leaving an empty log
+    behind -- which made this door easier to walk through than it used to
+    be.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    older = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    newer = log_dir / f"{do.APPLY_LOG_PREFIX}-20240202T000000Z.log.json"
+    for path in (older, newer):
+        path.write_text(
+            json.dumps(
+                {
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "dry_run": False,
+                    "source": "dbt-orphans",
+                    "renames": [],
+                }
+            )
+        )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other"])
+
+    out = _flat(result.output)
+    assert result.exit_code == ExitCode.INVALID_INPUT, result.output
+    assert str(newer) in out
+    assert "auto-selected" in out
+    assert "--log" in out
+
+
+def test_revert_explicit_log_with_no_renames_still_reports_nothing_to_revert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sibling of the test above: an *explicitly* passed ``--log`` with
+    no renames recorded is the operator's own choice, and keeps the
+    pre-existing behaviour -- "No renames recorded in the log; nothing to
+    revert.", exit 0. Only the auto-selected case (above) refuses.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(do, "LEGACY_LOG_DIR", tmp_path / "absent")
+
+    empty = log_dir / f"{do.APPLY_LOG_PREFIX}-20240101T000000Z.log.json"
+    empty.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "dry_run": False,
+                "source": "dbt-orphans",
+                "renames": [],
+            }
+        )
+    )
+
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["revert", "-p", "demo_other", "--log", str(empty)])
+
+    out = _flat(result.output)
+    assert result.exit_code == 0, result.output
+    assert "No renames recorded in the log; nothing to revert." in out
+
+
 # --- the [engine] line prefix -------------------------------------------
 
 
@@ -804,7 +1579,7 @@ def test_log_discovery_still_globs_the_timestamp(
 # compared byte for byte afterwards.
 #
 # Note these tests do *not* use the `warehouse` fixture, which stubs out
-# `_engines_for_target` — the very function that refuses.
+# `_engines_for_project` — the very function that refuses.
 
 
 def _flat(text: str) -> str:
@@ -833,6 +1608,11 @@ def _duckdb_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("DDB_ENGINE", "duckdb")
     monkeypatch.setenv("DDB_PATH", str(path))
     monkeypatch.delenv("DP_DEFAULT_TARGET", raising=False)
+    # The default project (demo_project) must declare ddb as one of its own
+    # targets, or `projects_and_targets` rejects `--target ddb` with "does not
+    # build into" before the capability gate this test is actually exercising
+    # is ever reached.
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "ddb")
     return path
 
 
@@ -850,7 +1630,7 @@ def _forbid_connections(monkeypatch: pytest.MonkeyPatch) -> None:
 def _assert_rename_refusal(result: Any) -> None:
     out = _flat(result.output)
     assert result.exit_code == ExitCode.INVALID_INPUT, result.output
-    assert "[ddb] dp db dbt-orphans cannot run against DuckDB" in out
+    assert "[ddb] dp dbt orphans cannot run against DuckDB" in out
     # The engine fact...
     assert "ALTER TABLE ... RENAME TO fails with a DependencyException" in out
     assert "no CASCADE" in out
@@ -876,6 +1656,39 @@ def test_scan_refuses_a_duckdb_target(
     # Nothing was renamed, and no audit log claims anything was.
     assert not log.exists()
     assert path.read_bytes() == before
+
+
+def test_scan_refuses_a_duckdb_target_carrying_libpq_variables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A DuckDB target can carry stale libpq-shaped env vars -- HOST/USER/
+    PASSWORD/DATABASE left over from before it was reconfigured to
+    ``duckdb``, say. ``_connection_identity`` is called for *every* resolved
+    target by the overlap check, which runs before the capability gate (see
+    ``_engines_for_project``'s docstring), and used to catch only
+    ``ConfigError`` -- but ``resolve_connection_params`` raises
+    ``ValidationError`` for a non-libpq engine (the return type is
+    libpq-shaped and has nowhere to put a DuckDB target's settings). That
+    escaped as a generic "connects over the PostgreSQL wire protocol"
+    message naming `dp db query`/`describe`/`top-tables` -- not this command
+    -- and with no target-name prefix, instead of the specific capability
+    refusal below. Catching ``DataplatError`` fixes it: the target is
+    excluded from the overlap check ("cannot tell" is not "distinct" -- see
+    ``_connection_identity``'s docstring) and the invocation reaches the
+    real refusal, proven here with the exact same assertion every other
+    DuckDB-refusal test in this file uses.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DDB_HOST", "localhost")
+    monkeypatch.setenv("DDB_PORT", "5432")
+    monkeypatch.setenv("DDB_USER", "svc")
+    monkeypatch.setenv("DDB_PASSWORD", "x")
+    monkeypatch.setenv("DDB_DATABASE", "analytics")
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["--target", "ddb"])
+
+    _assert_rename_refusal(result)
 
 
 def test_scan_refuses_a_duckdb_target_before_the_gate(
@@ -933,7 +1746,8 @@ def test_revert_refuses_a_duckdb_target_before_looking_for_a_log(
 def test_all_refuses_when_one_target_cannot_rename(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`-t all` is the default, and this command renames and drops.
+    """Every declared target is the default (no ``--target``), and this command
+    renames and drops.
 
     Deliberately not per-target degradation: a partly-applied destructive run is
     the outcome worth avoiding most, and the refusal names the target so the
@@ -941,8 +1755,102 @@ def test_all_refuses_when_one_target_cannot_rename(
     """
     _duckdb_target(monkeypatch, tmp_path)
     monkeypatch.setenv("DP_TARGETS", "demo_pg,ddb")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,ddb")
     _forbid_connections(monkeypatch)
 
-    result = _scan(["--target", "all", "--log", str(tmp_path / "s.json")])
+    result = _scan(["--log", str(tmp_path / "s.json")])
 
     _assert_rename_refusal(result)
+
+
+def test_all_refuses_across_a_genuinely_multi_project_fan_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The all-or-nothing refusal proven again across *projects*, not just
+    across targets within one project (see
+    ``test_all_refuses_when_one_target_cannot_rename`` above): demo_project's
+    own targets are fine, but demo_other now declares a DuckDB target that
+    cannot rename-with-dependents, and the whole ``-p all`` invocation must
+    refuse before any connection is opened for *any* project -- including
+    demo_project's, which would otherwise have worked.
+
+    demo_project (demo_pg, demo_rs) and demo_other (ddb) declare disjoint
+    targets here, deliberately -- overlapping targets are a different refusal
+    (see test_dbt_orphans_project.py's
+    test_orphans_refuses_projects_that_share_a_target), and this test would
+    hit that one first instead of the capability gate it means to exercise.
+    """
+    _duckdb_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("DP_TARGETS", "demo_pg,demo_rs,ddb")
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg,demo_rs")
+    monkeypatch.setenv("DEMO_OTHER_DBT_TARGETS", "ddb")
+    _forbid_connections(monkeypatch)
+
+    result = _scan(["-p", "all", "--log", str(tmp_path / "s.json")])
+
+    _assert_rename_refusal(result)
+
+
+def test_all_fan_out_reaches_each_project_with_its_own_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The green case the two refusal tests above never exercise: a
+    genuinely multi-project ``-p all`` fan-out that *succeeds*, and reaches
+    each project's own targets with that project's own node prefix and
+    exclusions -- the entire reason ``_engines_for_project`` carries the
+    resolved project alongside each target rather than resolving one
+    globally for the whole run (see its docstring).
+
+    demo_project (demo_pg) and demo_other (demo_pg2) declare disjoint
+    targets here, deliberately, so this hits neither overlap refusal
+    (test_dbt_orphans_project.py) nor the capability refusal above -- this
+    test is only about whether the right settings reach the right target.
+    """
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_PROJECT", project_name="demo_project_from_yml"
+    )
+    _give_project_a_manifest(
+        monkeypatch, tmp_path, "DEMO_OTHER", project_name="ignored_because_env_wins"
+    )
+    monkeypatch.setenv("DEMO_PROJECT_DBT_TARGETS", "demo_pg")
+    monkeypatch.setenv("DEMO_OTHER_DBT_TARGETS", "demo_pg2")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(do, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        do,
+        "resolve_orphans_connection_params",
+        lambda engine, *, env_prefix: object(),
+    )
+
+    @contextlib.contextmanager
+    def _open(params: object, *, dry_run: bool) -> Iterator[_Conn]:
+        yield _Conn()
+
+    monkeypatch.setattr(do, "open_transactional_connection", _open)
+
+    seen_node_prefixes: list[str] = []
+
+    def _fetch_live(
+        cur: object, *, invocation_command: object, node_prefix: str, **kw: object
+    ) -> dict[str, set[str]]:
+        seen_node_prefixes.append(node_prefix)
+        return {SCHEMA: {"kept"}}
+
+    monkeypatch.setattr(do, "fetch_live_model_relations", _fetch_live)
+    monkeypatch.setattr(
+        do, "fetch_existing_relations", lambda cur, schemas, **kw: {SCHEMA: {"kept"}}
+    )
+
+    result = _scan(["-p", "all", "--log", str(tmp_path / "s.json")])
+
+    assert result.exit_code == 0, result.output
+    assert "[demo_pg]" in result.output
+    assert "[demo_pg2]" in result.output
+    # demo_project's own dbt_project.yml names it demo_project_from_yml;
+    # demo_other is named via DEMO_OTHER_DBT_NAME=explicit_name (conftest).
+    # Each target got its own project's node prefix, not one shared value.
+    assert sorted(seen_node_prefixes) == [
+        "model.demo_project_from_yml.",
+        "model.explicit_name.",
+    ]

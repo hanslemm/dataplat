@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 
 os.environ.pop("FORCE_COLOR", None)
 os.environ.pop("CLICOLOR", None)
@@ -31,7 +32,17 @@ os.environ["COLUMNS"] = "200"
 # assignment here silently erased it, so the documented target form could never
 # work under pytest. Appending keeps the demo targets authoritative and lets a
 # named cluster resolve alongside them.
-_DEMO_TARGETS = "demo_pg,demo_rs"
+#
+# demo_pg2 is a second Postgres target sharing demo_pg's engine, deliberately:
+# it exists so a test can prove two same-engine targets stay distinguishable
+# from each other (by target name, not by engine family) in a fan-out — see
+# tests/cli/test_dbt_orphans.py's same-engine disambiguation tests. It is
+# registered here (so `resolve_target("demo_pg2")` and connection-env lookups
+# work) but is not declared by demo_project or demo_other by default; tests
+# that need it in a project's fan-out monkeypatch that project's own
+# `*_DBT_TARGETS` locally, the same way the DuckDB-target tests already
+# monkeypatch one in to prove a different capability gate.
+_DEMO_TARGETS = "demo_pg,demo_pg2,demo_rs"
 _RS_TARGET = os.environ.get("DP_TEST_RS_TARGET", "").strip()
 os.environ["DP_TARGETS"] = (
     f"{_DEMO_TARGETS},{_RS_TARGET}"
@@ -40,6 +51,18 @@ os.environ["DP_TARGETS"] = (
 )
 os.environ["DEMO_PG_ENGINE"] = "postgresql"
 os.environ["DEMO_PG_REASSIGN_OWNER"] = "demo_pg_root"
+os.environ["DEMO_PG2_ENGINE"] = "postgresql"
+os.environ["DEMO_PG2_REASSIGN_OWNER"] = "demo_pg2_root"
+os.environ["DP_DBT_PROJECTS"] = "demo_project,demo_other"
+os.environ["DEMO_PROJECT_DBT_PATH"] = str(
+    Path(__file__).parent / "fixtures" / "demo_project"
+)
+os.environ["DEMO_PROJECT_DBT_TARGETS"] = "demo_pg,demo_rs"
+os.environ["DEMO_OTHER_DBT_PATH"] = str(
+    Path(__file__).parent / "fixtures" / "demo_other"
+)
+os.environ["DEMO_OTHER_DBT_NAME"] = "explicit_name"
+os.environ["DEMO_OTHER_DBT_TARGETS"] = "demo_rs"
 os.environ["DEMO_RS_ENGINE"] = "redshift"
 os.environ["DEMO_RS_REASSIGN_OWNER"] = "admin"
 os.environ.pop("DP_DEFAULT_TARGET", None)

@@ -21,7 +21,10 @@ dp
 │   ├── schema             # list | create | drop | grant | revoke | alter [2]
 │   │                      # impact — what outside the DB depends on it
 │   ├── top-tables         # rank big tables (--drop-sql, --drop)
-│   └── dbt-orphans        # scan/rename | revert | purge (--older-than) [1]
+│   └── dbt-orphans        # deprecated — moved to `dp dbt orphans`     [1]
+├── dbt                    # named dbt projects (DP_DBT_PROJECTS)
+│   └── orphans            # scan/rename | revert | purge (--older-than) [1]
+│                          # -p/--project, -t/--target — see "dbt projects"
 ├── ingest                 # data ingestion
 │   └── airbyte
 │       ├── connections    # list | get | create | update | set-cursor
@@ -248,12 +251,12 @@ all — every connection is the same implicit user, `duckdb`.
 | `role list` / `show` / `create` / `grant` / `drop` | ✓ | ✓ ¹ | ✗ | it has no users or roles at all — `pg_roles`, `pg_authid` and `pg_user` do not exist, and every connection is the same implicit user, `duckdb` |
 | `long-queries` | ✓ | ✓ | ✗ | it runs inside this process and has no `pg_stat_activity`: there are no other sessions to inspect |
 | `kill` | ✓ | ✓ | ✗ | the same — there is no other session to cancel |
-| `dbt-orphans` | ✓ | ✓ ² | ✗ | it quarantines an orphan by renaming it, and `ALTER TABLE … RENAME TO` fails with a `DependencyException` whenever a view depends on the table, which in a dbt project is the normal case. DuckDB has no `CASCADE` |
+| `dbt orphans` ⁶ | ✓ | ✓ ² | ✗ | it quarantines an orphan by renaming it, and `ALTER TABLE … RENAME TO` fails with a `DependencyException` whenever a view depends on the table, which in a dbt project is the normal case. DuckDB has no `CASCADE` |
 
 ¹ `dp db role show` reports `Password set: unknown` on Redshift: there is no
 `pg_authid`, and `pg_user.passwd` is masked to `'********'` for every row, so
 the question cannot be answered rather than answered wrongly.
-² `dp db dbt-orphans` does not consider materialized views on Redshift: there is
+² `dp dbt orphans` does not consider materialized views on Redshift: there is
 no `pg_matviews` catalog listing them.
 ³ `dp db schema list` adds Used/Quota columns on Redshift, the only engine with
 schema quotas. `svv_schema_quota_state` is version-dependent, so an unavailable
@@ -267,6 +270,11 @@ schemas out of `pg_namespace` entirely. `dp db schema create` works but rejects
 Redshift the flag warns and is skipped when there is other work to do, and is an
 error when it is the only change requested — a silent skip there would report
 success having done nothing.
+⁶ Moved out of `dp db` into its own area — see [dbt projects](#dbt-projects).
+`dp db dbt-orphans` still works exactly as before (same subcommands, same
+flags); both `dp db --help` and its own `--help` mark it **(deprecated)** with
+a pointer to `dp dbt orphans`, and running it prints a `DeprecationWarning` to
+stderr, where it cannot corrupt `--json` or other scripted output.
 
 A refused command **exits 2** — "a combination of arguments that cannot work",
 the same code as an unknown flag or an unknown target — and says which engine
@@ -382,6 +390,98 @@ also says: DuckDB does **not** block `DROP TABLE` on a dependent view — it
 leaves the view broken — while a foreign-key child does block it, and there is no
 `CASCADE`.
 
+## dbt projects
+
+`dp dbt` is the area for dbt-aware commands. Today it has one: `orphans`
+(scan/rename, `revert`, `purge --older-than`) — the same command that used to
+live at `dp db dbt-orphans`, moved here so it can be scoped to a *named*
+project instead of the single project a whole installation used to share.
+
+```bash
+export DP_DBT_PROJECTS="betterdoc,betterdoc_qa"
+export DP_DBT_DEFAULT_PROJECT="betterdoc"        # used when --project is omitted
+
+export BETTERDOC_DBT_PATH=~/repos/betterdoc/dbt        # dir with dbt_project.yml
+export BETTERDOC_DBT_TARGETS="warehouse,lake"           # DP_TARGETS names it builds into
+# export BETTERDOC_DBT_PROFILES_DIR=...                 # optional, defaults to _DBT_PATH
+# export BETTERDOC_DBT_NAME=...                         # optional, defaults to dbt_project.yml's name:
+
+export BETTERDOC_QA_DBT_PATH=~/repos/betterdoc/dbt
+export BETTERDOC_QA_DBT_TARGETS="qa"
+
+dp dbt orphans                        # scans BETTERDOC (the default project)
+dp dbt orphans -p betterdoc_qa        # scans the named project instead
+dp dbt orphans -p all                 # every configured project, each with its own settings
+dp dbt orphans -p betterdoc -t lake   # narrow to one of the project's own targets
+```
+
+`<NAME>` above is the **project** name, not a target name — `DP_DBT_PROJECTS`
+is its own registry, parallel to `DP_TARGETS` but one level up: a project
+declares *which* targets (already-configured `DP_TARGETS` names) it builds
+into, and `-p`/`--project` picks the project the way `-t`/`--target` picks a
+target within it. `-t all` is accepted under a configured project exactly as
+it always was on the legacy path below — identical to omitting `-t`.
+
+**No `DP_DBT_PROJECTS` at all** falls back to the pre-project shape this
+command has always had: `DP_DBT_PROJECT` (a bare dbt project name, not a
+path) plus `DP_TARGETS`/`--target` directly. An installation that has not
+adopted named projects keeps working unchanged. `DP_DBT_INVOCATION_COMMAND`
+and `DP_DBT_ORPHANS_EXCLUDE_SCHEMAS` are read on this path; once a project is
+configured, `<NAME>_DBT_INVOCATION_COMMAND` / `<NAME>_DBT_ORPHANS_EXCLUDE_SCHEMAS`
+take precedence per project, falling back to the same two legacy variables
+when a project does not set its own.
+
+Three things this command refuses to guess at, because it renames and later
+drops what it finds:
+
+- **Two projects sharing a warehouse in one invocation.** Each project's live
+  dbt-model set is scoped to itself, so scanning the same target once per
+  project would see the *other* project's live tables as its own orphans —
+  under `-p all --no-dry-run` that is one project's production tables
+  quarantined as another's garbage. Caught by target name, and (best-effort)
+  by matching host/port/database across differently-named targets on one
+  cluster. Run the overlapping projects one at a time (`--project <name>`)
+  instead.
+- **An old-format audit log or rename-age record that cannot be attributed to
+  one target.** A log written before named projects existed recorded only the
+  engine family (`postgres`/`redshift`), not which target produced it;
+  `revert` and `purge --older-than` still read it, but refuse when more than
+  one configured target shares that engine — the log cannot tell them apart.
+  Rerun scoped to one target with `--target` to make it unambiguous.
+- **`revert` with no `--log` picks the newest log on disk**, and if none of
+  its entries belong to any target in this invocation, it refuses rather than
+  reporting a hollow "Reverted 0 object(s)" success — the log is very likely
+  the wrong one (a different project's run), not proof there was nothing to
+  revert. The same reasoning covers a log with no renames recorded at all: an
+  auto-picked empty log could just as easily be the wrong log as a clean
+  scan, so `revert` run unconditionally straight after a scan — a runbook, a
+  CI step — now exits non-zero on a run that found nothing, where it used to
+  exit 0. Pass `--log` explicitly to confirm which log you mean, which is
+  also what keeps that kind of run non-interactive; an explicitly passed log
+  that matches nothing, or has nothing recorded, is your own call and is
+  left alone.
+
+A project with a compiled manifest (`target/manifest.json`, from `dbt compile`
+or `dbt docs generate`) gets one more thing: a relation the manifest still
+claims to produce is spared even if it has not rebuilt inside `--window-days`,
+and so is a partition child of a produced parent. A manifest that cannot be
+read at all, or that reports zero produced relations, refuses outright —
+diffing against nothing would flag everything already in scope as an orphan.
+This changes what `--window-days` means, but does not remove it from the
+picture: a relation built inside the window is still always spared, and the
+window still decides which schemas get scanned and which builds count as
+live — so a smaller window still means more rename candidates. What changes
+is that the window stops being the *only* way to be spared: a relation the
+manifest still claims to produce survives even if it has not rebuilt inside
+the window. On the legacy no-project path there is no manifest, so the
+window stays the sole criterion, exactly as before.
+
+The scan assumes it is the only dbt project writing into the schemas it
+scans — it has no way to attribute an existing table to a *different* dbt
+project that also happens to write into scope, so two dbt projects sharing
+schemas outside of a declared `DP_DBT_PROJECTS` overlap (see above) is a
+known, undetected hazard, not a case that raises.
+
 ## CI: GitHub runners
 
 `dp ci github runner` runs a self-hosted GitHub Actions runner in Docker,
@@ -429,9 +529,15 @@ private key reaches docker through the process environment, never argv.
 | `DP_AWS_PROFILE_ALIASES` | Short aliases, e.g. `prod=AdminAccess-Prod,qa=AdminAccess-QA`. |
 | `DP_AWS_REGION` | Default AWS region (falls back to `AWS_REGION`, then the profile). |
 | `DP_RDS_INSTANCE` | Default RDS instance for `dp cloud aws rds` / `dp status`. |
-| `DP_DBT_PROJECT` | dbt project name — required for `dp db dbt-orphans`. |
-| `DP_DBT_INVOCATION_COMMAND` | Optional filter on dbt_artifacts invocations. |
-| `DP_DBT_ORPHANS_EXCLUDE_SCHEMAS` | Comma-separated schemas to skip (default `raw,_raw,dbt_artifacts`). |
+| `DP_DBT_PROJECTS` | Comma-separated named dbt project names for `dp dbt`, e.g. `betterdoc,betterdoc_qa`. Unset ⇒ the legacy single-project shape below. |
+| `DP_DBT_DEFAULT_PROJECT` | Project used when `--project` is omitted (default: first of `DP_DBT_PROJECTS`). |
+| `<NAME>_DBT_PATH` | Per **project**: the dbt project directory (must contain `dbt_project.yml`). Required for a project to exist. |
+| `<NAME>_DBT_PROFILES_DIR` | Per project: profiles directory. Defaults to `<NAME>_DBT_PATH`. |
+| `<NAME>_DBT_NAME` | Per project: dbt project name. Defaults to the `name:` in its `dbt_project.yml`. |
+| `<NAME>_DBT_TARGETS` | Per project: comma-separated `DP_TARGETS` names it builds into. |
+| `DP_DBT_PROJECT` | **Legacy**, no-project-configured fallback only: a bare dbt project name (not a path) for `dp dbt orphans`. Ignored once `DP_DBT_PROJECTS` is set. |
+| `DP_DBT_INVOCATION_COMMAND` | Optional filter on dbt_artifacts invocations. Per-project override: `<NAME>_DBT_INVOCATION_COMMAND`. |
+| `DP_DBT_ORPHANS_EXCLUDE_SCHEMAS` | Comma-separated schemas to skip (default `raw,_raw,dbt_artifacts`). Per-project override: `<NAME>_DBT_ORPHANS_EXCLUDE_SCHEMAS`. |
 | `GHA_APP_ID`, `GHA_APP_PRIVATE_KEY` | GitHub App creds for `dp ci github runner`. |
 | `DP_CI_RUNNER_DNS` | Comma-separated DNS servers for the runner container. |
 
@@ -670,10 +776,10 @@ Two engine differences worth knowing:
 ```bash
 dp db top-tables --schema-prefix dev_ -n 30
 dp db top-tables --drop-sql > review.sql       # emit a script
-dp db dbt-orphans                              # dry-run scan (default)
-dp db dbt-orphans --no-dry-run                 # apply renames (confirms)
-dp db dbt-orphans purge --older-than 7 --no-dry-run
-dp db dbt-orphans revert                       # undo from the audit log
+dp dbt orphans                                 # dry-run scan (default)
+dp dbt orphans --no-dry-run                    # apply renames (confirms)
+dp dbt orphans purge --older-than 7 --no-dry-run
+dp dbt orphans revert                          # undo from the audit log
 ```
 
 ### AWS secrets
