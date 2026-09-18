@@ -111,6 +111,16 @@ def _target_specs(prefix: str, engine: SqlEngine | None = None) -> list[EnvVarSp
     ]
 
 
+def _project_specs(prefix: str) -> list[EnvVarSpec]:
+    """The variables one dbt project needs."""
+    return [
+        EnvVarSpec(f"{prefix}_DBT_PATH"),
+        EnvVarSpec(f"{prefix}_DBT_PROFILES_DIR", required=False),
+        EnvVarSpec(f"{prefix}_DBT_NAME", required=False),
+        EnvVarSpec(f"{prefix}_DBT_TARGETS"),
+    ]
+
+
 def component_vars() -> dict[str, list[EnvVarSpec]]:
     """Component -> variables, built from the configured targets.
 
@@ -149,6 +159,9 @@ def component_vars() -> dict[str, list[EnvVarSpec]]:
                 EnvVarSpec("DP_RDS_INSTANCE", required=False),
             ],
             "dbt": [
+                EnvVarSpec("DP_DBT_PROJECTS", required=False),
+                EnvVarSpec("DP_DBT_DEFAULT_PROJECT", required=False),
+                # Legacy single-project variables, still read as a fallback.
                 EnvVarSpec("DP_DBT_PROJECT", required=False),
                 EnvVarSpec("DP_DBT_INVOCATION_COMMAND", required=False),
                 EnvVarSpec("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", required=False),
@@ -160,6 +173,22 @@ def component_vars() -> dict[str, list[EnvVarSpec]]:
             ],
         }
     )
+
+    # dbt/projects.py imports PyYAML at module scope, and that ships only
+    # under the dbt extra. Laziness alone only defers the failure from import
+    # time to call time: component_vars() runs on every `dp config show`
+    # regardless of whether any dbt project is configured, so an unguarded
+    # call still raises ModuleNotFoundError for anyone without PyYAML. The
+    # area_ready() guard -- the same style of guard `_connect_checks()` uses
+    # for psycopg via its own `db_deps_ready` flag -- is what actually makes
+    # this safe.
+    from dataplat.core.deps import area_ready
+
+    if area_ready("dbt"):
+        from dataplat.services.dbt.projects import load_projects
+
+        for name, project in load_projects().items():
+            components[f"dbt project: {name}"] = _project_specs(project.env_prefix)
     return components
 
 
@@ -505,6 +534,25 @@ def _offline_checks() -> list[CheckResult]:
         )
     else:
         results.append(_check("GitHub runner env", True, detail="not configured"))
+
+    # Legacy single-project dbt variables still work as a fallback, but `dp
+    # dbt` reads named projects; flag it as a nudge, not a failure -- doctor's
+    # exit code is a contract and these still work on their own.
+    legacy = [
+        name
+        for name in ("DP_DBT_PROJECT", "DP_DBT_ORPHANS_EXCLUDE_SCHEMAS")
+        if os.getenv(name, "").strip()
+    ]
+    if legacy and not os.getenv("DP_DBT_PROJECTS", "").strip():
+        results.append(
+            _warn(
+                "dbt legacy vars",
+                f"{', '.join(legacy)} set without DP_DBT_PROJECTS",
+                "`dp dbt orphans` falls back to these automatically -- "
+                "nothing to fix. Set DP_DBT_PROJECTS to also unlock "
+                "--project and multi-project fan-out.",
+            )
+        )
 
     return results
 

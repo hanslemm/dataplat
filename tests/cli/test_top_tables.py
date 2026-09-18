@@ -234,7 +234,9 @@ def test_top_tables_drop_prompt_keeps_its_wording(monkeypatch) -> None:
         result = runner.invoke(db_app, ["top-tables", "--drop"])
 
     assert result.exit_code == 1
-    assert prompts == ["DROP the 3 table(s) listed above? This cannot be undone."]
+    # 2 rows each from demo_pg and demo_pg2 (both postgresql, so _fake_collect
+    # returns the same fixture rows for each) + 1 from demo_rs.
+    assert prompts == ["DROP the 5 table(s) listed above? This cannot be undone."]
     executed.assert_not_called()
 
 
@@ -247,7 +249,7 @@ def test_top_tables_drop_with_yes_executes() -> None:
         result = runner.invoke(db_app, ["top-tables", "--drop", "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert executed.call_count == 2  # one per target
+    assert executed.call_count == 3  # one per target: demo_pg, demo_pg2, demo_rs
 
 
 # =========================================================================

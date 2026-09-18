@@ -56,6 +56,14 @@ AREAS: dict[str, AreaDeps] = {
         modules=("httpx",),
         enabled_by=("SUPERSET_BASE_URL",),
     ),
+    "dbt": AreaDeps(
+        area="dbt",
+        extra="dbt",
+        # yaml reads dbt_project.yml; psycopg reaches the warehouses a project
+        # builds into, so the area needs both.
+        modules=("yaml", "psycopg"),
+        enabled_by=("DP_DBT_PROJECTS",),
+    ),
     "people": AreaDeps(
         area="people",
         extra="people",

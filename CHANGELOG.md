@@ -35,6 +35,17 @@
   "3 unused" from an account that can see a third of the estate is a number
   somebody would otherwise act on.
 
+- **`dp ci github runner start` can register an organization-level runner.**
+  New `--org/-o` (mutually exclusive with `--repo-url`) and `--runner-group/-g`;
+  `--scope` is now inferred from whichever target is given and only validated
+  when passed. Organization targets get `RUNNER_SCOPE=org`, `ORG_NAME`,
+  `APP_LOGIN` and `RUNNER_GROUP` and no `REPO_URL`; repository targets are
+  unchanged apart from an explicit `APP_LOGIN=<owner>`, the value the image
+  derived on its own before. Mount directories are keyed per target
+  (`github.com-<org>` next to `github.com-<org>-<repo>`), so both kinds can
+  coexist. Enterprise scope is rejected outright: GitHub Apps cannot register
+  enterprise runners, so the old `--scope enterprise` never worked.
+
 ### Changed
 
 - Every `dp` command and every option is now covered by a test asserting it has
@@ -43,6 +54,61 @@
 ## 0.10.0
 
 ### Added
+
+- **`dp dbt` — named dbt projects, with `orphans` moved onto them.** A whole
+  installation used to share one dbt project (`DP_DBT_PROJECT`) and one set of
+  targets; `DP_DBT_PROJECTS` (plus per-project `<NAME>_DBT_PATH`/`_TARGETS`/
+  `_NAME`/`_PROFILES_DIR`) lets several coexist, each with its own targets,
+  excluded schemas and invocation-command filter. `-p/--project` picks one (or
+  `all`, fanning out with each project's own settings); `-t/--target` narrows
+  to one of *that* project's declared targets, and accepts `all` there too —
+  identical to omitting it, matching what the flag meant before projects
+  existed. `dp db dbt-orphans` still works unchanged, marked
+  **(deprecated)** in both its own `--help` and `dp db --help`, pointing at
+  `dp dbt orphans`. Nothing configured at all falls back to the exact
+  pre-project shape, so an existing installation needs no changes to keep
+  working.
+
+  Three refusals ship with the fan-out, because this command renames and
+  later drops what it finds: two projects sharing a warehouse in one
+  invocation (each project's live-model set is scoped to itself, so scanning
+  a shared target once per project would rename one project's production
+  tables as another's orphans); an old-format audit log or rename-age record
+  that cannot be attributed to one target once more than one configured
+  target shares its engine (it recorded only `postgres`/`redshift`, not which
+  target); and `revert` refusing an auto-selected log (no `--log` given) that
+  matches no target in the invocation, rather than reporting a hollow
+  "Reverted 0 object(s)" — the same false-success shape as a log written
+  before target identity existed, which this branch also closed. An
+  explicitly passed `--log` matching nothing is left alone; that one is the
+  operator's own call.
+
+  **Behaviour change worth calling out on its own:** the auto-selected-log
+  refusal above now also covers a log with *zero renames recorded at all* —
+  e.g. the newest log on disk happens to be a scan that found nothing. An
+  empty auto-selected log is genuinely ambiguous (it can mean "wrong log" or
+  "nothing was ever renamed", and there is no way to tell which), so it now
+  refuses the same way, where it used to print "nothing to revert" and exit
+  0. `revert` run unconditionally straight after a scan — a runbook, a CI
+  step — now exits non-zero on a clean run where it used to exit 0. Pass
+  `--log` explicitly to keep that path non-interactive; an explicitly passed
+  empty log still exits 0, unchanged.
+
+  A project with a compiled manifest also gets orphan detection to consult it:
+  a relation the manifest still claims to produce is spared even if it has
+  not rebuilt recently, and so is a partition child of a produced parent — a
+  manifest that cannot be read, or reports zero produced relations, refuses
+  outright rather than diff against nothing. `--window-days` keeps its
+  existing job either way — a relation that built inside the window is
+  always spared, and the window is still what decides both which schemas get
+  scanned and which builds count as live — but with a manifest it stops
+  being the *only* way to survive: a relation the manifest still claims to
+  produce is spared too, even if it did not rebuild inside the window. The
+  legacy no-project path is unaffected: there is no manifest there, so the
+  window stays the sole criterion. The scan still assumes it is the only dbt
+  project writing into the schemas it scans — sharing a schema with an
+  unrelated dbt project outside a declared `DP_DBT_PROJECTS` overlap remains
+  an undetected hazard.
 
 - **`dp db schema drop` says what depends on the schema.** It could already
   show what a schema *contains*; what breaks when it goes was a question only
@@ -304,17 +370,6 @@
 ## 0.6.0
 
 ### Added
-
-- **`dp ci github runner start` can register an organization-level runner.**
-  New `--org/-o` (mutually exclusive with `--repo-url`) and `--runner-group/-g`;
-  `--scope` is now inferred from whichever target is given and only validated
-  when passed. Organization targets get `RUNNER_SCOPE=org`, `ORG_NAME`,
-  `APP_LOGIN` and `RUNNER_GROUP` and no `REPO_URL`; repository targets are
-  unchanged apart from an explicit `APP_LOGIN=<owner>`, the value the image
-  derived on its own before. Mount directories are keyed per target
-  (`github.com-<org>` next to `github.com-<org>-<repo>`), so both kinds can
-  coexist. Enterprise scope is rejected outright: GitHub Apps cannot register
-  enterprise runners, so the old `--scope enterprise` never worked.
 
 - **Tests for the Airbyte service layer**, which was the largest untested area
   left after coverage measurement arrived: 64% → 89% across those modules, with

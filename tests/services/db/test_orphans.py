@@ -7,15 +7,16 @@ import pytest
 from dataplat.core.errors import ConfigError
 from dataplat.services.db.connection import SqlEngine
 from dataplat.services.db.orphans import (
-    DBT_ARTIFACTS_SCHEMA,
     DEPRECATED_SUFFIX,
     LIVE_STATUSES,
     build_rename_statement,
     classify_object,
+    resolve_orphans_connection_params,
+)
+from dataplat.services.dbt.settings import (
     excluded_schemas,
     invocation_command,
     node_prefix,
-    resolve_orphans_connection_params,
 )
 
 
@@ -74,35 +75,44 @@ def _clear_orphan_env(monkeypatch) -> None:
 def test_constants() -> None:
     assert DEPRECATED_SUFFIX == "_deprecated"
     assert frozenset({"success", "error"}) == LIVE_STATUSES
-    assert DBT_ARTIFACTS_SCHEMA == "dbt_artifacts"
+    # DBT_ARTIFACTS_SCHEMA lives in dataplat.services.dbt.settings, not here --
+    # see tests/services/dbt/test_settings.py::test_dbt_artifacts_schema.
 
 
 def test_excluded_schemas_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``excluded_schemas``/``node_prefix``/``invocation_command`` used to be
+    defined in ``dataplat.services.db.orphans`` itself; they now live in
+    ``dataplat.services.dbt.settings`` (see that module's own test suite for
+    full coverage, including the per-project behaviour). These four tests stay
+    here, imported from their new home, to keep proving the orphans CLI's own
+    legacy-mode call convention (``project=None``, for an installation that has
+    not adopted named dbt projects) still behaves like the reader it replaced.
+    """
     monkeypatch.delenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", raising=False)
-    assert excluded_schemas() == frozenset({"raw", "_raw", "dbt_artifacts"})
+    assert excluded_schemas(None) == frozenset({"raw", "_raw", "dbt_artifacts"})
 
 
 def test_excluded_schemas_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DP_DBT_ORPHANS_EXCLUDE_SCHEMAS", "a, b ,")
-    assert excluded_schemas() == frozenset({"a", "b"})
+    assert excluded_schemas(None) == frozenset({"a", "b"})
 
 
 def test_node_prefix_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DP_DBT_PROJECT", "acme")
-    assert node_prefix() == "model.acme."
+    assert node_prefix(None) == "model.acme."
 
 
 def test_node_prefix_requires_project(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DP_DBT_PROJECT", raising=False)
     with pytest.raises(ConfigError, match="DP_DBT_PROJECT"):
-        node_prefix()
+        node_prefix(None)
 
 
 def test_invocation_command_optional(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DP_DBT_INVOCATION_COMMAND", raising=False)
-    assert invocation_command() is None
+    assert invocation_command(None) is None
     monkeypatch.setenv("DP_DBT_INVOCATION_COMMAND", "dbt build")
-    assert invocation_command() == "dbt build"
+    assert invocation_command(None) == "dbt build"
 
 
 def test_classify_object_returns_view_for_view() -> None:
@@ -553,6 +563,65 @@ def test_diff_orphans_drops_schemas_with_no_orphans() -> None:
         excluded_user_schemas=frozenset(),
         excluded_user_relations=frozenset(),
     ) == {"analytics": ["b"]}
+
+
+def test_diff_orphans_is_produced_spares_a_name_not_in_live() -> None:
+    # A candidate absent from `live` (the dbt-run-results table) but accepted
+    # by `is_produced` (e.g. the project's manifest still claims it) is not
+    # reported -- the whole point of threading a second source through.
+    from dataplat.services.db.orphans import diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {"manifest_only", "genuine_orphan"}}
+    assert diff_orphans(
+        live=live,
+        existing=existing,
+        excluded_schemas=frozenset(),
+        excluded_user_schemas=frozenset(),
+        excluded_user_relations=frozenset(),
+        is_produced=lambda name: name == "manifest_only",
+    ) == {"public": ["genuine_orphan"]}
+
+
+def test_diff_orphans_is_produced_none_matches_old_behaviour() -> None:
+    # Not passing is_produced at all and passing an always-false one must
+    # agree: the parameter is additive, never a reason for a name to survive
+    # on its own account.
+    from dataplat.services.db.orphans import diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {"a", "b"}}
+    kwargs = dict(
+        live=live,
+        existing=existing,
+        excluded_schemas=frozenset(),
+        excluded_user_schemas=frozenset(),
+        excluded_user_relations=frozenset(),
+    )
+    assert diff_orphans(**kwargs) == diff_orphans(
+        is_produced=lambda name: False, **kwargs
+    )
+
+
+def test_diff_orphans_is_produced_cannot_resurrect_a_deprecated_name() -> None:
+    # is_produced is consulted alongside the other checks in the same
+    # comprehension, not instead of them -- a name already ending in
+    # DEPRECATED_SUFFIX stays excluded even if is_produced would accept it.
+    from dataplat.services.db.orphans import DEPRECATED_SUFFIX, diff_orphans
+
+    live = {"public": set()}
+    existing = {"public": {f"x{DEPRECATED_SUFFIX}"}}
+    assert (
+        diff_orphans(
+            live=live,
+            existing=existing,
+            excluded_schemas=frozenset(),
+            excluded_user_schemas=frozenset(),
+            excluded_user_relations=frozenset(),
+            is_produced=lambda name: True,
+        )
+        == {}
+    )
 
 
 def test_build_drop_statement_table() -> None:

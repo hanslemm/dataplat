@@ -706,11 +706,11 @@ def test_db_section_probes_targets_concurrently(
 
     from dataplat.services.db import long_queries
 
-    for prefix in ("DEMO_PG", "DEMO_RS"):
+    for prefix in ("DEMO_PG", "DEMO_PG2", "DEMO_RS"):
         monkeypatch.setenv(f"{prefix}_HOST", "db.example.invalid")
         monkeypatch.setenv(f"{prefix}_USER", "svc")
         monkeypatch.setenv(f"{prefix}_DATABASE", "analytics")
-    gate = threading.Barrier(2, timeout=_GATE_TIMEOUT_S)
+    gate = threading.Barrier(3, timeout=_GATE_TIMEOUT_S)
 
     def fake_connect(**kwargs: Any) -> _FakeConn:
         gate.wait()
@@ -722,9 +722,9 @@ def test_db_section_probes_targets_concurrently(
 
     section = status_cli._db_section()
 
-    # Both reachable proves the barrier opened; the key order is DP_TARGETS order,
-    # not the order the connects happened to finish in.
-    assert list(section) == ["demo_pg", "demo_rs"]
+    # All three reachable proves the barrier opened; the key order is DP_TARGETS
+    # order, not the order the connects happened to finish in.
+    assert list(section) == ["demo_pg", "demo_pg2", "demo_rs"]
     assert all(info["reachable"] for info in section.values())
 
 

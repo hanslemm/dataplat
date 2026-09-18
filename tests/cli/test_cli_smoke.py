@@ -187,6 +187,7 @@ def test_areas_mount_as_placeholders_in_registry_order() -> None:
         assert group.list_commands(ctx) == [
             "config",
             "db",
+            "dbt",
             "ingest",
             "bi",
             "people",
@@ -223,7 +224,8 @@ def test_unknown_command_still_suggests_a_lazy_area() -> None:
     result = runner.invoke(main_module.app, ["dbb"])
 
     assert result.exit_code == 2
-    assert "Did you mean 'db'?" in result.output
+    # 'dbt' is now also one edit away from 'dbb' and is offered alongside 'db'.
+    assert "Did you mean 'db', 'dbt'?" in result.output
 
 
 def test_a_third_party_area_mounts_under_its_registry_name(
@@ -717,7 +719,7 @@ def test_db_dbt_orphans_purge_rejects_multi_dot_exclusion() -> None:
 
 
 def _isolate_log_dir(monkeypatch, tmp_path) -> None:
-    from dataplat.cli.db import dbt_orphans as orphans_module
+    from dataplat.cli.dbt import orphans as orphans_module
 
     monkeypatch.setattr(orphans_module, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(orphans_module, "LEGACY_LOG_DIR", tmp_path / "local")
@@ -735,7 +737,15 @@ def test_db_dbt_orphans_revert_no_log_found(tmp_path, monkeypatch) -> None:
 
 
 def test_db_dbt_orphans_revert_auto_picks_latest_log(tmp_path, monkeypatch) -> None:
-    """Revert without --log finds the newest timestamped log (legacy dir included)."""
+    """Revert without --log finds the newest timestamped log (legacy dir
+    included) -- and, because both logs here have no renames recorded at
+    all, this also pins the auto-selected-empty-log refusal: an
+    auto-picked log with nothing in it is exactly as likely to be the
+    wrong log as it is proof there was nothing to revert, so it refuses
+    rather than silently reporting "nothing to revert". The refused
+    message still names the newest log, which is what proves the right one
+    was selected.
+    """
     _isolate_log_dir(monkeypatch, tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -750,9 +760,9 @@ def test_db_dbt_orphans_revert_auto_picks_latest_log(tmp_path, monkeypatch) -> N
 
     result = runner.invoke(main_module.app, ["db", "dbt-orphans", "revert"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert "dbt_orphans-20260422T120000Z.log.json" in result.stdout
-    assert "nothing to revert" in result.stdout
+    assert "auto-selected" in result.stdout
 
 
 def test_db_dbt_orphans_revert_corrupt_log(tmp_path) -> None:

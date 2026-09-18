@@ -1,10 +1,11 @@
-"""`dp db dbt-orphans` — discover and rename orphan dbt tables."""
+"""`dp dbt orphans` — discover and rename orphan dbt tables."""
 
 from __future__ import annotations
 
 import glob
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,11 @@ from dataplat.cli._exit import exit_code_for, fail
 from dataplat.cli._options import YesOption
 from dataplat.cli._prompt import confirm_or_exit
 from dataplat.cli._render import esc
+from dataplat.cli.dbt._common import (
+    ProjectOption,
+    TargetFilterOption,
+    projects_and_targets,
+)
 from dataplat.core.errors import (
     ConfigError,
     DataplatError,
@@ -23,7 +29,7 @@ from dataplat.core.errors import (
     ValidationError,
 )
 from dataplat.services.db.capabilities import Capability, require_capability
-from dataplat.services.db.connection import SqlEngine
+from dataplat.services.db.connection import DbConnectionParams, SqlEngine
 from dataplat.services.db.orphans import (
     DEPRECATED_SUFFIX,
     LIVE_STATUSES,
@@ -35,17 +41,21 @@ from dataplat.services.db.orphans import (
     classify_object,
     diff_orphans,
     drop_object,
-    excluded_schemas,
     fetch_deprecated_objects,
     fetch_existing_relations,
     fetch_live_model_relations,
-    invocation_command,
-    node_prefix,
     open_transactional_connection,
     rename_object,
     resolve_orphans_connection_params,
 )
-from dataplat.services.db.targets import resolve_targets
+from dataplat.services.db.targets import ALL_TARGETS, DbTarget, resolve_targets
+from dataplat.services.dbt.manifest import is_partition_of, relation_names
+from dataplat.services.dbt.projects import DbtProject, default_project_name
+from dataplat.services.dbt.settings import (
+    excluded_schemas,
+    invocation_command,
+    node_prefix,
+)
 
 DEFAULT_WINDOW_DAYS = 7
 
@@ -68,14 +78,6 @@ LEGACY_LOG_DIR = Path("local")
 APPLY_LOG_PREFIX = "dbt_orphans"
 PURGE_LOG_PREFIX = "dbt_orphans_purge"
 
-# Log entries keep the historical engine labels so old logs stay revertable.
-# Only the engines this command can act on appear here; _engines_for_target
-# refuses the others before it reaches this mapping.
-_ENGINE_LABELS: dict[SqlEngine, str] = {
-    SqlEngine.postgresql: "postgres",
-    SqlEngine.redshift: "redshift",
-}
-
 # Why this command needs `rename_with_dependents`, which the capability's own
 # reason ("renames fail when a view depends on the table") does not say. Written
 # once and passed to every check, because all three subcommands — apply, revert
@@ -88,20 +90,97 @@ _RENAME_DETAIL = (
     "renamed, and a half-working destructive command is worse than none."
 )
 
-TargetOption = typer.Option(
-    "all",
-    "--target",
-    "-t",
-    help="Named DB target from DP_TARGETS, or all.",
-)
+# ``database`` values a pre-named-project audit log used: the engine family
+# (postgres/redshift), not a target name — see _engines_for_project's
+# docstring for why the identity moved to the target's own name. Revert's
+# log filter and purge's rename-age index both still have to recognize the
+# legacy value: a log written before that migration cannot carry an identity
+# that did not exist yet, and refusing to match it at all silently no-ops
+# every revert of a pre-upgrade rename while reporting success — the exact
+# hazard this migration must not introduce. The write side never produces
+# these anymore; this is read-only backward compatibility.
+#
+# The legacy value is only safe to trust when exactly one target in the
+# current invocation has that engine. A legacy log cannot tell two
+# same-engine targets apart -- the distinction it would need was never
+# recorded -- so matching it against *every* same-engine target reintroduces
+# the exact cross-application the target-name identity exists to prevent,
+# just for old logs instead of new ones. See _ambiguous_legacy_conflicts:
+# when more than one target shares an engine, the legacy fallback for that
+# engine is refused outright rather than guessed, and the operator is told
+# to rerun scoped to one target with --target.
+_LEGACY_ENGINE_LABELS: dict[SqlEngine, str] = {
+    SqlEngine.postgresql: "postgres",
+    SqlEngine.redshift: "redshift",
+}
+
+
+def _ambiguous_legacy_conflicts(
+    present_identities: set[str],
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+) -> list[tuple[str, list[str]]]:
+    """``(legacy_label, [target names])`` for every legacy identity that
+    cannot be safely attributed to one target in this invocation.
+
+    A conflict exists when a legacy engine-family value is actually present
+    in the data being read (``present_identities`` — a log's ``database``
+    values for revert, or a rename-age index's keys for purge) *and* more
+    than one target in ``engines`` shares that legacy value's engine. Two
+    different targets on the same engine each independently produce the
+    same legacy value, and nothing recorded which of them a given legacy
+    entry belongs to.
+    """
+    engine_targets: dict[SqlEngine, set[str]] = {}
+    for label, engine, _env_prefix, _project in engines:
+        engine_targets.setdefault(engine, set()).add(label)
+
+    conflicts: list[tuple[str, list[str]]] = []
+    for engine, targets in sorted(engine_targets.items(), key=lambda kv: kv[0].value):
+        if len(targets) <= 1:
+            continue
+        legacy_label = _LEGACY_ENGINE_LABELS.get(engine)
+        if legacy_label is not None and legacy_label in present_identities:
+            conflicts.append((legacy_label, sorted(targets)))
+    return conflicts
+
+
+def _refuse_ambiguous_legacy_entries(
+    present_identities: set[str],
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+    *,
+    context: str,
+) -> None:
+    """Raise if any legacy identity in ``present_identities`` is ambiguous.
+
+    ``context`` names what was read (``"log"`` for revert, ``"rename-age
+    index"`` for purge) so the error says what predates per-target identity.
+    """
+    conflicts = _ambiguous_legacy_conflicts(present_identities, engines)
+    if not conflicts:
+        return
+    detail = "; ".join(
+        f"'{legacy_label}' could mean any of {', '.join(targets)}"
+        for legacy_label, targets in conflicts
+    )
+    raise ValidationError(
+        f"Refusing: this {context} predates per-target identity, and it "
+        f"cannot be attributed safely in this invocation: {detail}. A "
+        "legacy entry recorded only the engine, not which target produced "
+        "it, so applying it to every target that shares that engine risks "
+        "acting on one target using another's history. Rerun scoped to a "
+        "single target with --target to make the attribution unambiguous."
+    )
 
 
 def _tag(label: str) -> str:
-    """The ``[<engine>]`` prefix every progress line carries.
+    """The ``[<target>]`` prefix every progress line carries.
 
-    ``[postgres]`` and ``[redshift]`` are well-formed Rich tags, so unescaped
-    the prefix was parsed as a style name and silently dropped — leaving the
-    reader unable to tell which cluster a rename or drop line belonged to.
+    ``label`` is the target's own name (``demo_pg``, not ``postgres``) — see
+    ``_engines_for_project`` for why — and a target name is exactly as
+    user-chosen as a schema or relation name. A target happening to be named
+    after a real Rich style (``red``, ``bold``) is a well-formed tag that,
+    left unescaped, would be parsed as a style and silently dropped, leaving
+    the reader unable to tell which target a rename or drop line belonged to.
     """
     return esc(f"[{label}]")
 
@@ -140,38 +219,172 @@ def _find_latest_log(prefix: str) -> str | None:
     return matches[-1] if matches else None
 
 
-def _engines_for_target(name: str) -> list[tuple[str, SqlEngine, str]]:
-    """Return ``(label, engine, env_prefix)`` per target; label is the log key.
+def _connection_identity(tgt: DbTarget) -> tuple[str, int, str] | None:
+    """Best-effort ``(host, port, dbname)`` for ``tgt``, or ``None``.
 
-    Also the one gate every subcommand passes through, which is why the
-    capability check lives here: apply, revert and purge each start by calling
-    this, and none of them has opened a connection yet.
-
-    An engine that cannot rename a relation a view depends on refuses the *whole*
-    invocation, including a ``--target all`` where other targets would have
-    worked. That is deliberate for this command and only this command: it renames
-    and drops, so "did some of it" is the outcome worth avoiding most, and naming
-    targets explicitly is a cheap way to get the rest done.
+    ``resolve_orphans_connection_params`` only reads environment variables —
+    no connection is opened — so this is safe to call for every resolved
+    target before any capability check or connection attempt. ``None`` covers
+    every case this cannot compare: missing connection settings, a
+    non-libpq engine (``resolve_connection_params`` raises ``ValidationError``
+    for one, since the libpq-shaped return type has no host/user/port to put
+    a DuckDB target's settings in), or a config problem in the settings
+    themselves (e.g. a non-integer port). Caught as ``DataplatError``, not
+    just ``ConfigError``, to cover both: this runs before the capability gate
+    (see ``_refuse_overlapping_targets``'s call site), so a DuckDB target
+    carrying libpq-shaped variables reaches this overlap check first, and a
+    bare ``ConfigError`` catch would let its ``ValidationError`` escape as a
+    generic, unprefixed crash instead of the capability refusal further
+    down. A target that cannot be read this way is excluded from the overlap
+    check rather than treated as either a collision or a clearance — "cannot
+    tell" is not the same claim as "distinct".
     """
     try:
-        targets = resolve_targets(name)
-    except ValidationError as exc:
+        params = resolve_orphans_connection_params(
+            tgt.engine, env_prefix=tgt.env_prefix
+        )
+    except DataplatError:
+        return None
+    if not isinstance(params, DbConnectionParams):
+        return None
+    return (params.host, params.port, params.dbname)
+
+
+def _refuse_overlapping_targets(
+    pairs: list[tuple[DbtProject | None, list[DbTarget]]],
+) -> None:
+    """Refuse a fan-out where two or more resolved projects share a warehouse.
+
+    Each project's live dbt model set is scoped to that project alone (see
+    ``_engines_for_project``), so scanning the same physical warehouse once
+    per project that declares it does not fail safe: each pass would see
+    every *other* project's live tables as its own orphans, because the live
+    sets are never unioned across the fan-out. With ``--no-dry-run`` that is
+    two projects' production tables quarantined in one invocation.
+
+    Two checks, because "the same warehouse" shows up here two ways. Two
+    projects can declare the identical target *name* — caught by comparing
+    names. Two projects can also each declare their *own*, differently-named
+    target that happens to resolve to the same host, port and database:
+    separate credentials per project pointed at one shared cluster is an
+    ordinary setup, not a misconfiguration, and the name-based check alone
+    lets it straight through. The second check (see
+    ``_connection_identity``) is best-effort by nature: it can only compare
+    targets whose connection settings actually resolve, and even then a DNS
+    alias, or the same host written two different ways, still slips past it.
+    It narrows this hole; it does not close it.
+
+    Unioning the live sets instead of refusing was considered and rejected:
+    a fan-out whose safety depends on a set union being exactly right, with
+    no test surface today, is not something a command that renames and drops
+    things should carry. Refusing outright is boring and obviously correct —
+    the operator reruns the overlapping projects one at a time.
+    """
+    by_name: dict[str, list[str]] = {}
+    by_connection: dict[tuple[str, int, str], list[tuple[str, str]]] = {}
+    for proj, targets in pairs:
+        if proj is None:
+            continue
+        for tgt in targets:
+            by_name.setdefault(tgt.name, []).append(proj.name)
+            identity = _connection_identity(tgt)
+            if identity is not None:
+                by_connection.setdefault(identity, []).append((proj.name, tgt.name))
+
+    details: list[str] = [
+        f"{name} (built into by {', '.join(projs)})"
+        for name, projs in sorted(by_name.items())
+        if len(projs) > 1
+    ]
+    for (host, port, dbname), entries in sorted(by_connection.items()):
+        distinct_projects = {proj for proj, _ in entries}
+        if len(distinct_projects) <= 1:
+            continue
+        who = ", ".join(f"{proj} ({tgt})" for proj, tgt in sorted(set(entries)))
+        details.append(
+            f"{host}:{port}/{dbname} (built into by {who}, under different "
+            "target names)"
+        )
+
+    if not details:
+        return
+    raise ValidationError(
+        "Refusing: more than one project builds into the same warehouse in "
+        f"this invocation: {'; '.join(details)}. Each project's live dbt "
+        "model set is its own, so scanning a shared warehouse once per "
+        "project would rename one project's live tables as another's "
+        "orphans. (The differently-named-target check is best-effort, "
+        "matched on host, port and database name — a DNS alias or an "
+        "address written differently can still slip through.) Run the "
+        "overlapping projects one at a time (--project <name>) instead."
+    )
+
+
+def _engines_for_project(
+    project: str | None, target: str | None
+) -> list[tuple[str, SqlEngine, str, DbtProject | None]]:
+    """Return ``(label, engine, env_prefix, project)`` per target of the named project.
+
+    ``label`` is the target's own name, not its engine family: the summary,
+    the audit log's ``database`` field and revert's log filter all key on it,
+    and two targets that share an engine (two Postgres clusters, say) would
+    be indistinguishable from each other if it were the engine name instead —
+    revert could then rename one cluster's objects back on the strength of
+    another cluster's log entries.
+
+    Still the one gate every subcommand passes through, which is why the
+    capability check stays here. An engine that cannot rename a relation a view
+    depends on refuses the whole invocation, including a fan-out where other
+    targets would have worked: this command renames and drops, so "did some of
+    it" is the outcome worth avoiding most.
+
+    No ``--project`` given and no project configured at all — ``DP_DBT_PROJECTS``
+    unset, nothing to default to — falls back to resolving ``DP_TARGETS``
+    directly instead of refusing to run: that is the legacy, pre-named-project
+    shape this command has always supported, and ``project=None`` rides along
+    so ``node_prefix``/``excluded_schemas``/``invocation_command`` read the
+    legacy single-project env vars the way they always did. Passing an
+    explicit ``--project`` still resolves (and can still fail) normally even
+    when nothing is configured — the operator asked for a specific project by
+    name, so silently falling back to "all targets" would run the command
+    against warehouses that project may never touch.
+
+    The ``project`` carried alongside each target (rather than resolved once
+    for the whole run) is what makes ``--project all`` correct: each project
+    fanned out by :func:`projects_and_targets` has its own node prefix and
+    exclusion settings. See ``_refuse_overlapping_targets`` for what happens
+    when two of them declare the same target.
+    """
+    try:
+        if project is None and default_project_name() is None:
+            targets = resolve_targets(target or ALL_TARGETS)
+            pairs: list[tuple[DbtProject | None, list[DbTarget]]] = [(None, targets)]
+        else:
+            pairs = [
+                (proj, tgts) for proj, tgts in projects_and_targets(project, target)
+            ]
+        _refuse_overlapping_targets(pairs)
+    except DataplatError as exc:
         fail(exc, console=console)
-    for tgt in targets:
-        try:
-            require_capability(
-                tgt.engine,
-                Capability.rename_with_dependents,
-                command="dp db dbt-orphans",
-                detail=_RENAME_DETAIL,
-            )
-        except ValidationError as exc:
-            # Prefixed with the target name, like every other per-target error in
-            # this module: with `all` the engine's reason alone would not say
-            # which target brought the command to a stop. fail() escapes the
-            # brackets before Rich sees them.
-            fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
-    return [(_ENGINE_LABELS[t.engine], t.engine, t.env_prefix) for t in targets]
+
+    resolved: list[tuple[str, SqlEngine, str, DbtProject | None]] = []
+    for proj, targets in pairs:
+        for tgt in targets:
+            try:
+                require_capability(
+                    tgt.engine,
+                    Capability.rename_with_dependents,
+                    command="dp dbt orphans",
+                    detail=_RENAME_DETAIL,
+                )
+            except ValidationError as exc:
+                # Prefixed with the target name, like every other per-target error
+                # in this module: with a multi-target fan-out the engine's reason
+                # alone would not say which target brought the command to a stop.
+                # fail() escapes the brackets before Rich sees them.
+                fail(ValidationError(f"[{tgt.name}] {exc}"), console=console)
+            resolved.append((tgt.name, tgt.engine, tgt.env_prefix, proj))
+    return resolved
 
 
 def _parse_exclusions(
@@ -229,7 +442,8 @@ def main(
             "dbt_orphans-<UTC timestamp>.log.json (unique per run)."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -250,9 +464,16 @@ def main(
         DEFAULT_WINDOW_DAYS,
         "--window-days",
         help=(
-            "Consider a model 'live' if any matching dbt build in the last "
-            "N days produced it. Larger windows are more conservative "
-            "(fewer false-positive renames)."
+            "How many days back to look for a matching dbt build. A "
+            "relation built within this window is always spared. For a "
+            "project with a manifest, the window is no longer the *only* "
+            "way to be spared -- a relation the manifest still claims to "
+            "produce survives even if it has not rebuilt inside the window "
+            "-- but the window still decides which schemas get scanned and "
+            "which builds count as live, so a smaller window still means "
+            "more rename candidates. On the legacy path (no --project "
+            "configured), the window remains the sole criterion. Larger "
+            "windows are more conservative (fewer false-positive renames)."
         ),
     ),
 ) -> None:
@@ -276,24 +497,34 @@ def main(
         # fail() escaping it is what keeps a hostile token from crashing Rich.
         fail(exc, console=console)
 
-    engines = _engines_for_target(target)
-    if not dry_run:
-        confirm_or_exit(
-            yes=yes,
-            prompt="Rename every orphaned dbt object with a _deprecated suffix?",
-            console=console,
-        )
+    engines = _engines_for_project(project, target)
 
     since = datetime.now(UTC) - timedelta(days=window_days)
 
     all_entries: list[RenameEntry] = []
     try:
-        for label, engine, env_prefix in engines:
+        # Pre-flight every resolved project's manifest once, before the
+        # confirmation prompt and before any target is touched. This used to
+        # happen per-target inside _run_for_engine, which (a) re-read the same
+        # project's manifest once per target it declares, and (b) under
+        # --project all --no-dry-run only discovered a later project's bad
+        # manifest after an earlier project's renames had already been
+        # applied -- the confirmation had already been answered for nothing.
+        produced_by_project = _preflight_produced(engines)
+        if not dry_run:
+            confirm_or_exit(
+                yes=yes,
+                prompt="Rename every orphaned dbt object with a _deprecated suffix?",
+                console=console,
+            )
+        for label, engine, env_prefix, proj in engines:
             all_entries.extend(
                 _run_for_engine(
                     label,
                     engine,
                     env_prefix=env_prefix,
+                    project=proj,
+                    produced=produced_by_project[proj.name if proj else None],
                     excluded_user_schemas=excluded_user_schemas,
                     excluded_user_relations=excluded_user_relations,
                     window_days=window_days,
@@ -339,11 +570,114 @@ def _write_audit_log(
         json.dump(payload, f, indent=4)
 
 
+def _produced_relations(project: DbtProject | None) -> set[str] | None:
+    """Relation names ``project``'s manifest says it produces, or ``None``.
+
+    ``None`` is the legacy, pre-named-project path (see
+    ``dataplat.services.dbt.settings``'s own module docstring): there is no
+    manifest to read there, so this reads nothing and the manifest-based
+    checks in ``_run_for_engine`` (produced-set exclusion, partition sparing)
+    simply do not run for it -- the exact behaviour that path has always had,
+    not a new refusal.
+
+    For a configured project, a manifest that cannot be read at all (never
+    compiled, or corrupt) and a manifest that reports zero produced relations
+    both refuse rather than let the scan continue. The second case matters as
+    much as the first: an empty produced set is never a reason to think a
+    project produces nothing (a genuinely empty project has no warehouse
+    tables to scan in the first place), only a reason to think the manifest
+    is wrong -- and diffing against an empty produced set would make every
+    object already in scope look orphaned.
+    """
+    if project is None:
+        return None
+    try:
+        produced = relation_names(project)
+    except (FileNotFoundError, ValueError) as exc:
+        # ValueError, not json.JSONDecodeError specifically: relation_names
+        # raises plain ValueError for a manifest that parses but is not a
+        # JSON object at the top level (a hostile or corrupted file), and
+        # json.JSONDecodeError for unparsable JSON is itself a ValueError
+        # subclass -- one except clause covers both, and covers whatever
+        # else relation_names decides is untrustworthy manifest shape in the
+        # future. This has to stay a ConfigError and not propagate raw: an
+        # uncaught exception here would skip the audit-log write in `main`'s
+        # `except DataplatError` handler, and under a multi-target fan-out
+        # that log is what makes an earlier target's already-applied renames
+        # recoverable.
+        raise ConfigError(str(exc)) from exc
+    if not produced:
+        raise ConfigError(
+            f"{project.name}'s manifest ({project.path / 'target' / 'manifest.json'}) "
+            "reports zero produced relations. Refusing: diffing against an "
+            "empty produced set would treat every object already in scope as "
+            "an orphan. Run `dbt compile` (or `dbt docs generate`) for a "
+            "build that actually produces something, then re-run."
+        )
+    return produced
+
+
+def _produced_predicate(produced: set[str] | None) -> Callable[[str], bool] | None:
+    """The ``is_produced`` callable ``diff_orphans`` consults, or ``None``.
+
+    ``None`` when there is no manifest to consult (see ``_produced_relations``)
+    -- ``diff_orphans`` treats that the same as never having been passed the
+    argument at all, which is what keeps the legacy path's behaviour
+    unchanged.
+
+    Lowercases the candidate before comparing. ``relation_names`` already
+    lowercases everything it returns, and ``is_partition_of`` lowercases its
+    own ``relation`` argument too, but the plain membership check right here
+    does not get that for free -- a warehouse catalog can report a
+    quoted, mixed-case relation name, and comparing it against the
+    always-lowercase produced set without lowercasing it first would quietly
+    stop matching for exactly that project.
+    """
+    if produced is None:
+        return None
+
+    def _is_produced(name: str) -> bool:
+        lowered = name.lower()
+        return lowered in produced or is_partition_of(lowered, produced)
+
+    return _is_produced
+
+
+def _preflight_produced(
+    engines: list[tuple[str, SqlEngine, str, DbtProject | None]],
+) -> dict[str | None, set[str] | None]:
+    """Read every distinct resolved project's manifest exactly once.
+
+    Keyed by project name (``None`` for the legacy no-project path, which
+    ``_produced_relations`` never reads anything for). Two targets that
+    declare the same project -- an ordinary shape, see
+    ``_engines_for_project`` -- used to trigger two separate manifest reads,
+    once per target, because this used to happen inside ``_run_for_engine``.
+    Deduplicating here means one read per project regardless of how many of
+    its targets are in this invocation.
+
+    Called before the destructive confirmation prompt (see ``main``'s own
+    comment at the call site): a bad manifest anywhere in a
+    ``--project all --no-dry-run`` fan-out now refuses before any project's
+    renames are applied, and before the operator is even asked to confirm,
+    rather than surfacing only after an earlier project already went
+    through.
+    """
+    produced_by_project: dict[str | None, set[str] | None] = {}
+    for _label, _engine, _env_prefix, proj in engines:
+        key = proj.name if proj is not None else None
+        if key not in produced_by_project:
+            produced_by_project[key] = _produced_relations(proj)
+    return produced_by_project
+
+
 def _run_for_engine(
     label: str,
     engine: SqlEngine,
     *,
     env_prefix: str,
+    project: DbtProject | None = None,
+    produced: set[str] | None,
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
     window_days: int,
@@ -352,7 +686,7 @@ def _run_for_engine(
 ) -> list[RenameEntry]:
     try:
         params = resolve_orphans_connection_params(engine, env_prefix=env_prefix)
-        dbt_node_prefix = node_prefix()
+        dbt_node_prefix = node_prefix(project)
     except ConfigError as exc:
         # Re-raised as the same class, not widened to ServiceError: "set
         # DP_DBT_PROJECT" is something the operator fixes (exit 3), and a CI job
@@ -374,7 +708,7 @@ def _run_for_engine(
     ):
         live = fetch_live_model_relations(
             cur,
-            invocation_command=invocation_command(),
+            invocation_command=invocation_command(project),
             node_prefix=dbt_node_prefix,
             statuses=LIVE_STATUSES,
             since=since,
@@ -387,7 +721,7 @@ def _run_for_engine(
             )
             return []
 
-        excluded = excluded_schemas()
+        excluded = excluded_schemas(project)
         schemas_to_scan = sorted(s for s in live if s not in excluded)
         existing = fetch_existing_relations(
             cur, schemas_to_scan, is_redshift=is_redshift
@@ -398,6 +732,7 @@ def _run_for_engine(
             excluded_schemas=excluded,
             excluded_user_schemas=excluded_user_schemas,
             excluded_user_relations=excluded_user_relations,
+            is_produced=_produced_predicate(produced),
         )
 
         _print_summary(label, live, existing, orphans)
@@ -491,7 +826,8 @@ def revert_cmd(
             "dbt_orphans-*.log.json in the log directory."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -504,7 +840,8 @@ def revert_cmd(
     # order answers "no dbt_orphans log found" to a target where there could
     # never have been one, sending the reader to look for a missing file
     # instead of at the engine.
-    engines = _engines_for_target(target)
+    engines = _engines_for_project(project, target)
+    log_was_auto_selected = log is None
     if log is None:
         log = _find_latest_log(APPLY_LOG_PREFIX)
         if log is None:
@@ -512,13 +849,13 @@ def revert_cmd(
                 f"[red]Error: no {APPLY_LOG_PREFIX} log found in {esc(LOG_DIR)}/[/red]"
             )
             console.print(
-                "[dim]Run `dp db dbt-orphans` first or pass --log explicitly.[/dim]"
+                "[dim]Run `dp dbt orphans` first or pass --log explicitly.[/dim]"
             )
             raise typer.Exit(code=1)
         console.print(f"[dim]Using latest log: {esc(log)}[/dim]")
     if not os.path.exists(log):
         console.print(f"[red]Error: log file not found: {esc(log)}[/red]")
-        console.print("[dim]Run `dp db dbt-orphans` first to generate it.[/dim]")
+        console.print("[dim]Run `dp dbt orphans` first to generate it.[/dim]")
         raise typer.Exit(code=1)
 
     try:
@@ -539,18 +876,63 @@ def revert_cmd(
 
     renames = payload.get("renames") or []
     if not renames:
+        # Same false-success door as the auto-selected-but-non-matching
+        # refusal further down (see the comment there): an empty log is
+        # exactly as likely to be the wrong log -- e.g. a later scan that
+        # happened to find nothing, written under the same prefix -- as it
+        # is to be genuine proof there was nothing to revert. Only the
+        # auto-selected case refuses; an explicitly passed empty log is the
+        # operator's own choice and keeps reporting "nothing to revert".
+        if log_was_auto_selected:
+            fail(
+                ValidationError(
+                    f"the auto-selected log {log} has no renames recorded "
+                    "at all. Nothing was reverted, but this is likely the "
+                    "wrong log rather than genuinely nothing to revert -- "
+                    "pass --log explicitly to confirm which one you mean."
+                ),
+                console=console,
+            )
         console.print("[dim]No renames recorded in the log; nothing to revert.[/dim]")
         return
 
-    total = 0
     try:
-        for label, engine, env_prefix in engines:
+        _refuse_ambiguous_legacy_entries(
+            # `isinstance(..., str)` rather than `is not None`: the parameter is
+            # a set of identities, and a log entry whose `database` came back as
+            # a number is not one. Binding it once is also what lets the type
+            # narrow -- two separate `.get()` calls are two expressions to mypy,
+            # so the `is not None` on the second never reached the first.
+            {
+                database
+                for r in renames
+                if isinstance(r, dict)
+                and isinstance(database := r.get("database"), str)
+            },
+            engines,
+            context="log",
+        )
+    except DataplatError as exc:
+        fail(exc, console=console)
+
+    total = 0
+    matched_any_target = False
+    try:
+        for label, engine, env_prefix, _project in engines:
+            # A legacy log's entries carry the old engine-family value (see
+            # _LEGACY_ENGINE_LABELS), not this target's name; matching only
+            # `label` would silently revert nothing from any log written
+            # before this migration.
+            wanted = {label, _LEGACY_ENGINE_LABELS.get(engine)}
             entries = [
-                r for r in renames if isinstance(r, dict) and r.get("database") == label
+                r
+                for r in renames
+                if isinstance(r, dict) and r.get("database") in wanted
             ]
             if not entries:
                 console.print(f"[dim]{_tag(label)} No entries in log.[/dim]")
                 continue
+            matched_any_target = True
             total += _revert_for_engine(
                 label, engine, entries, env_prefix=env_prefix, dry_run=dry_run
             )
@@ -562,6 +944,26 @@ def revert_cmd(
         # See the note in `main`: the count printed after the error is why this
         # takes the code from the exception instead of calling fail().
         raise typer.Exit(code=exit_code_for(exc))
+
+    # An explicitly passed --log matching nothing is the operator's own
+    # choice -- keep reporting "Reverted 0 object(s)" as before. An
+    # auto-selected log matching nothing is different: the newest log on
+    # disk can belong to a different project or target than this invocation,
+    # and reporting success here is the same false-comfort shape as the
+    # pre-upgrade-log Critical this branch already fixed (see
+    # _LEGACY_ENGINE_LABELS above) -- purge would later drop what the
+    # operator believes was already reverted.
+    if log_was_auto_selected and not matched_any_target:
+        fail(
+            ValidationError(
+                f"the auto-selected log {log} matches no entries for any "
+                "target in this invocation. Nothing was reverted, but this "
+                "is likely the wrong log rather than genuinely nothing to "
+                "revert -- pass --log explicitly to confirm which one you "
+                "mean."
+            ),
+            console=console,
+        )
 
     prefix = "[DRY-RUN] " if dry_run else ""
     console.print(f"[green]{prefix}Reverted {total} object(s).[/green]")
@@ -696,7 +1098,8 @@ def purge_cmd(
             "dbt_orphans_purge-<UTC timestamp>.log.json (unique per run)."
         ),
     ),
-    target: str = TargetOption,
+    project: str | None = ProjectOption,
+    target: str | None = TargetFilterOption,
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -752,7 +1155,29 @@ def purge_cmd(
     except ValidationError as exc:
         fail(exc, console=console)
 
-    engines = _engines_for_target(target)
+    engines = _engines_for_project(project, target)
+
+    # Pre-flight, before the destructive confirmation: this used to run after
+    # confirm_or_exit, so an operator confirmed an irreversible drop and was
+    # then refused -- training people to confirm blind. Reading the
+    # rename-age index and checking it for ambiguity needs nothing the
+    # confirmation would have produced, so there is no reason it has to wait.
+    renamed_at = _renamed_at_index() if older_than is not None else None
+    if renamed_at is not None:
+        try:
+            _refuse_ambiguous_legacy_entries(
+                {key[0] for key in renamed_at},
+                engines,
+                context="rename-age index",
+            )
+        except DataplatError as exc:
+            fail(exc, console=console)
+    cutoff = (
+        datetime.now(UTC) - timedelta(days=older_than)
+        if older_than is not None
+        else None
+    )
+
     if not dry_run:
         confirm_or_exit(
             yes=yes,
@@ -762,23 +1187,17 @@ def purge_cmd(
             console=console,
         )
 
-    renamed_at = _renamed_at_index() if older_than is not None else None
-    cutoff = (
-        datetime.now(UTC) - timedelta(days=older_than)
-        if older_than is not None
-        else None
-    )
-
     all_drops: list[DropEntry] = []
     blocked: list[BlockedEntry] = []
     try:
-        for label, engine, env_prefix in engines:
+        for label, engine, env_prefix, proj in engines:
             try:
                 all_drops.extend(
                     _purge_for_engine(
                         label,
                         engine,
                         env_prefix=env_prefix,
+                        project=proj,
                         excluded_user_schemas=excluded_user_schemas,
                         excluded_user_relations=excluded_user_relations,
                         dry_run=dry_run,
@@ -839,6 +1258,7 @@ def _purge_for_engine(
     engine: SqlEngine,
     *,
     env_prefix: str,
+    project: DbtProject | None = None,
     excluded_user_schemas: frozenset[str],
     excluded_user_relations: frozenset[tuple[str, str]],
     dry_run: bool,
@@ -861,7 +1281,7 @@ def _purge_for_engine(
         return []
 
     is_redshift = engine is SqlEngine.redshift
-    effective_excluded_schemas = excluded_schemas() | excluded_user_schemas
+    effective_excluded_schemas = excluded_schemas(project) | excluded_user_schemas
     drops: list[DropEntry] = []
 
     with (
@@ -881,6 +1301,7 @@ def _purge_for_engine(
             deprecated = _apply_age_filter(
                 deprecated,
                 label=label,
+                legacy_label=_LEGACY_ENGINE_LABELS.get(engine),
                 renamed_at=renamed_at,
                 cutoff=cutoff,
                 include_unknown=include_unknown,
@@ -903,14 +1324,25 @@ def _apply_age_filter(
     deprecated: list[tuple[str, str, Any]],
     *,
     label: str,
+    legacy_label: str | None,
     renamed_at: dict[tuple[str, str, str], datetime],
     cutoff: datetime,
     include_unknown: bool,
 ) -> list[tuple[str, str, Any]]:
-    """Keep only objects renamed before ``cutoff`` per the audit logs."""
+    """Keep only objects renamed before ``cutoff`` per the audit logs.
+
+    ``renamed_at`` is built from every apply log on disk (see
+    ``_renamed_at_index``), old and new alike, so a rename an old log
+    recorded under the legacy engine-family value has to be found under
+    ``legacy_label`` too — otherwise every pre-upgrade rename looks like it
+    has no recorded rename at all, which ``--older-than`` (without
+    ``--include-unknown``) then skips outright.
+    """
     kept: list[tuple[str, str, Any]] = []
     for schema, name, kind in deprecated:
         when = renamed_at.get((label, schema, name))
+        if when is None and legacy_label is not None:
+            when = renamed_at.get((legacy_label, schema, name))
         if when is None:
             if include_unknown:
                 kept.append((schema, name, kind))

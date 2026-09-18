@@ -36,7 +36,7 @@ def _pin_envrc(
 
 def _configure_everything(monkeypatch) -> None:
     """Set every var doctor's offline checks want, so it has zero failures."""
-    for prefix in ("DEMO_PG", "DEMO_RS"):
+    for prefix in ("DEMO_PG", "DEMO_PG2", "DEMO_RS"):
         for spec in config_cli._target_specs(prefix):
             if "ENGINE" not in spec.name:  # keep the engines from conftest
                 monkeypatch.setenv(spec.name, "x")
