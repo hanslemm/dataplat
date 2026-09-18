@@ -41,7 +41,7 @@ dp
 │       ├── users          # list | create | update | delete | set-password
 │       ├── roles          # list
 │       ├── groups         # list
-│       └── dashboards     # list | datasets | duplicate               [3]
+│       └── dashboards     # list | datasets | duplicate | usage       [3]
 ├── people                 # access across every area at once
 │   ├── onboard            # create accounts everywhere, copying a colleague
 │   └── offboard           # disable everywhere; drops nothing
@@ -66,6 +66,8 @@ roles, no other sessions, and no rename that survives a dependent view. See
 
 [3] `duplicate` copies a dashboard and repoints the copy's charts onto another
 database's datasets, creating what is missing. It never deletes anything.
+`usage` ranks dashboards by how many people open them, read from Superset's own
+log tables — `--unused` for the ones nobody does.
 
 ## Installation
 

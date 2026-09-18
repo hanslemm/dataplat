@@ -898,10 +898,16 @@ def revert_cmd(
 
     try:
         _refuse_ambiguous_legacy_entries(
+            # `isinstance(..., str)` rather than `is not None`: the parameter is
+            # a set of identities, and a log entry whose `database` came back as
+            # a number is not one. Binding it once is also what lets the type
+            # narrow -- two separate `.get()` calls are two expressions to mypy,
+            # so the `is not None` on the second never reached the first.
             {
-                r.get("database")
+                database
                 for r in renames
-                if isinstance(r, dict) and r.get("database") is not None
+                if isinstance(r, dict)
+                and isinstance(database := r.get("database"), str)
             },
             engines,
             context="log",
