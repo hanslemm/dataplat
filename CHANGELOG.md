@@ -35,6 +35,17 @@
   "3 unused" from an account that can see a third of the estate is a number
   somebody would otherwise act on.
 
+- **`dp ci github runner start` can register an organization-level runner.**
+  New `--org/-o` (mutually exclusive with `--repo-url`) and `--runner-group/-g`;
+  `--scope` is now inferred from whichever target is given and only validated
+  when passed. Organization targets get `RUNNER_SCOPE=org`, `ORG_NAME`,
+  `APP_LOGIN` and `RUNNER_GROUP` and no `REPO_URL`; repository targets are
+  unchanged apart from an explicit `APP_LOGIN=<owner>`, the value the image
+  derived on its own before. Mount directories are keyed per target
+  (`github.com-<org>` next to `github.com-<org>-<repo>`), so both kinds can
+  coexist. Enterprise scope is rejected outright: GitHub Apps cannot register
+  enterprise runners, so the old `--scope enterprise` never worked.
+
 ### Changed
 
 - Every `dp` command and every option is now covered by a test asserting it has
@@ -304,17 +315,6 @@
 ## 0.6.0
 
 ### Added
-
-- **`dp ci github runner start` can register an organization-level runner.**
-  New `--org/-o` (mutually exclusive with `--repo-url`) and `--runner-group/-g`;
-  `--scope` is now inferred from whichever target is given and only validated
-  when passed. Organization targets get `RUNNER_SCOPE=org`, `ORG_NAME`,
-  `APP_LOGIN` and `RUNNER_GROUP` and no `REPO_URL`; repository targets are
-  unchanged apart from an explicit `APP_LOGIN=<owner>`, the value the image
-  derived on its own before. Mount directories are keyed per target
-  (`github.com-<org>` next to `github.com-<org>-<repo>`), so both kinds can
-  coexist. Enterprise scope is rejected outright: GitHub Apps cannot register
-  enterprise runners, so the old `--scope enterprise` never worked.
 
 - **Tests for the Airbyte service layer**, which was the largest untested area
   left after coverage measurement arrived: 64% → 89% across those modules, with
