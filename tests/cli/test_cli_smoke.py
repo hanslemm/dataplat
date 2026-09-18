@@ -773,3 +773,55 @@ def test_db_dbt_orphans_group_lists_purge() -> None:
 
     assert result.exit_code == 0
     assert "purge" in result.stdout
+
+
+def _walk_commands(command, path):
+    """Every leaf command in the tree, as ``(label, click command)``."""
+    import click
+
+    if isinstance(command, click.Group):
+        for name, sub in command.commands.items():
+            yield from _walk_commands(sub, [*path, name])
+        return
+    yield " ".join(path), command
+
+
+def _every_leaf_command():
+    import typer.main
+
+    from dataplat.core.registry import load_app
+
+    for mount in all_areas():
+        yield from _walk_commands(
+            typer.main.get_command(load_app(mount)), ["dp", mount.name]
+        )
+
+
+def test_every_command_has_help_text() -> None:
+    """`dp <area> <cmd> --help` has to say something on every command.
+
+    Areas are mounted lazily, so this loads each one through the registry
+    rather than reading the placeholder the root group carries -- the
+    placeholder would report its own help and prove nothing.
+    """
+    missing = [
+        label
+        for label, command in _every_leaf_command()
+        if not (command.help or command.short_help)
+    ]
+
+    assert not missing, f"commands without help: {missing}"
+
+
+def test_every_option_has_help_text() -> None:
+    """An undocumented flag is one nobody outside this repo can use."""
+    import click
+
+    missing = [
+        f"{label} {'/'.join(param.opts)}"
+        for label, command in _every_leaf_command()
+        for param in command.params
+        if isinstance(param, click.Option) and param.name != "help" and not param.help
+    ]
+
+    assert not missing, f"options without help: {missing}"

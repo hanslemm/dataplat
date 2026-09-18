@@ -18,13 +18,21 @@ from dataplat.cli._exit import fail
 from dataplat.cli._options import JsonOption
 from dataplat.cli._render import cell
 from dataplat.cli.bi._superset_auth import load_auth_context
-from dataplat.core.errors import AuthError, ConfigError, ServiceError
+from dataplat.cli.bi.dashboards_usage import resolve_usage_params
+from dataplat.cli.db._common import db_session
+from dataplat.core.errors import AuthError, ConfigError, ServiceError, ValidationError
 from dataplat.services.superset.client import build_client
 from dataplat.services.superset.client import login as _login
 from dataplat.services.superset.dashboards import dashboard_charts, iter_dashboards
 from dataplat.services.superset.databases import resolve_database_id
 from dataplat.services.superset.datasets import iter_datasets
 from dataplat.services.superset.repoint import chart_datasource_id
+from dataplat.services.superset.usage import (
+    DEFAULT_VIEW_ACTION,
+    load_usage_config,
+    usage_query,
+    usage_rows,
+)
 
 __all__ = ["list_command"]
 
@@ -50,6 +58,16 @@ def list_command(
         None,
         "--database",
         help="Only dashboards reading a dataset on this database connection.",
+    ),
+    by_usage: bool = typer.Option(
+        False,
+        "--by-usage",
+        help="Add view counts from Superset's logs and rank by them. Combine "
+        "with --database to find dashboards on a warehouse nobody opens. "
+        "Needs DP_SUPERSET_USAGE_TARGET; see `dashboards usage`.",
+    ),
+    days: int = typer.Option(
+        90, "--days", help="Window for --by-usage counts. Default: 90 days."
     ),
     as_json: bool = JsonOption,
 ) -> None:
@@ -90,7 +108,38 @@ def list_command(
                         )
                     )
                 ]
-    except (AuthError, ServiceError, ConfigError) as exc:
+            if by_usage:
+                # Uncapped on purpose: a dashboard missing from a capped scan
+                # would be shown as never opened, which is the one error this
+                # flag must not make when it is used to decide what to delete.
+                usage_config = load_usage_config()
+                sql, params = usage_query(
+                    usage_config,
+                    days=days,
+                    view_actions=(DEFAULT_VIEW_ACTION,),
+                    limit=None,
+                )
+                with (
+                    db_session(resolve_usage_params(usage_config.target)) as conn,
+                    conn.cursor() as cursor,
+                ):
+                    cursor.execute(sql, params)
+                    counts = {
+                        row.dashboard_id: row for row in usage_rows(cursor.fetchall())
+                    }
+                for dashboard in dashboards:
+                    measured = counts.get(int(dashboard.get("id", 0)))
+                    dashboard["views"] = measured.views if measured else 0
+                    dashboard["viewers"] = measured.viewers if measured else 0
+                    dashboard["last_viewed"] = (
+                        measured.last_viewed.strftime("%Y-%m-%d")
+                        if measured and measured.last_viewed
+                        else ""
+                    )
+                dashboards.sort(
+                    key=lambda d: (-int(d["views"]), str(d.get("dashboard_title", "")))
+                )
+    except (AuthError, ServiceError, ConfigError, ValidationError) as exc:
         fail(exc, console=console)
 
     if as_json:
@@ -107,17 +156,41 @@ def list_command(
     table.add_column("ID", style="dim", no_wrap=True)
     table.add_column("Title", style="cyan")
     table.add_column("Status")
+    if by_usage:
+        table.add_column("Viewers", justify="right")
+        table.add_column("Views", justify="right")
+        table.add_column("Last viewed", style="dim")
     table.add_column("Owners", style="dim")
 
-    for dashboard in sorted(
-        dashboards, key=lambda d: str(d.get("dashboard_title", ""))
-    ):
+    # --by-usage has already ordered these by what it measured; without it the
+    # only sensible order is the one a reader can scan.
+    ordered = (
+        dashboards
+        if by_usage
+        else sorted(dashboards, key=lambda d: str(d.get("dashboard_title", "")))
+    )
+    for dashboard in ordered:
+        usage_cells = (
+            [
+                cell(f"{int(dashboard['viewers']):,}"),
+                cell(f"{int(dashboard['views']):,}"),
+                cell(str(dashboard["last_viewed"]) or "—"),
+            ]
+            if by_usage
+            else []
+        )
         table.add_row(
             cell(dashboard.get("id", "")),
             cell(dashboard.get("dashboard_title", "")),
             cell(dashboard.get("status", "")),
+            *usage_cells,
             cell(_owner_names(dashboard)),
         )
 
     console.print(table)
     console.print(f"\n[dim]Total: {len(dashboards)} dashboard(s)[/dim]")
+    if by_usage:
+        never = sum(1 for d in dashboards if not d["views"])
+        console.print(
+            f"[dim]{never} of them with no recorded view in {days} day(s)[/dim]"
+        )
